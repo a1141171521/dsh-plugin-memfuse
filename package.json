@@ -1,0 +1,50 @@
+{
+  "name": "dsh-memfuse",
+  "version": "0.1.0",
+  "description": "DSH 自动记忆系统：本地优先、文本可读、失败可见的分层记忆。",
+  "type": "module",
+  "main": "lib/index.js",
+  "exports": {
+    ".": "./lib/index.js",
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "lib",
+    "cordis.patch.yml",
+    "README.md",
+    "docs"
+  ],
+  "license": "MIT",
+  "keywords": [
+    "dsh",
+    "dsh-plugin",
+    "dsh-plugins",
+    "deepseek-harness",
+    "memory",
+    "agent-memory",
+    "long-term-memory"
+  ],
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/a1141171521/dsh-plugin-memfuse.git"
+  },
+  "homepage": "https://github.com/a1141171521/dsh-plugin-memfuse#readme",
+  "bugs": {
+    "url": "https://github.com/a1141171521/dsh-plugin-memfuse/issues"
+  },
+  "scripts": {
+    "test": "node test/smoke.mjs",
+    "demo": "node test/demo.mjs"
+  },
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    }
+  },
+  "peerDependencies": {
+    "@deepseek-ai/cordis": "^4.0.1"
+  },
+  "engines": {
+    "node": ">=18"
+  }
+}

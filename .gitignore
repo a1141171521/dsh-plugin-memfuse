@@ -1,0 +1,12 @@
+# 依赖
+node_modules/
+
+# 运行时数据（记忆仓库默认在 ~/.dsh/memory，不在此目录；保险起见排除）
+.memory/
+*.tmp-*
+
+# 日志与系统文件
+*.log
+.DS_Store
+Thumbs.db
+desktop.ini
