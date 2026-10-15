@@ -1,5 +1,12 @@
 # dsh-memfuse
 
+> ⚠️ **本文档部分内容已过时**（工具名、进度表、存储布局、安装路径）。
+> **权威来源是 [`docs/spec.md`](docs/spec.md)；接手开发先读 [`docs/HANDOFF.md`](docs/HANDOFF.md)。**
+>
+> 已知过时点：工具名已从 `memory_*` 改为 `memfuse_*`（避免与 `dsh-memory` 撞车）；
+> 插件名从 `dsh-memory` 改为 `dsh-memfuse`；测试从 19 项涨到 59 项；
+> 进度不是"M1–M3 完成"，而是阶段 0–3 全部完成（详见 spec §3.5–§3.11）。
+
 > **DSH 自动记忆系统** —— 借鉴 Breezell / Claude Desktop / ChatGPT-Codex 三家的记忆系统，
 > 取长避短，为 DeepSeek Harness 构建的一套独立记忆插件。
 

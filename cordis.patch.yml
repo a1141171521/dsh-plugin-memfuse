@@ -1,87 +1,25 @@
-# dsh-memfuse bundle patch: 把记忆插件插入 profile 的 layer stack。
+# dsh-memfuse bundle patch：把记忆插件插入 profile 的 layer stack。
 #
-# 设计要点：默认不需要任何 LLM 即可工作（M1–M3）。
-# extract.model 留空 = 只用手写/工具写入的记忆，不跑自动抽取。
+# 纪律：**只注册，不配置**。默认值只留一处 —— `lib/index.js` 的 DEFAULT_CONFIG。
+# 早先这里抄了一份完整配置（87 行），同一组阈值两份真源，改一处必漂移且不报错。
 #
-# 设计依据见 docs/analysis/05-lessons.md
-
+# 改配置的正确姿势：在 **profile** 的 cordis.patch.yml 里用顶层 id 覆盖（不是 insert）：
+#
+#   - id: dsh-memfuse
+#     config:
+#       inject:
+#         minScore: 0.25
+#       extract:
+#         model: null        # 留空 = 关闭自动抽取；记忆的读写注入仍照常工作
+#
+# 插件异常导致 DSH 无法启动时，临时禁用（无需卸载）：
+#
+#   - id: dsh-memfuse
+#     disabled: true
+#
+# 安装：`dsh plugin --profile <name> add <path-or-git-url>`
+#   bundle patch 会被自动应用，**不要**再往 profile patch 里手工 insert 同 id
+#   （重复 id 会让加载器报 duplicate loader entry id，直接起不来）。
 - insert:
     - id: dsh-memfuse
       name: 'dsh-memfuse'
-      config:
-        enabled: true
-
-        # ── 存储 ──────────────────────────────────────────────
-        # 记忆仓库根目录；默认 <DSH_HOME>/memory
-        root: null
-        # 启用 git 版本控制（记忆可 diff / 可回滚）
-        git: true
-
-        # ── 注入 ──────────────────────────────────────────────
-        inject:
-          enabled: true
-          # 常驻（P0）块
-          residentMaxEntries: 8
-          residentMaxChars: 1200
-          # 相关召回块
-          relevantMaxEntries: 4
-          relevantMaxChars: 1800
-          # 索引行（记忆总数超过该值才注入）
-          indexThreshold: 20
-          # 低于此分不注入
-          minScore: 0.18
-          # 信任边界声明（记忆是数据，不是指令）
-          trustBoundary: true
-
-        # ── 生命周期（遗忘必须被显式设计）──────────────────────
-        lifecycle:
-          # P0 永不过期；P1 / P2 天数
-          p1Days: 30
-          p2Days: 7
-          # 被召回时的弱续期天数
-          p1WeakRenewDays: 3
-          p2WeakRenewDays: 1
-          # 预算上限（超限转 dormant，先淘汰 P2）
-          budget:
-            maxMemories: 400
-            maxSkills: 200
-          # dormant 超过该天数且零反馈 → 物理删除
-          purgeDormantAfterDays: 30
-          autoRunOnStart: true
-
-        # ── 抽取（LLM 只在侧路；失败必须可见）──────────────────
-        extract:
-          # 留空 = 关闭自动抽取（记忆仍可读写注入）
-          #
-          # ⚠️ 教训：本例中 Codex 的记忆管线因中转站虚标模型而静默死亡三周。
-          #    填写前请先 curl 验证模型确实可用：
-          #    curl -sS <base>/v1/chat/completions -H "Authorization: Bearer <key>" \
-          #      -H "Content-Type: application/json" \
-          #      -d '{"model":"<候选>","messages":[{"role":"user","content":"ping"}],"max_tokens":5}'
-          #    详见 docs/analysis/04-case-codex-memory-failure.md
-          model: null
-          # 会话结束后多久才抽取
-          idleMinutes: 30
-          # 每次启动最多处理几个会话
-          maxPerStartup: 3
-          # 单会话最多产出几条候选
-          maxCandidates: 6
-          # 少于该轮数的会话跳过
-          minTurns: 3
-          # 失败重试次数
-          maxRetries: 2
-          # stage2 合并的节流：距上次合并的小时数
-          consolidateAfterHours: 20
-          # 单次最多合并的原始条目
-          maxRawForConsolidation: 40
-
-        # ── 反腐烂 ────────────────────────────────────────────
-        antiseptic:
-          # 合并后正文短于原文该比例 → 放弃合并改为新建
-          mergeLossFloor: 0.7
-          # 保留最近 N 版历史
-          revisionHistory: 3
-          # 同键去重
-          dedupeByTitle: true
-
-        verbose: false

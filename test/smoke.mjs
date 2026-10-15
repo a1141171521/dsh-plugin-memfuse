@@ -7,7 +7,7 @@ import assert from 'node:assert/strict';
 
 import { MemoryStore } from '../lib/store.js';
 import * as policy from '../lib/policy.js';
-import { recall, tokenize, lexicalScore } from '../lib/recall.js';
+import { recall, tokenize, bm25, excerpt } from '../lib/recall.js';
 import { buildInjection, estimateTokens } from '../lib/inject.js';
 
 const root = path.join(os.tmpdir(), `dsh-memory-test-${Date.now()}`);
@@ -58,20 +58,35 @@ ok('store 往返（frontmatter 含中文、数组、嵌套 stats）');
 // 若 git 开启会建仓库；这里关闭，确认不抛错
 ok('git 关闭时 init 正常');
 
-// ── 2. 中文分词 + 词法打分 ────────────────────────────────
+// ── 2. 中文分词 + BM25 打分 ───────────────────────────────
 const toks = tokenize('我现在要装依赖，用哪个包管理器？');
 assert.ok(toks.includes('依赖'), `tokens=${JSON.stringify(toks)}`);
 assert.ok(toks.includes('包管') || toks.includes('管理'), 'CJK bigram 生效');
 ok('CJK bigram 分词', `${toks.length} tokens`);
 
-const lex = lexicalScore(back, tokenize('安装依赖 包管理'));
-assert.ok(lex > 0, `lexicalScore=${lex}`);
-ok('词法打分（anchor 命中权重最高）', `score=${lex.toFixed(3)}`);
+// BM25 字段权重：同样的内容，出现在 anchor 里应比出现在正文里得分高
+const anchorHit = { ...back, id: 'a', anchor: '安装依赖、运行脚本时', summary: '', body: '' };
+const bodyHit = { ...back, id: 'b', anchor: '', summary: '', body: '安装依赖、运行脚本时' };
+const [sA, sB] = bm25([anchorHit, bodyHit], tokenize('安装依赖 包管理'));
+assert.ok(sA > sB, `anchor 命中应高于正文命中：${sA} vs ${sB}`);
+ok('BM25：anchor 命中权重最高', `${sA.toFixed(3)} > ${sB.toFixed(3)}`);
+
+// BM25 长度归一（b=0.75）：同样命中一次，短文档应高于长文档
+const shortDoc = { ...back, id: 's', anchor: '', summary: '', body: '安装依赖' };
+const longDoc = { ...back, id: 'l', anchor: '', summary: '', body: `安装依赖 ${'无关内容 '.repeat(200)}` };
+const [sLong, sShort] = bm25([longDoc, shortDoc], tokenize('安装依赖'));
+assert.ok(sShort > sLong, `短文档应更高：${sShort} vs ${sLong}`);
+ok('BM25：长度归一', `${sShort.toFixed(3)} > ${sLong.toFixed(3)}`);
 
 // 反例：无关查询不该命中
-const lexMiss = lexicalScore(back, tokenize('今天天气怎么样'));
-assert.equal(lexMiss, 0);
+assert.equal(bm25([back], tokenize('今天天气怎么样'))[0], 0);
 ok('无关查询零命中');
+
+// excerpt：挑出与查询最相关的那一行（而不是固定用 summary）
+const ex = excerpt({ body: '第一行讲部署。\n第二行讲安装依赖要用 pnpm。\n第三行讲天气。' }, '安装依赖 用哪个包管理器');
+assert.ok(ex.includes('pnpm'), `excerpt=${ex}`);
+assert.equal(excerpt({ body: '第一行讲部署。' }, '完全无关的词'), '', '无命中行应返回空串');
+ok('excerpt 挑出相关行', JSON.stringify(ex));
 
 // ── 3. 准入策略 ──────────────────────────────────────────
 const mk = (o) => ({ kind: 'fact', title: 'T', body: 'B', durability: 'durable', confidence: 0.9, evidence: 'explicit', ...o });
@@ -164,7 +179,7 @@ ok('注入：正常路径', `tokens≈${injOk.tokens}`);
 const injBad = buildInjection(allNow, '安装依赖', { ok: false, reason: 'model unavailable', sinceDays: 14 }, {});
 assert.ok(injBad.text.includes('⚠️'), '故障时出现警告块');
 assert.ok(injBad.text.includes('model unavailable'), '警告含原因');
-assert.ok(injBad.text.includes('memory_write'), '警告说明哪些功能仍可用');
+assert.ok(injBad.text.includes('memfuse_write'), '警告说明哪些功能仍可用');
 ok('注入：Block D 失败可见（这是 Codex 缺的那一环）');
 
 // 常驻块
@@ -183,6 +198,35 @@ ok('index.md 生成');
 const t = estimateTokens(injOk.text);
 assert.ok(t > 0 && t < 2000, `token 估算合理: ${t}`);
 ok('token 估算', `${t}`);
+
+// ── 9. 真机缺陷 3 的回归：双字虚词不该成为有效 bigram ──────
+// 真机实测：查询"今天午饭吃什么"里的"什么"命中了某条记忆 anchor 中的
+// "用什么包管理器"，而 BM25 按最大值归一化后**唯一的命中就是满分**，
+// 假命中直接压过真正相关的条目（详见 spec §3.12 缺陷 3）。
+const qTokens = tokenize('今天午饭吃什么');
+assert.ok(!qTokens.includes('什么'), `"什么"是虚词，不该参与打分：${JSON.stringify(qTokens)}`);
+assert.ok(!tokenize('这个功能怎么用').includes('怎么'), '"怎么"不该参与打分');
+assert.ok(!tokenize('我们应该先做哪个').includes('哪个'), '"哪个"不该参与打分');
+assert.ok(
+  !tokenize('谢谢你，麻烦看一下').some((x) => ['谢谢', '麻烦', '一下'].includes(x)),
+  '客套语不该参与打分',
+);
+// 但不能误杀实词 —— 黑名单只收纯功能词
+for (const w of ['依赖', '包管', '部署', '凭据', '安装']) {
+  assert.ok(tokenize(`请帮我${w}一下`).includes(w), `实词「${w}」被误杀`);
+}
+ok('分词：双字虚词被过滤（缺陷 3 回归），实词不被误杀');
+
+// recall()：无关查询不该返回**非 P0** 条目。
+// （P0 零命中豁免是有意设计，见 recall.js 的注释；Block B 会把它与 Block A 去重）
+const noise = recall(await store.list(), '今天午饭吃什么', { maxEntries: 10 });
+const nonP0 = noise.filter((h) => h.rec.priority !== 'P0');
+assert.equal(
+  nonP0.length,
+  0,
+  `无关查询不该返回非 P0 条目，实际：${nonP0.map((h) => h.rec.title).join(' / ')}`,
+);
+ok('检索：无关查询不返回非 P0 条目（虚词不再造出假命中）');
 
 // ── 汇总 ─────────────────────────────────────────────────
 console.log('\n通过的全部检查：');
