@@ -1,0 +1,8 @@
+# 冒烟夹具的**运行期**产物 —— 每次跑都重建，不进版本库
+memory/
+probe-report.json
+overlay.generated.yml
+probe-overlay.generated.yml
+
+# 要进版本库的是工具本身（可复现的测试用具）：
+#   smoke.mjs  seed.mjs  probe/index.js  probe/package.json

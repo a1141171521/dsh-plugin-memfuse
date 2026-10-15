@@ -1768,3 +1768,197 @@ test('缺陷 11 回归：volatile 引用必须被解开（否则 provider 变成
 
   console.log('  ✅ volatile 引用被正确解开成普通值');
 });
+
+// ───────────────────── H7 技能建议（零 LLM 主动提示）─────────────────────
+
+/** 造一条立刻够格（≥4 分）的记忆：experience(+3) + 步骤性内容(+2) = 5。 */
+async function seedSkillCandidate(api, h, extra = {}) {
+  const write = h.tools.find((d) => d.name === 'memfuse_write');
+  return JSON.parse(
+    await write.execute({
+      mode: 'add',
+      kind: 'experience',
+      priority: 'P1',
+      title: '部署要走 scripts/deploy.sh',
+      summary: '第一步先确认分支干净，再跑 deploy.sh。',
+      body: '第一步先确认分支干净；第二步跑 scripts/deploy.sh；第三步验证健康检查。',
+      anchor: '执行部署时',
+      tags: ['deploy', 'release'],
+      ...extra,
+    }),
+  );
+}
+
+test('H7 技能建议：够格就出现在注入里，且不调模型', async (t) => {
+  const root = path.join(os.tmpdir(), `memfuse-suggest-${Date.now()}`);
+  t.after(() => fsp.rm(root, { recursive: true, force: true }));
+
+  let modelCalls = 0;
+  const h = fakeCtx({
+    llm: {
+      async *stream() {
+        modelCalls++;
+        yield { type: 'text-delta', text: '{}' };
+      },
+      listProviders: () => ['p'],
+      listModels: () => ['m'],
+    },
+  });
+  const api = mod.apply(h.ctx, {
+    root, git: false, verbose: false,
+    extract: { enabled: true, provider: 'p', model: 'm', autoRunOnStart: false },
+  });
+  await api.ready;
+
+  await seedSkillCandidate(api, h);
+  await api.refreshInjectionCache();
+
+  const sugg = await api.suggestions();
+  assert.ok(sugg.length >= 1, `应识别出建议，实际 ${sugg.length}`);
+  assert.equal(sugg[0].seedTitle, '部署要走 scripts/deploy.sh');
+  assert.ok(sugg[0].useWhen, '建议必须带「作用」（取自 anchor）');
+  assert.ok(sugg[0].members.length >= 1, '建议必须带成员列表');
+
+  const inj = await api.buildInjection('随便问点什么');
+  const blockE = inj.blocks.find((b) => b.key === 'E');
+  assert.ok(blockE, `注入里必须出现 Block E，实际 blocks=${inj.blocks.map((b) => b.key).join(',')}`);
+  assert.ok(inj.text.includes('可提炼成技能'), '注入文本要有人话标题');
+  assert.ok(inj.text.includes('部署要走 scripts/deploy.sh'), '要出现候选标题');
+  assert.ok(inj.text.includes('执行部署时'), '要告知「作用」');
+  assert.ok(inj.text.includes('提炼'), '要告诉用户怎么决定');
+
+  // 核心断言：识别与提示**零模型调用**
+  assert.equal(modelCalls, 0, `只做建议不该调模型，实际调了 ${modelCalls} 次`);
+  console.log('  ✅ 够格 → Block E 提示（含作用/成员），模型调用数 = 0');
+});
+
+test('H7 Block E 排在 Block D 之前 —— 故障保持末尾高显著位', async (t) => {
+  const root = path.join(os.tmpdir(), `memfuse-order-${Date.now()}`);
+  t.after(() => fsp.rm(root, { recursive: true, force: true }));
+
+  const h = fakeCtx();
+  const api = mod.apply(h.ctx, { root, git: false, verbose: false, extract: { autoRunOnStart: false } });
+  await api.ready;
+  await seedSkillCandidate(api, h);
+  await api.refreshInjectionCache();
+
+  // 同时造一个故障：抽取开着但模型没配 → health 报错
+  const inj = await api.buildInjection('部署');
+  const keys = inj.blocks.map((b) => b.key);
+  const iE = keys.indexOf('E');
+  const iD = keys.indexOf('D');
+  assert.ok(iE !== -1, 'Block E 应存在');
+  if (iD !== -1) {
+    assert.ok(iE < iD, `Block E 必须在 D 之前（实际 ${keys.join(',')}）—— 故障要留在最后`);
+  }
+  console.log(`  ✅ 块顺序 ${keys.join(' → ')}（E 在 D 前，故障留末尾）`);
+});
+
+test('H7 suggest=false 时不提示（但仍能被 list 看到候选）', async (t) => {
+  const root = path.join(os.tmpdir(), `memfuse-nosuggest-${Date.now()}`);
+  t.after(() => fsp.rm(root, { recursive: true, force: true }));
+
+  const h = fakeCtx();
+  const api = mod.apply(h.ctx, {
+    root, git: false, verbose: false,
+    extract: { autoRunOnStart: false },
+    skill: { suggest: false },
+  });
+  await api.ready;
+  await seedSkillCandidate(api, h);
+  await api.refreshInjectionCache();
+
+  const sugg = await api.suggestions();
+  assert.equal(sugg.length, 0, 'suggest=false 时不该产生建议');
+
+  const inj = await api.buildInjection('部署');
+  assert.equal(inj.blocks.find((b) => b.key === 'E'), undefined, '不该出现 Block E');
+
+  // 候选识别本身仍在（关掉的只是"提示"）
+  const skill = h.tools.find((d) => d.name === 'memfuse_skill');
+  const list = JSON.parse(await skill.execute({ action: 'list' }));
+  assert.ok(list.candidates.length >= 1, '候选识别不受 suggest 影响');
+  console.log('  ✅ suggest=false：不提示，但候选识别照常');
+});
+
+test('H7 dismiss：忽略后不再提示，簇长大时重新提一次', async (t) => {
+  const root = path.join(os.tmpdir(), `memfuse-dismiss-${Date.now()}`);
+  t.after(() => fsp.rm(root, { recursive: true, force: true }));
+
+  const h = fakeCtx();
+  const api = mod.apply(h.ctx, {
+    root, git: false, verbose: false,
+    extract: { autoRunOnStart: false },
+    skill: { minScore: 3 },
+  });
+  await api.ready;
+  await seedSkillCandidate(api, h);
+  await api.refreshInjectionCache();
+
+  const before = await api.suggestions();
+  assert.ok(before.length >= 1, '先要有建议');
+  const keyBefore = before[0].key;
+  const membersBefore = before[0].members.length;
+
+  const skill = h.tools.find((d) => d.name === 'memfuse_skill');
+  const dis = JSON.parse(await skill.execute({ action: 'dismiss' }));
+  assert.equal(dis.ok, true, JSON.stringify(dis));
+  assert.ok(dis.note.includes('不会再提') || dis.note.includes('不再提示') || dis.note.includes('忽略'), '要说明后果');
+
+  await api.refreshInjectionCache();
+  const after = await api.suggestions();
+  assert.equal(after.length, 0, '忽略后不该再提示');
+
+  const inj = await api.buildInjection('部署');
+  assert.equal(inj.blocks.find((b) => b.key === 'E'), undefined, '忽略后 Block E 应消失');
+
+  // 簇长大 → key 变 → 重新提示
+  const skillMod2 = await import('../lib/distill.js');
+  const grown = [...before[0].members.map((m) => ({ id: m.id, tags: ['deploy'] })), { id: 'new-member', tags: ['deploy'] }];
+  assert.notEqual(skillMod2.clusterKey(grown), keyBefore, '成员变化必须产生新 key（否则会被旧的忽略永久压住）');
+
+  // dismiss 无建议时要明确报错，而不是静默成功
+  const again = JSON.parse(await skill.execute({ action: 'dismiss' }));
+  assert.equal(again.ok, false, '没有建议可忽略时必须报错');
+  console.log(`  ✅ dismiss：${membersBefore} 条那组被忽略且不再提示；成员变化会重新提一次`);
+});
+
+test('H7 clusterKey / renderSuggestions 的纯函数行为', async (t) => {
+  const d = await import('../lib/distill.js');
+
+  // key 稳定：成员顺序不影响
+  const a = [{ id: 'x' }, { id: 'y' }];
+  const b = [{ id: 'y' }, { id: 'x' }];
+  assert.equal(d.clusterKey(a), d.clusterKey(b), 'key 必须与成员顺序无关');
+
+  // sharedTags：至少一半成员带它才算
+  const cluster = [
+    { id: '1', tags: ['deploy', 'x'] },
+    { id: '2', tags: ['deploy'] },
+    { id: '3', tags: ['deploy'] },
+    { id: '4', tags: ['other'] },
+  ];
+  const tags = d.sharedTags(cluster);
+  assert.deepEqual(tags, ['deploy'], `共享标签判定错误：${JSON.stringify(tags)}`);
+
+  // 渲染：作用 / 成员 / 够格理由 / 决定方式 都要有
+  const rows = d.renderSuggestions(
+    [
+      {
+        key: 'k',
+        seedTitle: '部署流程',
+        tags: ['deploy'],
+        useWhen: '执行部署时',
+        members: [{ title: 'a' }, { title: 'b' }],
+        reasons: ['本身就是 skill/experience 类记忆'],
+      },
+    ],
+    1,
+  );
+  const text = rows.join('\n');
+  for (const need of ['部署流程', '作用', '执行部署时', '成员', '够格理由', '提炼']) {
+    assert.ok(text.includes(need), `渲染结果缺少「${need}」：\n${text}`);
+  }
+  assert.ok(!/undefined|null/.test(text), `渲染结果不该出现 undefined/null：\n${text}`);
+  console.log('  ✅ clusterKey 顺序无关 / sharedTags 过半判定 / 渲染要素齐全');
+});

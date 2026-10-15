@@ -11,6 +11,12 @@
 #         minScore: 0.25
 #       extract:
 #         model: null        # 留空 = 关闭自动抽取；记忆的读写注入仍照常工作
+#       skill:
+#         suggest: true      # 够格时主动提示"有记忆可以固化成技能"（零 LLM，不调模型）
+#         suggestMax: 1      # 每轮最多提示几组
+#         minScore: 4        # 判定为技能候选的最低分
+#
+# 完整参数与默认值见 `lib/index.js` 的 DEFAULT_CONFIG（唯一真源）。
 #
 # 插件异常导致 DSH 无法启动时，临时禁用（无需卸载）：
 #

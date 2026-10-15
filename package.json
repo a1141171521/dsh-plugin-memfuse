@@ -38,7 +38,9 @@
     "test:smoke": "node test/smoke.mjs",
     "test:plugin": "node --test test/plugin.test.mjs",
     "test:client": "node --test test/client.test.mjs",
-    "demo": "node test/demo.mjs"
+    "demo": "node test/demo.mjs",
+    "demo:suggest": "node test/demo-suggest.mjs",
+    "smoke": "node .memfuse-smoke/smoke.mjs"
   },
   "dsh": {
     "bundle": {

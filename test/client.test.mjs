@@ -286,12 +286,14 @@ test('client half：summary 给一行说明，page 渲染得出来', async () =>
   const snapshot = face.hooks.memfuseConfig.getSnapshot();
   assert.deepEqual(
     Object.keys(snapshot.fields),
-    ['enabled', 'follow', 'model', 'onUnavailable', 'fallback', 'mode'],
-    '字段顺序 = 页面顺序：总开关 → 跟随 → 模型 → 不可用时 → 降级 → 落盘方式',
+    ['enabled', 'follow', 'model', 'onUnavailable', 'fallback', 'mode', 'skillSuggest'],
+    '字段顺序 = 页面顺序：总开关 → 跟随 → 模型 → 不可用时 → 降级 → 落盘方式 → 技能建议',
   );
   assert.equal(snapshot.fields.model.value, 'zjpaiguo\u0000deepseek-flash', '选择器要显示当前 provider#model');
   assert.equal(snapshot.fields.follow.checked, false, '默认不勾选「跟随对话模型」');
   assert.equal(snapshot.fields.mode.text, '', '没配过就是空（回落默认值）');
+  // 技能建议**不属于抽取**：它零 LLM，与"用不用模型"无关，不该跟着总开关联动
+  assert.ok(snapshot.fields.skillSuggest, '技能建议开关必须在表单里');
   console.log('  ✅ summary/page 都渲染；字段投影齐全（默认不勾跟随、默认不选模型）');
 });
 
