@@ -161,5 +161,5 @@ curl -sS https://<中转>/v1/chat/completions \
 
 > 任何把 LLM 放在关键路径上的记忆系统，都必须有**失败可见性**。
 > Claude 的记忆不存在"失效"概念（就是文件，写没写一看便知）；
-> Breezell 至少在 UI 显示 active/dormant/unsynced 统计；
+> 云端超级记忆 至少在 UI 显示 active/dormant/unsynced 统计；
 > **Codex 是唯一一个会静默烂掉的。**

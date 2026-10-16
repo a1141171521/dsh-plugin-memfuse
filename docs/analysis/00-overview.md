@@ -1,6 +1,6 @@
 # 三家 AI 产品记忆系统对比分析
 
-> 分析对象：Breezell 超级记忆、Claude Desktop 记忆、ChatGPT / Codex 记忆。
+> 分析对象：云端超级记忆、Claude Desktop 记忆、ChatGPT / Codex 记忆。
 > 方法：出厂工件静态分析（asar / 二进制 / SQLite）+ 本机实测数据。
 > 目的：为 `dsh-memfuse` 的设计提供取舍依据。
 
@@ -10,7 +10,7 @@
 
 | 系统 | 一句话 |
 |---|---|
-| **Breezell 超级记忆** | 做了一个很好的引擎，但把用户的记忆扣作人质 |
+| **云端超级记忆** | 做了一个很好的引擎，但把用户的记忆扣作人质 |
 | **Claude Desktop** | 把记忆还给了用户，但没给引擎 |
 | **ChatGPT / Codex** | 难得地两者都要了，却挂在一条会静默断掉的模型管道上 |
 
@@ -20,10 +20,10 @@
 
 ## 1. 总览对比
 
-| 维度 | Breezell 超级记忆 | Claude Desktop | ChatGPT | Codex |
+| 维度 | 云端超级记忆 | Claude Desktop | ChatGPT | Codex |
 |---|---|---|---|---|
 | **记忆形态** | SQLite 强类型数据库 | Markdown + `MEMORY.md` 索引 | 纯服务端 | git Markdown + SQLite 管线 |
-| **存储位置** | `~/.breezell/viking.db` | `spaces/<id>/memory/*.md` | `chatgpt.com/backend-api` | `~/.codex/memories/` |
+| **存储位置** | `~/.<产品目录>/memory.db` | `spaces/<id>/memory/*.md` | `chatgpt.com/backend-api` | `~/.codex/memories/` |
 | **作用域** | global / workspace | 每 Space（项目） | 账号 | 每 thread → 全局 |
 | **谁决定记什么** | LLM 抽取 + 代码策略 | **模型自己** | 服务端 | 后台 agent 两阶段 |
 | **结构** | L0/L1/L2 + priority + confidence + tags | 自由 Markdown | 条目（容量/优先级/领域/版本） | Markdown + git |
@@ -47,7 +47,7 @@
 
 ## 2. 三种哲学
 
-### Breezell = 系统托管（system-managed）
+### 云端超级记忆 = 系统托管（system-managed）
 把记忆做成**数据库 + 检索引擎**。赌注：专门的抽取/判级/去重/排序管线，胜过模型自己的判断。
 代价：不透明、云端绑定、每轮最多 7 次 LLM 调用。
 
@@ -66,7 +66,7 @@
 
 | 系统 | 死穴 |
 |---|---|
-| **Breezell** | 云端绑定 + 成本转嫁 + 不透明。断网/欠费语义能力归零；用户既看不懂也改不动；每轮 7 次 LLM 调用在用户账上悄悄跑 |
+| **云端超级记忆** | 云端绑定 + 成本转嫁 + 不透明。断网/欠费语义能力归零；用户既看不懂也改不动；每轮 7 次 LLM 调用在用户账上悄悄跑 |
 | **Claude** | **不可扩展 + 无遗忘 + 依赖模型自觉**。记忆一多索引就是负担；`MEMORY.md` 只增不减必然撑爆；"读不读"完全靠模型自律 |
 | **Codex** | **静默失败**。开关亮着、实际 0 条、三周无人察觉。LLM 硬编码在关键路径上 |
 | **ChatGPT 产品侧** | **用户主权为零**。全在云端，看不到、导不出、版本控制不了；容量满了还会降低服务质量；AI 可降权你的记忆 |
@@ -77,12 +77,12 @@
 
 | 来自 | 可复用 | 说明 |
 |---|---|---|
-| Breezell | **L0/L1/L2 渐进披露** | 默认只注入索引，按需下钻 |
-| Breezell | **`retrieval_anchor` 字段** | 存"何时该召回"而非内容副本，等价于 query-side 向量的廉价替代 |
-| Breezell | **准入分权** | LLM 判断语义，代码定优先级，P0 只给用户 |
-| Breezell | **完整遗忘链** | 过期 → 休眠 → 预算淘汰 → 物理删除 |
-| Breezell | **反馈闭环** | 负面权重 1.5×，事件溯源可回滚 |
-| Breezell | **omissions 记录** | 能观测"没注入什么、为什么" |
+| 云端超级记忆 | **L0/L1/L2 渐进披露** | 默认只注入索引，按需下钻 |
+| 云端超级记忆 | **`retrieval_anchor` 字段** | 存"何时该召回"而非内容副本，等价于 query-side 向量的廉价替代 |
+| 云端超级记忆 | **准入分权** | LLM 判断语义，代码定优先级，P0 只给用户 |
+| 云端超级记忆 | **完整遗忘链** | 过期 → 休眠 → 预算淘汰 → 物理删除 |
+| 云端超级记忆 | **反馈闭环** | 负面权重 1.5×，事件溯源可回滚 |
+| 云端超级记忆 | **omissions 记录** | 能观测"没注入什么、为什么" |
 | Claude | **纯文本归用户** | 记忆是可读可改可 git 的 Markdown |
 | Claude | **文件名安全白名单** | 裸文件名 + 原子写 + 拒绝非普通文件 |
 | Codex | **两阶段管线** | 逐会话抽取 → 全局合并 |
@@ -95,17 +95,17 @@
 
 | 反模式 | 来源 | 后果 |
 |---|---|---|
-| 云端是唯一检索路径 | Breezell | 断网/欠费 → 记忆功能归零 |
-| 记忆存进不可读的黑箱 | Breezell / ChatGPT | 用户无法审查、迁移、版本控制 |
+| 云端是唯一检索路径 | 云端超级记忆 | 断网/欠费 → 记忆功能归零 |
+| 记忆存进不可读的黑箱 | 云端超级记忆 / ChatGPT | 用户无法审查、迁移、版本控制 |
 | 无衰减机制 | Claude / Codex | 索引线性膨胀，最终撑爆上下文 |
 | LLM 在关键路径且无失败可见性 | Codex | 静默烂掉，用户数周不知 |
-| 把记忆内容当指令注入 | Breezell / Claude | 记忆投毒可劫持 agent 行为 |
+| 把记忆内容当指令注入 | 云端超级记忆 / Claude | 记忆投毒可劫持 agent 行为 |
 | 容量满即降低服务质量 | ChatGPT | 把记忆配额变成付费杠杆 |
 
 ---
 
 详细剖析见：
-- [Breezell 超级记忆](01-breezell.md)
+- [云端超级记忆](01-cloud-super-memory.md)
 - [Claude Desktop 记忆](02-claude-desktop.md)
 - [ChatGPT / Codex 记忆](03-chatgpt-codex.md)
 - [失败案例：gpt-5.6-luna](04-case-codex-memory-failure.md)

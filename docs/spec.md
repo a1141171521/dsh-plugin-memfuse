@@ -15,7 +15,7 @@
 
 | 系统 | 它占住的位置 | 它留下的空位 |
 |---|---|---|
-| Breezell | 完整遗忘 + 打分 + L0/L1/L2 | 记忆锁进 `viking.db`、语义检索要订阅、断网兜底是 30 词停用表 |
+| 云端超级记忆 | 完整遗忘 + 打分 + L0/L1/L2 | 记忆锁进 `memory.db`、语义检索要订阅、断网兜底是 30 词停用表 |
 | Claude Desktop | 明文归用户、零 LLM 成本 | **没有遗忘**（只增不减）、没有检索 |
 | Codex | 两阶段后台 agent + git | **失败不可见**（管线静默死三周）、无遗忘 |
 | dsh-memory-evolve | 5 轨 + drift guard + 自审 + 合并技能 + 情绪反馈 + 同步 | 无自动衰减淘汰、无打分、14 模块、1.2MB 产物、无 CI |
@@ -193,7 +193,7 @@
        └── index.db                派生索引（P1，可删可重建）
 ```
 
-**三条硬纪律**（守住就不会变成第二个 Breezell / Codex）：
+**三条硬纪律**（守住就不会变成第二个 云端超级记忆 / Codex）：
 
 1. **`index.db` / `index.md` / `status.md` 都是派生视图** —— 删掉系统仍能工作（只是慢）。真源永远只有 `memories/*.md` + `skills/*.md`。
 2. **关键路径零 LLM** —— 读 / 写 / 注入 / 检索不需要模型。只有抽取（F2）与技能提炼（H2）需要，且关掉后其余功能照常。
@@ -262,7 +262,7 @@
 | 约束 | 理由 |
 |---|---|
 | **零运行时依赖**（只用 node: 内置） | 不因缺依赖整块失效（Codex 的教训） |
-| **真源永远是纯文本 Markdown** | 可 diff / 可人读 / 可迁出（Breezell 的反面） |
+| **真源永远是纯文本 Markdown** | 可 diff / 可人读 / 可迁出（云端超级记忆 的反面） |
 | **不引入第二个模型** | 关键路径零 LLM（P3 原则） |
 | **所有会真实改变行为的写入先进待确认队列** | 除非用户显式开启 auto 模式 |
 | **P0 / source:user 是学习的锚** | 不可被自动合并、淘汰、或权重学习改写 |
@@ -471,7 +471,7 @@
 | **F2** | **水位线**：`state.extracted` 记录每个 `sessions/*.md` 已处理到的字符数，**只有成功才推进**（失败下次重试同一段） | 断言：第二次调用 `files === 0` 且**不再调模型** |
 | **F2** | **偏好句加成**：命中"以后都 / 不要 / 我习惯 / 一律 / always…"→ `confidence ≥ 0.9` + 升 P1（**P0 仍只归用户**） | 断言：低置信偏好项被抬到 P1 并标记 `preference: true` |
 | **F2** | **准入真正接上了**：`policy.normalize` / `classify` / `dedupeKey` 从死代码变成主流程的一环 | 断言：`turn_local` 被丢弃 |
-| **F2** | **抽取产物再过滤一次凭据**（防 Breezell 那种"把 25 条内网 IP、8 条口令写进库"） | 断言：含 `password:` 的候选被丢弃 |
+| **F2** | **抽取产物再过滤一次凭据**（防 云端超级记忆 那种"把 25 条内网 IP、8 条口令写进库"） | 断言：含 `password:` 的候选被丢弃 |
 | **F2** | **失败可见闭环**：抽取失败写 `state.lastExtractError` / `lastErrorAt` → **Block D 的"管线故障"分支第一次有了真实数据源** | 断言：模型报 503 → `health.ok === false` → 注入里出现 `⚠️` 且带原因 |
 | **E6** | 新模块 **`lib/queue.js`**：**一条一项一个文件** `<root>/.memory/pending/<slug>.json`（刻意不用单文件 JSONL 追加 —— Windows 上 `appendFile` 非原子，审查点名过） | 断言：2 条 → 2 个 `.json` 文件；可按标题/id/slug 查 |
 | **E6** | **`memfuse_write` 新增 `approve` / `reject`**：采纳 → 写成真记忆（`source: 'auto'`，**不是用户资产**，可被淘汰也可被自动升级）+ 删队列项；丢弃 → 只删队列项。两者都写 `usage.jsonl` 留痕 | 断言：approve 后能读到记忆、队列减一；`queue-approve`/`queue-reject` 事件都在 |
@@ -2109,7 +2109,7 @@ cordis_inspect_query(client, Slots, listSubTree, {root:'plugins.row.config'})
 
 1. 关键路径零 LLM（硬规则 3）
 2. 技能"不该在后台悄悄生成"（§H 的设计前提）
-3. 每轮都烧 token（Breezell 每轮最多 7 次调用的教训）
+3. 每轮都烧 token（云端超级记忆 每轮最多 7 次调用的教训）
 
 ⇒ 所以"预览"给的是**簇级语义**，不是 SKILL.md 正文：
 
@@ -2215,4 +2215,4 @@ skill:
 | K1 K2 工程 | dsh-memory-evolve | node:test + fakeCtx |
 | — 遗忘链 | **自有** | 五家唯一的差异化 |
 | — Block D 失败可见 | **自有** | 五家唯一的差异化 |
-| — 打分与预算化注入 | 自有（借鉴 Breezell 系数） | 五家里 evolve/memsearch/Claude/Codex 都没有 |
+| — 打分与预算化注入 | 自有（借鉴 云端超级记忆 系数） | 五家里 evolve/memsearch/Claude/Codex 都没有 |

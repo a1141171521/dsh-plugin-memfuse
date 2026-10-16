@@ -100,7 +100,7 @@ Resp:    { checksum, content: { entries, entryChecksums } }
 3. **没有去重与合并** —— 靠模型自觉，可反复记同一条
 4. **没有质量分层** —— 无 priority / confidence / utility，好记忆与坏记忆生而平等
 5. **依赖模型自觉** —— 小模型/差模型会写垃圾；**最大的实践风险是模型可能压根不调 `project_memory_read`**，记忆写了但从不被读
-6. **没有自动注入** —— 与 Breezell 相反，完全被动
+6. **没有自动注入** —— 与 云端超级记忆 相反，完全被动
 7. **双代际/双系统并存** —— legacy 与 improved memory 并存，增加心智负担
 8. **单文件 256 KB 但无总量配额** —— 只有 5000 条目上限，无总 token 预算
 

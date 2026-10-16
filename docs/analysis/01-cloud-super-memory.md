@@ -1,8 +1,8 @@
-# Breezell 超级记忆 剖析
+# 云端超级记忆 剖析
 
-> 目标：`D:\Breezell\`（VS Code 1.135.0 分支，产品版本 1.4.0）
+> 目标：`D:\云端超级记忆\`（VS Code 1.135.0 分支，产品版本 1.4.0）
 > 形态：解包 Electron 应用（`resources/app/` 非 asar）
-> 存储：`C:\Users\<user>\.breezell\viking.db`（SQLite 3，WAL）
+> 存储：`C:\Users\<user>\.<产品目录>\memory.db`（SQLite 3，WAL）
 
 ---
 
@@ -11,12 +11,12 @@
 `超级记忆` 是中文语言包对内部标识 **`superMemory` / `Viking`** 的翻译。
 代码里没有中文字面量，只用 `\u8d85\u7ea7\u8bb0\u5fc6` 转义形式存在于 `workbench.desktop.main.js`。
 
-自研代码集中在 `out/vs/workbench/contrib/breezell/**`。
+自研代码集中在 `out/vs/workbench/contrib/<产品模块>/**`。
 
 ## 2. 架构（五层）
 
 ```
-UI 面板 (React chunks)   workbench.action.openBreezellSuperMemory
+UI 面板 (React chunks)   workbench.action.open云端超级记忆SuperMemory
    ↓
 编排层 memoryRecallContextService    每轮注入装配
    ↓
@@ -24,9 +24,9 @@ UI 面板 (React chunks)   workbench.action.openBreezellSuperMemory
    ↓
 检索层 vikingRetriever + memoryInjectionPolicy
    ↓
-存储层 vikingStoreService ──IPC──> vikingDatabaseChannel（主进程）──> viking.db
+存储层 vikingStoreService ──IPC──> vikingDatabaseChannel（主进程）──> memory.db
    ↓
-云端   vikingEmbeddingSyncService ──> api.breezell.com
+云端   <嵌入同步服务> ──> api.<产品域名>
        POST /api/viking/embed    (1024 维)
        POST /api/viking/rerank   (Jina 重排)
 ```
@@ -203,12 +203,12 @@ lifecycle: 来源 stale 或 negativeRatio≥0.5 → dormant
 ## 9. 商业与授权
 
 - `hasSuperMemory` 来自 `POST /api/capability-token` 返回的**RSA 签名令牌**
-- 公钥硬编码在 `capabilityManager.js`，有效域校验 `cdnbreezellone.34567.xin` / `breezell.com`
+- 公钥硬编码在 `capabilityManager.js`，有效域校验 `<CDN 域名>` / `<产品域名>`
 - 429 → `SuperMemoryQuotaExceededError`，按套餐限额
 
 ## 10. 实测数据
 
-`~/.breezell/viking.db`：
+`~/.<产品目录>/memory.db`：
 
 | 维度 | 值 |
 |---|---|
@@ -257,7 +257,7 @@ lifecycle: 来源 stale 或 negativeRatio≥0.5 → dormant
    `freshness` 只占 0.03（几乎等于没有）；阈值 0.12 偏低；
    新旧两条路径的 priority 语义不一致（乘性 ×1.5 vs 加性 0.16）
 6. **关键词类别路由过于粗糙** —— `String.includes()` 硬编码，"为什么这个测试挂了"不含"报错/修复"就退化为全类目查询
-7. **双记忆系统割裂** —— `viking.db` vs `~/.breezell/memories/*.md`，`migrateFromMemoryBank()` 是 `return 0` 空实现
+7. **双记忆系统割裂** —— `memory.db` vs `~/.<产品目录>/memories/*.md`，`migrateFromMemoryBank()` 是 `return 0` 空实现
 8. **`stable` 冷启动问题** —— 同一坑要踩两次，第一次学到的教训还不生效
 9. **死代码** —— `memoryDeletion.js` 仅 22 字节
 
