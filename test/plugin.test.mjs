@@ -248,7 +248,9 @@ test('卸载：disposer 被 ctx.effect 收好并可释放', async (t) => {
   const h = fakeCtx();
   const api = mod.apply(h.ctx, { root: tmpRoot, git: false, verbose: false });
   await api.ready;
-  assert.equal(h.effects.length, 1, '必须用 ctx.effect 注册卸载逻辑');
+  // 至少一个 effect 收养整份清理逻辑；Remote 通道会在 inject 子上下文里再挂一个
+  // （它只负责撤掉自己的贡献/服务，见 lib/remote.js）——所以这里不写死 ==1。
+  assert.ok(h.effects.length >= 1, '必须用 ctx.effect 注册卸载逻辑');
   assert.equal(api.disposers.length, 7, '6 个工具 + 1 个注入 provider');
   h.effects[0]();
   assert.equal(h.disposersCalled.length, 7, '释放时必须逐个调用 disposer');
@@ -1127,6 +1129,81 @@ test('H2/H3/H5 提炼 → 待确认 → approve 装进技能库 + derived-into �
   console.log('  ✅ distill → 待确认 → approve 装进技能库，源记忆标 derivedInto');
 });
 
+test('缺陷 25：界面那条路（提炼 → 草稿预览 → 装/丢）与工具走**同一份实现**', async (t) => {
+  const root = path.join(os.tmpdir(), `memfuse-ui-distill-${Date.now()}`);
+  const skillDir = path.join(root, 'skills-lib');
+  t.after(() => fsp.rm(root, { recursive: true, force: true }));
+  const h = fakeCtx({
+    llm: fakeLlm(JSON.stringify({
+      name: 'ui-skill',
+      description: '界面点「提炼成技能」时用',
+      body: '## 步骤\n1. 先确认\n2. 再动手',
+    })),
+  });
+  const api = mod.apply(h.ctx, {
+    root, git: false, verbose: false,
+    extract: { enabled: true, provider: 'p', model: 'm', autoRunOnStart: false },
+    skill: { dir: skillDir, minScore: 3, minSessions: 2 },
+  });
+  await api.ready;
+  const { store, state } = await api.ready;
+  const cfg = {
+    extract: { enabled: true, provider: 'p', model: 'm' },
+    skill: { dir: skillDir, maxBytes: 65536, minScore: 3, minSessions: 2, enabled: true, suggest: true },
+  };
+  const logger = { warn: () => {}, log: () => {} };
+
+  // 先攒出一条够格的记忆（零 LLM 的候选识别）
+  const write = h.tools.find((d) => d.name === 'memfuse_write');
+  const added = JSON.parse(await write.execute({
+    mode: 'add', kind: 'experience', priority: 'P1',
+    title: '界面那条路的验证流程',
+    summary: '先看候选 key，再点提炼。',
+    body: '第一步拿到候选 key，第二步调 distill，第三步看草稿。',
+    anchor: '验证界面提炼时',
+    tags: ['ui-flow'],
+  }));
+
+  // 界面手里只有候选 key（不是记忆 id）—— 宿主负责把 key 翻回种子记忆
+  const all = await store.list();
+  const suggestions = mod.computeSuggestions(all, state, cfg);
+  assert.ok(suggestions.length >= 1, '应有可决定的建议（界面卡片的输入）');
+  const seedId = suggestions[0].seedId;
+
+  const res = await mod.distillCluster({ store, cfg, state, ctx: h.ctx, logger, seedId });
+  assert.equal(res.ok, true, JSON.stringify(res));
+  assert.equal(res.name, 'ui-skill');
+  assert.ok(res.content.includes('## 步骤'), '草稿要带 SKILL.md 原文（界面要显示提示词本体）');
+  assert.ok(String(res.installPath).endsWith('SKILL.md'), '要告诉用户会写到哪儿');
+
+  // 界面读草稿：**从磁盘读**，所以刷新页面后照样在
+  const drafts = await mod.pendingSkillDrafts(store, cfg);
+  assert.equal(drafts.length, 1);
+  assert.equal(drafts[0].name, 'ui-skill');
+  assert.equal(drafts[0].description, '界面点「提炼成技能」时用', 'description 就是"这个技能干什么用的"');
+  assert.ok(drafts[0].content.includes('ui-skill'), '草稿内容要能直接渲染');
+  assert.ok(drafts[0].loadable, '待确认草稿本身必须是规范格式（否则装进去也是废的）');
+
+  // 装进技能库
+  const app = await mod.approveSkill({ store, cfg, state, ctx: h.ctx, name: 'ui-skill' });
+  assert.equal(app.ok, true, JSON.stringify(app));
+  assert.equal(app.markedSources, 1, '源记忆要标 derivedInto');
+  assert.equal((await mod.pendingSkillDrafts(store, cfg)).length, 0, '装完就从待确认队列消失');
+  assert.equal((await store.read(added.id)).derivedInto, 'ui-skill');
+
+  // 丢掉
+  await skillMod.writeSkill(
+    store.root.pendingSkills,
+    'throwaway',
+    skillMod.buildSkillMd({ name: 'throwaway', description: 'd', body: 'b' }),
+  );
+  assert.equal((await mod.pendingSkillDrafts(store, cfg)).length, 1);
+  const rej = await mod.rejectSkill({ store, name: 'throwaway' });
+  assert.equal(rej.ok, true, JSON.stringify(rej));
+  assert.equal((await mod.pendingSkillDrafts(store, cfg)).length, 0, '丢掉之后草稿必须真的没了');
+  console.log('  ✅ 界面那条路：key → 草稿（含 SKILL.md 原文）→ 装 / 丢，与工具共用同一份实现');
+});
+
 test('H6 patch 需要 read-before-write 证据', async (t) => {
   const root = path.join(os.tmpdir(), `memfuse-patch-${Date.now()}`);
   const skillDir = path.join(root, 'skills-lib');
@@ -1641,6 +1718,150 @@ test('抽取降级：模型不可用时按 onUnavailable 决定「停」还是�
   console.log('  ✅ 抽取降级：stop / 显式降级 / 跟随主模型 / 降级目标也坏 —— 四条路径都对');
 });
 
+test('Remote 通道：手写描述符合法 + 服务绑定正确 + 七个方法都动状态', async (t) => {
+  const remoteMod = await import('../lib/remote.js');
+
+  /**
+   * 描述符的**可比较投影**：codec 里的 `create` 每次调用都是新闭包
+   * （`assert.deepEqual` 在 strict 模式下按引用比函数 → 必然不等），
+   * 而我们要锁的是**数据与形状**，所以把函数换成它的类型名再比。
+   */
+  const shapeOf = (list) =>
+    list.map((d) => ({
+      ...d,
+      result: { ...d.result, create: typeof d.result.create },
+      parameters: d.parameters.map((p) => ({ ...p, codec: { ...p.codec, create: typeof p.codec.create } })),
+    }));
+
+  // ① 描述符必须过宿主注册表/网关那几条硬规则（行号见 lib/remote.js 顶部注释）。
+  //    这里把规则**照抄**成断言；换宿主版本时要回去重读那些函数，别让测试变成自证。
+  const wireName = /^[A-Za-z0-9_$.-]+$/;
+  const descriptors = remoteMod.remoteDescriptors();
+  assert.equal(descriptors.length, 7);
+  // 端点清单（探针与 status.md 都读它）必须与描述符**一一对应** —— 少一个就是
+  // "界面按钮打到不存在的端点上"，而那种失败只表现为"点了没反应"。
+  assert.deepEqual(
+    Object.values(remoteMod.REMOTE_ENDPOINTS).sort(),
+    descriptors.map((d) => `${d.namespace}/${d.method}`).sort(),
+  );
+  // 缺陷 25 补的三个端点（提炼 → 草稿预览 → 装/丢）：少一个界面就没有第二阶段
+  for (const method of ['distill', 'approve', 'reject']) {
+    assert.ok(
+      descriptors.some((d) => d.method === method),
+      `缺 ${method} 端点：点「提炼成技能」之后界面就没有下一步了（缺陷 25）`,
+    );
+  }
+  for (const d of descriptors) {
+    assert.ok(d.id.length > 0, 'id 非空');
+    assert.ok(d.service.length > 0 && !d.service.includes('#'), `service 段非法：${d.service}`);
+    assert.match(d.namespace, wireName);
+    assert.match(d.method, wireName);
+    assert.match(d.implementation, wireName);
+    assert.deepEqual(d.invocation, { kind: 'direct' });
+    for (const p of d.parameters) {
+      assert.match(p.name, wireName);
+      assert.match(p.wire, wireName);
+      // 参数 codec 要真的校验（否则类型错误会被留到下游）
+      assert.throws(() => p.codec.create().parse(123), '非法参数必须被拒');
+    }
+    // codec：宿主只要求 mode/typeSymbol/create，运行时只调 create().parse()
+    for (const codec of [d.result, ...d.parameters.map((p) => p.codec)]) {
+      assert.equal(codec.mode, 'strict', 'codec 必须是 strict');
+      assert.ok(typeof codec.typeSymbol === 'string' && codec.typeSymbol.length > 0);
+      assert.equal(typeof codec.create, 'function');
+      assert.equal(typeof codec.create().parse, 'function', 'create() 要能被 decode 调用');
+    }
+  }
+
+  // ② 服务绑定：网关按 `===` 比对原始对象，serviceKey / namespace 也要对上
+  const calls = [];
+  const service = remoteMod.createRemoteService({
+    list: () => {
+      calls.push('list');
+      return { groups: [] };
+    },
+    dismiss: (key) => {
+      calls.push(['dismiss', key]);
+      return { ok: true };
+    },
+    markSeen: (keys) => {
+      calls.push(['markSeen', keys.length]);
+      return { ok: true };
+    },
+    requestDistill: (key) => {
+      calls.push(['requestDistill', key]);
+      return { ok: true };
+    },
+    distill: (key) => {
+      calls.push(['distill', key]);
+      return { ok: true, name: 'n1' };
+    },
+    approve: (name) => {
+      calls.push(['approve', name]);
+      return { ok: true };
+    },
+    reject: (name) => {
+      calls.push(['reject', name]);
+      return { ok: true };
+    },
+  });
+  const binding = service.typertRemote;
+  assert.ok(binding, '没有 typertRemote 绑定 → 网关会报 gateway/binding-invalid');
+  assert.equal(binding.service, service, '绑定里的 service 必须是服务对象本身');
+  assert.equal(binding.serviceKey, 'memfuseRemote');
+  assert.equal(binding.namespace, 'memfuse');
+  for (const d of descriptors) {
+    assert.equal(d.service, binding.serviceKey);
+    assert.equal(typeof service[d.implementation], 'function', `服务上缺少 ${d.implementation}()`);
+  }
+  await service.list();
+  await service.dismiss('k1');
+  await service.markSeen(['k1', 'k2']);
+  await service.requestDistill('k1');
+  await service.distill('k1');
+  await service.approve('n1');
+  await service.reject('n1');
+  assert.deepEqual(calls, [
+    'list',
+    ['dismiss', 'k1'],
+    ['markSeen', 2],
+    ['requestDistill', 'k1'],
+    ['distill', 'k1'],
+    ['approve', 'n1'],
+    ['reject', 'n1'],
+  ]);
+
+  // ③ 两份贡献只在 face 上不同（宿主定义实现、客户端定义可调用方法）
+  // ⚠️ 宿主读 `invocations`、客户端读 `descriptors` —— 字段名不同（真机踩过，见 lib/remote.js 注释）
+  assert.deepEqual(shapeOf(remoteMod.remoteContribution('host').invocations), shapeOf(descriptors));
+  assert.equal(remoteMod.remoteContribution('host').descriptors, undefined, '宿主那份不该有 descriptors（会被静默忽略）');
+  assert.deepEqual(shapeOf(remoteMod.remoteContribution('client').descriptors), shapeOf(descriptors));
+  assert.equal(remoteMod.remoteContribution('client').invocations, undefined, '客户端那份不该有 invocations');
+  assert.equal(remoteMod.remoteContribution('host').face, 'host');
+  assert.equal(remoteMod.remoteContribution('client').face, 'client');
+
+  // ④ 状态语义：seen / dismissed / 提炼待办都要落盘
+  const root = path.join(os.tmpdir(), `memfuse-remote-${Date.now()}`);
+  t.after(() => fsp.rm(root, { recursive: true, force: true }));
+  const h = fakeCtx();
+  const api = mod.apply(h.ctx, { root, git: false, verbose: false, extract: { autoRunOnStart: false } });
+  const { store, state } = await api.ready;
+
+  await mod.markSuggestionsSeen(store, state, ['a,b', 'c,d']);
+  assert.equal(Object.keys(state.skillSeen).length, 2, 'skillSeen 要落进 state');
+  assert.equal(await mod.dismissSuggestion(store, state, 'a,b'), 1);
+  assert.equal(await mod.requestDistillKey(store, state, 'a,b'), 1);
+  await mod.requestDistillKey(store, state, 'a,b');
+  assert.equal(state.distillRequests.length, 1, '同一个 key 不重复记');
+  await mod.clearDistillRequest(store, state, 'a,b');
+  assert.equal(state.distillRequests.length, 0, '提炼成功后待办要划掉（否则每轮都在催）');
+
+  const written = JSON.parse(await fsp.readFile(path.join(root, '.memory', 'state.json'), 'utf8'));
+  assert.deepEqual(Object.keys(written.skillSeen).sort(), ['a,b', 'c,d']);
+
+  console.log('  ✅ Remote：描述符合法 + 绑定正确 + seen/dismiss/提炼待办都能落盘');
+});
+
 test('抽取四形态：默认关闭 / 开关开了但没选模型 / 跟随对话模型 / 显式挑选', async (t) => {
   const llm = fakeLlm('[]');
   llm.listProviders = async () => [{ id: 'real-p', name: 'Real' }];
@@ -1830,6 +2051,33 @@ test('H7 技能建议：够格就出现在注入里，且不调模型', async (t
   // 核心断言：识别与提示**零模型调用**
   assert.equal(modelCalls, 0, `只做建议不该调模型，实际调了 ${modelCalls} 次`);
   console.log('  ✅ 够格 → Block E 提示（含作用/成员），模型调用数 = 0');
+});
+
+test('H8 卡片只显示 suggestMax 组，其余记 seen 并报数（缺陷 22）', async () => {
+  const mk = (key, score) => ({ key, score, seedTitle: key, members: [], reasons: [], tags: [], useWhen: '' });
+  const all = [mk('a', 9), mk('b', 7), mk('c', 6), mk('d', 5)];
+
+  // 默认 1 组：只显示第一个，其余把 key 交回去（卡片渲染时一起记 seen）
+  let picked = mod.selectUiSuggestions(all, {}, [], 1);
+  assert.deepEqual(picked.shown.map((s) => s.key), ['a'], '默认只显示 1 组（与 Block E 同口径）');
+  assert.deepEqual(picked.restKeys, ['b', 'c', 'd']);
+  assert.equal(picked.shown.length + picked.restKeys.length, 4, '一组都不能丢');
+
+  // 看过的、已点「提炼」的都不进队列
+  picked = mod.selectUiSuggestions(all, { a: 1 }, ['b'], 1);
+  assert.deepEqual(picked.shown.map((s) => s.key), ['c']);
+  assert.deepEqual(picked.restKeys, ['d']);
+
+  // 配成 2 就显示 2 组
+  picked = mod.selectUiSuggestions(all, {}, [], 2);
+  assert.deepEqual(picked.shown.map((s) => s.key), ['a', 'b']);
+  assert.deepEqual(picked.restKeys, ['c', 'd']);
+
+  // 非法值兜底成 1（NaN / 0 / 负数）
+  for (const bad of [Number.NaN, 0, -3, undefined]) {
+    assert.equal(mod.selectUiSuggestions(all, {}, [], bad).shown.length, 1, `suggestMax=${String(bad)} 应兜底成 1`);
+  }
+  console.log('  ✅ 卡片行数 = skill.suggestMax（默认 1），其余组不丢、也不排队刷屏');
 });
 
 test('H7 Block E 排在 Block D 之前 —— 故障保持末尾高显著位', async (t) => {

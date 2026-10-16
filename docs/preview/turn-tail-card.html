@@ -1,0 +1,283 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>dsh-memfuse · 回合尾候选卡片（离线预览）</title>
+<style>
+  /* 设计令牌取自 DSH 官方主题（@deepseek-ai/dsh-client-ui-theme 的 base.css / tokens），
+     卡片本体用的是下面这些同名变量，所以这里的观感与真机一致。 */
+  :root {
+    --dsw-alias-bg-base: rgb(255, 255, 255);
+    --dsw-alias-bg-layer-1: rgb(255, 255, 255);
+    --dsw-alias-bg-layer-2: rgb(255, 255, 255);
+    --dsw-alias-label-primary: rgb(15, 17, 21);
+    --dsw-alias-label-secondary: rgb(97, 102, 107);
+    --dsw-alias-label-tertiary: rgb(129, 133, 140);
+    --dsw-alias-border-l1: rgba(0, 0, 0, .04);
+    --dsw-alias-border-l2: rgba(0, 0, 0, .1);
+    --dsw-alias-border-l3: rgba(0, 0, 0, .12);
+    --dsw-alias-border-l4: rgba(0, 0, 0, .16);
+    --dsw-alias-interactive-bg-hover: rgba(38, 49, 72, .06);
+    --dsw-alias-state-business-primary: rgb(65, 118, 230);
+    --dsw-alias-state-success-primary: rgb(34, 197, 94);
+    --dsw-alias-settings-card-fill: var(--dsw-alias-bg-layer-2);
+    --dsw-alias-settings-card-stroke: var(--dsw-alias-border-l4);
+    --dsw-radius-sm: 8px;
+    --dsw-radius-md: 12px;
+    --dsw-radius-lg: 16px;
+    --dsw-font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", "PingFang SC", "Microsoft YaHei", sans-serif;
+    --page-panel: rgb(249, 250, 251);
+    --page-code: rgb(245, 245, 245);
+  }
+  body[data-ds-dark-theme] {
+    --dsw-alias-bg-base: rgb(21, 21, 23);
+    --dsw-alias-bg-layer-1: rgb(35, 35, 36);
+    --dsw-alias-bg-layer-2: rgb(44, 44, 46);
+    --dsw-alias-label-primary: rgb(249, 250, 251);
+    --dsw-alias-label-secondary: rgb(207, 211, 214);
+    --dsw-alias-label-tertiary: rgb(173, 178, 184);
+    --dsw-alias-border-l1: rgba(255, 255, 255, .06);
+    --dsw-alias-border-l2: rgba(255, 255, 255, .12);
+    --dsw-alias-border-l3: rgba(255, 255, 255, .16);
+    --dsw-alias-border-l4: rgba(255, 255, 255, .2);
+    --dsw-alias-interactive-bg-hover: rgba(255, 255, 255, .08);
+    --page-panel: rgb(30, 30, 32);
+    --page-code: rgb(27, 27, 28);
+  }
+
+  * { box-sizing: border-box; }
+  body {
+    margin: 0;
+    background: var(--dsw-alias-bg-base);
+    color: var(--dsw-alias-label-primary);
+    font: 14px/22px var(--dsw-font-family);
+  }
+  header {
+    display: flex; align-items: baseline; gap: 12px; flex-wrap: wrap;
+    padding: 18px 24px; border-bottom: .5px solid var(--dsw-alias-border-l2);
+  }
+  header h1 { font-size: 16px; margin: 0; }
+  header p { margin: 0; color: var(--dsw-alias-label-secondary); font-size: 13px; }
+  header button {
+    margin-left: auto; border: .5px solid var(--dsw-alias-border-l3); background: none;
+    color: var(--dsw-alias-label-primary); border-radius: var(--dsw-radius-sm);
+    font: inherit; font-size: 12px; padding: 4px 12px; cursor: pointer;
+  }
+  header button:hover { background: var(--dsw-alias-interactive-bg-hover); }
+
+  main { display: grid; grid-template-columns: minmax(0, 1.35fr) minmax(320px, 1fr); gap: 0; align-items: start; }
+  @media (max-width: 960px) { main { grid-template-columns: 1fr; } }
+
+  .stage { padding: 24px; min-width: 0; }
+  .conversation { max-width: 760px; }
+  .bubble { border-radius: var(--dsw-radius-lg); padding: 10px 14px; margin-bottom: 12px; }
+  .bubble.user { background: var(--page-panel); border: .5px solid var(--dsw-alias-border-l2); }
+  .bubble.assistant { background: none; border: none; padding: 0 0 4px; color: var(--dsw-alias-label-primary); }
+  .bubble.assistant .who { color: var(--dsw-alias-label-secondary); font-size: 12px; margin-bottom: 4px; }
+  .tail { margin: 4px 0 10px; }
+  .tail-empty { margin: 0; color: var(--dsw-alias-label-tertiary); font-size: 12px; }
+  .actionbar {
+    display: flex; gap: 14px; color: var(--dsw-alias-label-tertiary);
+    font-size: 12px; border-top: .5px solid var(--dsw-alias-border-l1); padding-top: 8px;
+  }
+  .caption { max-width: 760px; color: var(--dsw-alias-label-secondary); font-size: 12px; margin-top: 18px; }
+
+  aside { border-left: .5px solid var(--dsw-alias-border-l2); padding: 24px; min-width: 0; }
+  aside h2 { font-size: 12px; color: var(--dsw-alias-label-secondary); margin: 18px 0 8px; font-weight: 500; }
+  aside h2:first-child { margin-top: 0; }
+  .kv { font-size: 12px; line-height: 20px; color: var(--dsw-alias-label-primary); }
+  .kv code, .log code, pre { font-family: Consolas, "SF Mono", monospace; }
+  .kv code { background: var(--page-code); padding: 1px 4px; border-radius: 4px; }
+  .log { font-size: 12px; line-height: 18px; max-height: 260px; overflow: auto; background: var(--page-code); border-radius: var(--dsw-radius-sm); padding: 8px 10px; }
+  .log div { white-space: pre-wrap; word-break: break-word; }
+  pre { background: var(--page-code); border-radius: var(--dsw-radius-sm); padding: 10px; font-size: 12px; line-height: 18px; white-space: pre-wrap; margin: 0; }
+  .scenarios { display: flex; flex-wrap: wrap; gap: 8px; }
+  .scenarios button {
+    border: .5px solid var(--dsw-alias-border-l3); background: none; color: var(--dsw-alias-label-primary);
+    border-radius: var(--dsw-radius-sm); font: inherit; font-size: 12px; padding: 4px 10px; cursor: pointer;
+  }
+  .scenarios button:hover { background: var(--dsw-alias-interactive-bg-hover); }
+  .hint { color: var(--dsw-alias-label-tertiary); font-size: 12px; margin: 8px 0 0; }
+</style>
+</head>
+<body data-ds-dark-theme>
+
+<header>
+  <h1>回合尾候选卡片 · 离线预览</h1>
+  <p>渲染的是 <code>lib/client.js</code> 里那张真卡片（同一段 CSS、同一份字典），宿主那一侧是假数据。</p>
+  <button type="button" id="theme">切到浅色</button>
+</header>
+
+<main>
+  <section class="stage">
+    <div class="conversation">
+      <div class="bubble user">帮我部署到测试环境。</div>
+      <div class="bubble assistant">
+        <div class="who">助手（示意）</div>
+        我先看一下 <code>scripts/deploy.sh</code> 的参数……
+      </div>
+      <!-- 真实卡片渲染到这里（conversation.chat.turnTail） -->
+      <div class="tail" id="tail"></div>
+      <div class="actionbar"><span>复制</span><span>重新生成</span><span>重新开始</span></div>
+    </div>
+    <p class="caption">
+      卡片出现的位置就是这里：<strong>回复下方、回合操作行上方</strong>（槽位 <code>conversation.chat.turnTail</code>，id <code>dsh-memfuse#suggestions</code>）。
+      它不是弹窗、不是通知、不抢焦点：<strong>没有候选时这块什么都没有</strong>（组件返回 <code>null</code>，不占位置）。
+    </p>
+  </section>
+
+  <aside>
+    <h2>宿主状态（真机上就是 <code>state.json</code>）</h2>
+    <div class="kv" id="state"></div>
+
+    <h2>界面 → 宿主 的调用</h2>
+    <div class="log" id="log"></div>
+
+    <h2>下一轮注入里会多出这段（Block E 示意）</h2>
+    <pre id="blocke"></pre>
+
+    <h2>场景（点一下看流程）</h2>
+    <div class="scenarios">
+      <button type="button" data-scene="turn">① 什么都不点，直接进下一轮</button>
+      <button type="button" data-scene="grow">② 这一簇长大了（成员变多）</button>
+      <button type="button" data-scene="new">③ 又来了一组新候选</button>
+      <button type="button" data-scene="reset">↺ 重置</button>
+    </div>
+    <p class="hint">真机上去抖是 1.5 秒，所以点完场景这里会稍等一秒再刷新。</p>
+  </aside>
+</main>
+
+<!-- ① 先支好模块加载器（真实客户端就是这么拿 bundle 的） -->
+<script>
+  window.__MEMFUSE_BUNDLE__ = null;
+  window.__ModuleLoader__ = {
+    load(spec) {
+      window.__MEMFUSE_BUNDLE__ = spec;
+    },
+  };
+</script>
+<!-- ② 真正的客户端半边（会自己把 CSS 注进 <head>） -->
+<script src="../../lib/client.js"></script>
+<!-- ③ 起预览 -->
+<script type="module">
+  import { startPreview } from './preview.mjs';
+
+  const logBox = document.getElementById('log');
+  const stateBox = document.getElementById('state');
+  const blockE = document.getElementById('blocke');
+
+  const escapeHtml = (text) =>
+    String(text).replace(/[&<>]/g, (ch) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;' })[ch]);
+
+  const addLog = (line) => {
+    const row = document.createElement('div');
+    row.textContent = `· ${line}`;
+    logBox.appendChild(row);
+    logBox.scrollTop = logBox.scrollHeight;
+  };
+
+  const renderState = (state) => {
+    if (!state) return;
+    const rows = state.groups
+      .map((group) => {
+        const flags = [
+          state.dismissed.includes(group.key) ? '已「不用」' : '',
+          state.pending.includes(group.key) ? '已点「提炼」' : '',
+          state.seen.includes(group.key) ? '已「看过」' : '',
+        ].filter(Boolean).join(' · ');
+        return `· <code>${escapeHtml(group.key)}</code> ${escapeHtml(group.seedTitle)} —— ${group.members} 条 · ${group.score} 分${flags ? `（${flags}）` : ''}`;
+      })
+      .join('<br />');
+    // 缺陷 25：待确认的**技能草稿**（真宿主上就是 pending-skills/ 里的东西）
+    const drafts = (state.drafts ?? [])
+      .map((draft) => `· <code>${escapeHtml(draft.name)}</code> 待你决定：装进技能库 / 丢掉`)
+      .join('<br />');
+    stateBox.innerHTML = [rows || '（没有候选）', drafts].filter(Boolean).join('<br />');
+  };
+
+  const renderBlockE = (state) => {
+    if (!state) return;
+    const lines = [];
+    const pending = state.groups.filter((group) => state.pending.includes(group.key));
+    if (pending.length) {
+      for (const group of pending) {
+        lines.push(
+          `**用户在界面上按了「提炼」**：${group.seedTitle} —— 请用 memfuse_skill action=distill 提炼它，先给草稿、不要直接装进技能库。`,
+        );
+      }
+    }
+    const fresh = state.groups.filter((group) => !state.seen.includes(group.key) && !state.dismissed.includes(group.key));
+    for (const group of fresh) {
+      lines.push(`**${group.seedTitle}** —— 共 ${group.members} 条记忆够格固化成技能`);
+      lines.push(`· 作用：${group.useWhen}`);
+      lines.push(`· 够格理由：${group.reasons.slice(0, 3).join('；')}`);
+    }
+    blockE.textContent =
+      lines.length === 0
+        ? '（这段现在不会出现：要么已经「看过」，要么已经「不用」—— 这就是「不能一直提示」）'
+        : lines.join('\n');
+  };
+
+  const preview = startPreview({
+    window,
+    document,
+    bundle: window.__MEMFUSE_BUNDLE__,
+    target: document.getElementById('tail'),
+    onLog: (line) => {
+      addLog(line);
+      renderBlockE(window.__PREVIEW_STATE__);
+    },
+    onState: (state) => {
+      window.__PREVIEW_STATE__ = state;
+      renderState(state);
+      renderBlockE(state);
+    },
+  });
+
+  const SCENES = {
+    turn: [
+      '什么都不点，直接进下一轮（重新渲染回合尾）',
+      () => {},
+    ],
+    grow: [
+      '这一簇长大了：成员 2 → 4（簇身份 key 跟着变，等于新的一组）',
+      (s) => s.grow('m_ui_9f2a', 2),
+    ],
+    new: [
+      '又来了一组新候选',
+      (s) =>
+        s.add({
+          key: 'm_new_77aa',
+          seedTitle: 'Node 的 ESM 缓存：改宿主代码必须换进程',
+          members: 2,
+          score: 6,
+          useWhen: '改了 DSH 插件的宿主半边、要验证生效时召回',
+          reasons: ['跨 2 个会话被召回', '含步骤性内容'],
+        }),
+    ],
+    reset: ['重置演示数据', (s) => s.reset()],
+  };
+
+  for (const button of document.querySelectorAll('[data-scene]')) {
+    button.addEventListener('click', () => {
+      const [label, mutate] = SCENES[button.dataset.scene];
+      if (button.dataset.scene === 'turn') {
+        addLog(`场景：${label}`);
+        preview.render();
+      } else {
+        preview.scenario(label, mutate);
+      }
+    });
+  }
+
+  const themeButton = document.getElementById('theme');
+  themeButton.addEventListener('click', () => {
+    const dark = document.body.hasAttribute('data-ds-dark-theme');
+    if (dark) document.body.removeAttribute('data-ds-dark-theme');
+    else document.body.setAttribute('data-ds-dark-theme', '');
+    themeButton.textContent = dark ? '切到深色' : '切到浅色';
+  });
+</script>
+</body>
+</html>

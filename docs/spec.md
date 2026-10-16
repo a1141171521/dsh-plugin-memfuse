@@ -1514,6 +1514,471 @@ client half 自己补一行状态文案（`role="status"`，带 `data-state`）�
 | `saved` | 已保存 ✓ 配置已生效（保存成功置位；任何一次新改动立刻撤销） |
 | `clean` | 当前显示的就是已生效的配置，没有未保存的改动（所以「保存」是灰的）。 |
 
+### H8 界面数据通道：手写 Typert 贡献 + 回合尾候选卡片（2026-10-15）
+
+**需求**（`docs/NEXT.md` §1）：候选要**直接出现在界面里**，而且"用户忽略了不能一直提示"。
+
+#### 拦路虎：客户端怎么读宿主侧的 memfuse 数据
+
+`docs/NEXT.md` §1.3 记的三个未知点，这一轮全部查明（**读本机宿主包，不是猜**）：
+
+| 未知点 | 结论 | 依据 |
+|---|---|---|
+| 插件能不能往 `remote` 上挂自己的方法？ | **能**，且不需要代码生成器 | `dsh-typert-registry/README.md`：*"any other owner calls `ctx.typert.register(contribution)` directly"* |
+| 需要 zod 吗？ | **不需要** | 注册表只校验 `codec.mode==='strict'` + `typeSymbol` 非空 + `create()` 是函数；运行时只调 `codec.create().parse(value)`（`dsh-api-gateway/lib/index.js:1513` 的 `decode()`） |
+| 服务怎么被网关认？ | Service 上挂一个 `typertRemote` 绑定即可 | `dsh-api-gateway/lib/index.js` 的 `validateBinding`；绑定的构造就是 `Object.freeze({service, serviceKey, namespace})`（`dsh-typert-protocol/lib/index.js` 的 `bindTypertRemote` 返回值） |
+
+实现落在 `lib/remote.js`（零第三方依赖，只用 `node:` + 宿主自带包）。
+
+#### ⚠️ 两侧字段名不同：宿主 `invocations`、客户端 `descriptors`
+
+第一版把两份贡献都写成 `descriptors`：**宿主一声不吭地收下了**（`register()` 读
+`contribution.invocations` → `undefined` → 什么都不注册，也不报错），
+而 status.md 写着「✅ 已装上（4 个端点）」，探针一查 **0/4 可路由**。
+翻源码才对上：
+
+```js
+// 宿主 dsh-typert-registry/lib/index.js:398
+register(contribution) {
+  const invocations = contribution.invocations;   // ← 宿主读这个
+  this.localStore.validate(invocations); … localStore.commit(owner, invocations);
+}
+// 客户端 dsh-api-gateway/lib/client.js 的 mountContribution
+for (const descriptor of contribution.descriptors) …  // ← 客户端读这个
+```
+
+⇒ 现在 `remoteContribution('host')` 给 `invocations`，`remoteContribution('client')` 给
+`descriptors`，**描述符本身字段一致**，并有测试逐字段比对两份（防漂移）。
+
+#### 装完必须**自校验**（否则就是"看起来装了其实没装"）
+
+`installRemoteHost()` 现在注册完立刻回读 `typert.local.get('<ns>/<method>')`：
+拿不到就判失败、撤掉已注册的东西、记 `runtimeFaults.remoteFail` → Block D + status.md。
+**这条正是上面那个坑的唯一防线**（没有它，字段名写错的表现只是"卡片不出现"）。
+
+#### 七个端点 + 状态语义
+
+| 端点 | 语义 |
+|---|---|
+| `memfuse/list` | 候选组（含 `seen` 标记）+ `seen/dismissed/pendingDistill` 计数 + **`pendingSkills`（待确认草稿，含 SKILL.md 原文）** |
+| `memfuse/dismiss` | 用户"不用" → `state.skillDismissed`（**prompt 与卡片都不再提**） |
+| `memfuse/markSeen` | 卡片**渲染即记** → `state.skillSeen`（只让卡片不再重复出现） |
+| `memfuse/requestDistill` | 用户点「提炼」→ `state.distillRequests` 待办（**兜底路径**，见缺陷 25） |
+| `memfuse/distill` | **界面上的「提炼成技能」真的调模型写出 SKILL.md** → 进 `pending-skills/`，把草稿（含正文）交回界面（缺陷 25） |
+| `memfuse/approve` | 把草稿**装进技能库**（= 移动 + 自校验 + `derived-into` 反向标记 + 回读宿主 `skills` 交叉验证） |
+| `memfuse/reject` | 丢掉这份草稿 |
+
+`seen` 与 `dismissed` 的分工就是"不能一直提示"的答案（`docs/NEXT.md` §1.4 方案 A），
+两者都落在**宿主** state.json —— prompt 与卡片**共用同一份状态**（两边各存一套必然打架）。
+簇成员变化 → key 变 → 会再提一次（期望行为）。
+
+注入侧（`lib/inject.js`）：`distillRequests` 里的 key 会让 Block E 多一行
+> **用户在界面上按了「提炼」**：<标题> —— 现在就该调用 `memfuse_skill action=distill`
+
+也就是"界面点一下 → 下一轮模型去执行工具"（提炼仍然由模型做，界面不偷偷调模型）。
+⚠️ **缺陷 25 之后这条只是兜底**：界面自己能提炼（`memfuse/distill`，用户点按钮 = 显式触发），
+只有宿主这侧提炼不了（没开抽取 / 没模型 / 模型报错）时，客户端才顺手记一条待办，
+让下一轮对话里的模型去补 —— 两条路都不丢。
+
+#### 界面：`conversation.chat.turnTail`（list 槽，session 作用域）
+
+注册 `{name:'conversation.chat.turnTail', id:'dsh-memfuse#suggestions', order:10}`
+（**别复用官方 id**，那会顶掉人家的格子）。卡片两段：
+
+1. **候选段**：`[提炼成技能] [不用（别再提）]`，没有候选或通道坏掉时返回 `null`（不搅乱回合尾部）；
+2. **草稿段**（缺陷 25）：点「提炼成技能」→ 一行"正在提炼…" → **技能名 + 作用 + SKILL.md 全文
+   （等宽可滚）+ `[装进技能库] [丢掉]`**，装/丢之后留一句结果说明。
+
+客户端那份贡献经 `ctx.remote.$mount()` 挂载（face 必须是 `client`）。
+
+#### 真机验证（headless 夹具 + 探针，2026-10-15）
+
+```
+[memfuse-probe] Remote 端点：4/4 可路由；服务 memfuseRemote：已 provide
+memfuse/list -> OK (memfuseRemote)      memfuse/dismiss -> OK (memfuseRemote)
+memfuse/markSeen -> OK (memfuseRemote)  memfuse/requestDistill -> OK (memfuseRemote)
+✅ 本机冒烟全部通过（Block A/B/E + dismiss + 隔离 + Remote）
+```
+
+（上面是**当时**的 4 个端点。缺陷 25 之后是 7 个 —— 探针与 status.md 都按
+`REMOTE_ENDPOINTS` 动态列，`status.md` 那行应写「✅ 已装上（7 个端点）」。）
+
+⚠️ **界面那一侧要重启 desktop 才能看到**（客户端 bundle 与宿主模块都要重新加载）；
+重启后判据：
+
+```
+cordis_inspect_query(client, Slots, listSubTree, {root:'conversation.chat.turnTail'})
+  → occupants 里应出现 { registrant: "mf", id: "dsh-memfuse#suggestions", active: true }
+```
+
+#### 缺陷 15 / 16（2026-10-16，真机重启后）：卡片**注册了却永远不出现** —— 两个叠加的静默失败
+
+用户重启 desktop 后问"现在是以什么形式弹出来的卡片？"。一查客户端槽位树：
+`conversation.chat.turnTail` 的 occupants 里**确实有** `dsh-memfuse#suggestions`（`active: true`），
+但宿主 `state.json` 里 **`skillSeen` 一直是空的** —— 说明卡片那侧**从来没成功拉到过数据**。
+两个原因叠在一起，**任何一个单独都足以让卡片永不出现，而且都是零报错**：
+
+**缺陷 15：`ctx.remote.memfuse` 被 cordis 的注入校验挡下。**
+点号命名的服务（`remote.<namespace>`）是**独立服务**，访问它必须在 fiber 的 inject 里声明。
+本机实测（真 cordis，见 `.probe/cordis-inject-probe.mjs`）：
+
+```
+③ 无 inject 访问 ctx.remote.demo -> 抛错：cannot get property "remote.demo" without inject
+⑤ ctx.inject(["remote.demo"]) 里访问 -> pong
+```
+
+而 `SuggestionFeed.call()` 当时用的是**插件根 ctx**（inject 只有
+`slots / locale / configForms / remote / remote.session`）→ `list()` 每次都抛 →
+被自己的 try/catch 收进 `snapshot.error` → 卡片那句
+`if (state.status !== 'ready' …) return null` → **什么都不显示**。
+
+修法照抄官方 voice-input 的客户端半边（`dsh-experimental-client-ui-voice-input/lib/client.js`
+的 `mountVoiceInput`）：
+
+```js
+disposeRemote = await ctx.remote.$mount(remoteContribution());   // ① 先挂：命名空间服务这时才 provide
+cardFiber = ctx.inject(['remote.memfuse', 'slots', 'locale'], (child) => {  // ② 再声明着取子 ctx
+  const feed = new SuggestionFeed(child);                                    //   数据源必须用子 ctx
+  child.slots.inject(SUGGEST_SLOT, () => child.slots.register({ … }, MemfuseSuggestionCard));
+});
+```
+
+**缺陷 16：字典里的文案写成了函数。**
+官方 locale 的插值是 `template.replace(/\{(\w+)\}/g, …)`（`dsh-client-locale/lib/client.js:1427`）——
+模板**必须是字符串**。我们写过 `suggestMeta: ({members, score}) => …`，
+于是卡片每次渲染都在 `template.replace` 上抛 `TypeError`，表现同样是"卡片永远不出现"。
+现在改成 `'· {members} 条记忆 · {score} 分'` + `t('suggestMeta', {members, score})`。
+
+**防回归（两条都进测试）**：
+- 客户端测试的假 ctx **照抄了 cordis 的注入校验**（用 getter 抛，**不要用 Proxy** ——
+  Proxy 会让 `node --test` 的子进程协议序列化失败，报成一句看不懂的
+  `Unable to deserialize cloned data`）；谁把数据源换回根 ctx，测试立刻炸；
+- 假 `t` 是**真实现**（查字典 + `{name}` 插值 + 非字符串模板会炸），文案再写成函数也立刻炸。
+
+**顺带补的可见性**（硬规则 4）：
+- 通道坏掉时回合尾不再"什么都不显示"，而是渲染一行 `界面通道出错：<原始消息>`；
+- 配置页多一行状态：`候选卡片：已连上（N 组候选待你决定）` /
+  `候选卡片读不到数据：<原始报错>`。卡片不出现时，这两处是唯一的线索。
+
+#### 缺陷 17 / 18（2026-10-16 二次重启后，用户截图暴露的）：通道还是没挂上 + 保存整批被拒
+
+用户重启后在配置页看到两行字，直接把根因写了出来：
+
+```
+界面数据通道没挂上： cannot get property "typert" without inject
+```
+
+**缺陷 18：`ctx.remote.$mount()` 要的是"调用方的 typert"。**
+`$mount` 内部执行 `callerCtx.typert.remotes.register(贡献)`
+（`dsh-api-gateway/lib/client.js` 的 `mountContribution`）—— 用的正是**访问它的那个 ctx**。
+第三方插件的 ctx 不在客户端核心的 isolate 里，**必须自己声明 `typert`**；官方
+`dsh-api-gateway` 的客户端半边自己也 inject 了 `["typert","connection"]`（本机包实测）。
+所以装配要多一层：
+
+```js
+mountFiber = ctx.inject(['typert', 'remote'], (mounter) => {
+  await mounter.remote.$mount(remoteContribution());      // ← 从 mounter 取，不能用根 ctx 的函数
+  cardFiber = mounter.inject(['remote.memfuse', 'slots', 'locale'], (child) => { …卡片… });
+});
+```
+
+⚠️ 细节：`$mount` 读的是 `this.ctx`（谁在调它），所以**必须从 mounter 上取 `$mount`**；
+把根 ctx 的函数 `.call()` 过去是不行的 —— 测试里的替身用 `this.allowed` 复刻了这个行为，
+随手写错就红。
+
+**缺陷 17：`skill.suggest` 没标 `.volatile()`，一按保存整批被拒。**
+
+宿主只接受 volatile 路径的写入（`dsh-settings/lib/index.js:629` 抛
+`Config field "<path>" is not volatile`），而且**一次 mutate 里只要有一个非法 op，整批都会被拒**。
+配置页上那个「记忆够格时提示『可提炼成技能』」开关写的正是 `skill.suggest`，
+但它当初漏了 `.volatile()` —— 于是用户改它一按保存就是「保存失败，请重试。」，
+**同批里本来合法的字段（模型、降级、落盘方式）也一起丢**。
+
+两处修：① `lib/config.js` 给 `skill.suggest` 补 `.volatile()`；
+② `lib/client.js` 把"改过哪些路径"显示出来 —— 官方 `ConfigFormController.mutate` 失败时
+**把宿主原话丢掉了**（`if (!response.ok) { await this.recover(); return false; }`，
+`dsh-client-ui-settings/lib/client.js:1183`），所以只能自己写路径，否则用户手里只有一句"保存失败"。
+
+**防回归**：`lib/client.js` 导出 `WRITABLE_PATHS`（配置页会写的全部路径），
+`test/client.test.mjs` 拿它逐个比对宿主 schema 的 `.meta.volatile` ——
+**以后再摆一个没标 volatile 的控件，测试当场红**。
+
+#### 缺陷 19 / 20（2026-10-16 三次重启后，卡片终于出现，随即暴露的两个问题）
+
+卡片挂上了、也渲染出来了，用户马上发现两件事：一按按钮就报错；卡片在**每个回合**尾巴上都来一张。
+
+**缺陷 19：描述符的参数漏了 `source: 'json'` → 被当成 lookup 参数。**
+
+用户点「提炼」得到：
+
+```
+界面通道出错：typert gateway: memfuse/markSeen: lookup parameter "keys" has no provider key
+```
+
+宿主 `resolveParameter()` 的判据就这么一行（`dsh-api-gateway/lib/index.js:1099`）：
+
+```js
+if (parameter.source === "json") return value;
+const key = parameter.lookup;              // ← 走到这里就要求 provider key
+if (key === void 0) throw new TypertGatewayError("gateway/lookup-unavailable", endpoint,
+  `lookup parameter ${JSON.stringify(parameter.name)} has no provider key`, …);
+```
+
+也就是说：**`source` 缺失 ≠ `'json'`，会被当成 lookup 参数**。表现极具误导性：
+**没参数的 `memfuse/list` 一切正常（卡片都能显示），一按带参数的按钮就报错**。
+修法：参数统一由 `jsonParam(name, codec)` 生成（`lib/remote.js` 与 `lib/client.js`
+两份都要改，parity 测试锁死）。
+
+**缺陷 20：卡片长在了每一个回合的尾巴上。**
+
+`conversation.chat.turnTail` 是**按回合渲染**的（`dsh-client-ui-chat` 的
+`TurnTailNodeView` 给每个回合都渲染一次 turnTail），所以一席长对话会冒出几十张卡片。
+修法照抄官方 owner 自己的判据（它判"这一段是不是最后一段"用的就是同一个）：
+
+```js
+const isLastTurn = props.useChat((snapshot) =>
+  String(snapshot?.timeline?.turnOrder?.at(-1)) === String(props.turn));
+```
+
+⚠️ 两个细节：① hooks 不能有条件地调用 —— `useChat` 与 `useMemfuseSuggestions`
+必须**每次渲染都按同样顺序**调用，早退放在两者之后；② 拿不到 `turnOrder` 时按"是"处理
+（别把功能藏起来），本地预览页正是这种情况。
+
+#### 缺陷 22（2026-10-16）：卡片一屏摆了 5 行 → 行数跟 `skill.suggestMax` 走
+
+卡片能用了之后，用户看到的第一版是**一次 5 行**（`computeSuggestions` 的 `limit: 5`）——
+"太多了，默认 1 组就可以"。
+
+改法与 Block E **同口径**：`skill.suggestMax`（默认 1）——注入里最多提几组，卡片上就最多几行。
+关键是**别把剩下的组变成"排队刷屏"**：宿主 `list` 把没显示的组的 key 一并交回
+（`restCount` / `restKeys`），卡片渲染时**把它们一起记 seen**；它们并没有丢 ——
+Block E 与 `memfuse_skill action=list` 里照样看得到、能提炼。卡片上多一行说明：
+`（另有 N 组同类候选 —— 用 memfuse_skill action=list 查看）`。
+
+抽取逻辑落成纯函数 `selectUiSuggestions(suggestions, seen, pending, max)`（`lib/index.js`），
+`test/plugin.test.mjs` 直接测它：默认 1 组、看过/待提炼的不进队列、配 2 就显示 2 组、
+`NaN / 0 / 负数` 兜底成 1。
+
+#### 缺陷 23（2026-10-16）：卡片**一闪而过**（渲染即记 seen + 渲染路径上的去抖刷新）
+
+真机现象：用户重启后**永远看不到卡片**，而 `state.json` 里 `skillSeen` 的时间戳一次比一次新
+（`04:39:53`、`04:40:55`…）—— 说明卡片**确实渲染了**，只是渲染完就自己消失了。
+
+根因是两条设计撞在一起：
+
+1. 卡片**渲染即记 seen**（`markSeenForVisible`）；
+2. 渲染路径上还挂着一次去抖刷新（`touch()` → 1.5s 后 `list`）—— 而那次 `list` 回来时
+   那几组**已经记过 seen 了**，`visible` 被清成 `[]`，卡片当场 `return null`。
+
+（去抖刷新本身是必要的：客户端没有轮询通道，"新候选自己冒出来"要靠它当心跳。）
+
+修法：**卡片按回合"领一次、钉住"**（`lib/client.js`）：
+
+- `feed.claim()` —— 把宿主刚交回来、还没给过任何回合的那几组**领走**（领走即从共享快照里清空）；
+- 卡片把领到的那一份**钉在 `<sessionId>:<turn>` 上**（`pinnedCard`），渲染只读这一份 ——
+  于是"那次空刷新"再也撤不掉它；
+- 键里有 `turn` / `sessionId`，所以**不会**串到别的回合（否则就是缺陷 20 的"每个回合都来一张"）
+  或别的对话（"每个对话底部都出现"）；
+- 用户点了「提炼 / 不用」→ `unpinRow()` 把那一行从钉住的那份里去掉（否则"点了没反应"）；
+- **过期响应丢掉**：`loadSeq` 在每次 `load()` / `claim()` 时 +1，先发出的 `list` 回来时如果序号
+  变了就整份丢弃 —— 真机启动时"挂载那次 load"与"卡片渲染推的那次 load"确实同时在飞，
+  不丢的话会把已经摆过、已经记过 seen 的候选塞回 `visible`，下一个回合再摆一遍；
+- 顺带修掉一个**竞态**：要记 seen 的 key 改成在 `publish()` **之前**固定（`seenKeys`）——
+  `publish()` 会立刻触发渲染，渲染里的 `claim()` 把 `visible` 清空，
+  等 publish 之后再从快照里读就读到空的，**显示过的那一组反而永远记不上 seen**。
+
+回归：`test/client.test.mjs` 的「刷新回来是空的，卡片也不许把自己撤掉」把两帧直接喂给组件
+（不真等 1.5s），并断言"不串回合、不串对话、点了就去掉"；预览页为此补了"回合"概念
+（`preview.nextTurn()`，四个场景按钮 = 进下一轮），否则演示出来的语义正好是反的。
+
+#### 缺陷 24（2026-10-16）：**卡片从此再也不出现** —— 那道"最后一个回合"的门比错了东西
+
+用户第三次说"并没有弹出来卡片"。这一轮先把"它可能一闪而过"的解释全部排掉：
+
+- `state.json` 里 `skillSeen` 的时间戳**每次都在写**（`04:39:53`、`04:59:44`、`05:03:27`…）；
+- 渲染器的 V8 Code Cache（`%APPDATA%\@deepseek-ai\dsh-desktop\Code Cache\js\*.js`）里
+  **同时有 `pinnedCard` / `unpinRow`** → 新 bundle 确实在跑；
+- 但屏幕上**永远什么都没有**。
+
+真因在宿主源码里 —— `dsh-client-ui-chat/lib/client.js` 的 `TurnTailNodeView`（L6577）：
+
+```js
+const turn = node.location.kind === "turn" || node.location.kind === "step" ? node.location.turn : void 0;
+…
+renderSlot("conversation.chat.turnTail", { turn, seq: closing?.finalNode.seq ?? data.seq, openFile });
+```
+
+`props.turn` 是 **TurnLocation 对象**（`{turn: <id>, status}`：见 `locationCoordinates()` L8186 的
+`location.turn.turn`、`locationTurnStatus()` L8193 的 `location.turn.status`），
+而 `snapshot.timeline.turnOrder` 里放的是 **id**（官方 owner 的判据是
+`turnOrder.at(-1) !== data.turn`，`data.turn` 就是那个 id；L8205 还用 `presentations.get(node.data.turn)`
+当 Map 键）。缺陷 20 的修法却写成：
+
+```js
+return String(order[order.length - 1]) === String(props.turn);   // ❌ 恒 false
+```
+
+`"5" !== "[object Object]"` → **门永远关着** → 卡片一次都没渲染过。
+
+**为什么这么久没看出来**：`touch()` 在门**之前**调用，所以每一轮照发 `list` + `markSeen` ——
+`skillSeen` 的时间戳看起来完全像"卡片弹过了"。
+**教训：`skillSeen` 只能证明 `touch()` 跑过，不能证明卡片画出来过**（这也是缺陷 23 走偏一轮的原因）。
+
+修法：
+
+```js
+function turnIdOf(turn) {                       // 对象取 .turn / .id，标量原样
+  if (turn !== null && typeof turn === 'object') return turn.turn ?? turn.id;
+  return turn;
+}
+// 门：两边都过 turnIdOf 再比；认不出 id 就按"是"处理（宁可多一张，别把功能藏起来）
+const last = turnIdOf(order[order.length - 1]);
+const mine = turnIdOf(props.turn);
+if (last === undefined || mine === undefined) return true;
+return String(last) === String(mine);
+```
+
+`pinnedCard` 的键一并改成 `<sessionId>:<回合 id>`（缺陷 23 那版直接拼 `props.turn`，
+对象拼出来全是 `"[object Object]"`，会让每个回合共用同一份）。
+
+回归：`test/client.test.mjs` 的「只在最后一个回合尾部渲染」补了**真机形状**的两个断言 ——
+`turn = {turn: 9, status: 'closed'}` + `turnOrder = [1, 9]` → 必须渲染；
+`turn = {turn: 8, …}` → 必须不渲染。
+
+#### 缺陷 25（2026-10-16）：点「提炼成技能」之后**弹框消失了，什么下一步都没有**
+
+卡片终于能显示之后，用户点「提炼成技能」的第一反应是：
+
+> 为什么我点击提炼技能后，弹框消失了，并没有给我弹出创建技能的下一步操作呀？
+> 点提炼技能后，不应该弹出一个框，让我看一下具体的提炼的技能的提示词以及作用吗？
+
+**这一条是我设计错了，不是 bug**：当时那条按钮只做一件事 —— 记一条待办
+（`requestDistill` → `state.distillRequests`），真正的提炼等**下一轮注入**里的 Block E
+催模型去调 `memfuse_skill action=distill`。而卡片那一行又被 `unpinRow()` 当场去掉，
+于是用户看到的就是"点完什么都没发生"。三处叠加：
+
+1. 界面上**没有第二阶段**（没有草稿预览、没有"装/丢"）；
+2. 客户端快照里其实有 `pending` 这个字段，但**从来没渲染过** —— 典型的
+   "功能存在但从不生效"（本项目硬规则 4 点名的失败模式）；
+3. 用户要看的恰恰是**提炼出来的提示词本体 + 它干什么用**，而这两样都只在磁盘上
+   （`pending-skills/<name>/SKILL.md`），界面从来没读过。
+
+修法（**两段式，全部落在卡片里**）：
+
+| 层 | 改动 |
+|---|---|
+| 宿主 | 新增三个端点 `memfuse/distill` / `approve` / `reject`；`list` 多带 `pendingSkills`（含 SKILL.md 原文，**从磁盘读**） |
+| 宿主 | 提炼/安装/丢弃的实现从 `memfuse_skill` 工具里**抽成共享函数**（`distillCluster` / `approveSkill` / `rejectSkill` / `pendingSkillDrafts`）—— 界面与工具**共用同一份**，不再有"两条路各写一遍、迟早漂移" |
+| 客户端 | 点「提炼成技能」→ `distill`（**会调模型**）→ 卡片出现草稿面板：技能名 + 作用 + **SKILL.md 全文**（等宽可滚）+ `[装进技能库] [丢掉]` |
+| 客户端 | 提炼/安装**进行中**要显示（模型可能跑几十秒）；失败**如实显示**（没开抽取 / 没模型 / 模型报错 / 自校验不过） |
+| 客户端 | 装/丢之后写一句结果说明（"已装进技能库：xxx ✓ 当轮即生效"）—— 否则草稿一没、卡片整个消失，又是"点了没反应" |
+| 客户端 | 草稿**不钉住**（与候选行不同）：真源在宿主磁盘上，每次 `list` 都带回来 → 刷新页面草稿还在 |
+
+几条设计取舍（都是有意的）：
+
+- **提炼失败要退化成待办**：宿主这侧没模型（`extract.enabled` 默认关）时，客户端顺手
+  `requestDistill(key)` —— 下一轮 Block E 会催对话里的模型去补。**两条路都不丢**，
+  而且失败原因原样显示在卡片上（不写"重试中"这种糊话）。
+- **`distill` 是唯一会调模型的端点**，且**只由用户点按钮触发**（H7 的"技能是注入即生效的
+  指令，必须显式触发"不变）；界面不会偷偷调模型。
+- **草稿的寿命跟着磁盘走**，不跟着回合走：刷新页面、切对话回来，草稿仍然列在那儿等你决定。
+- **`[装进技能库]` 才是安装**（`approve` → 移动 + 自校验 + `derived-into` 反向标记）；
+  草稿在 `pending-skills/` 里躺着时对 DSH **完全无影响**（不会被加载、不会被注入）。
+
+回归（`test/` 里共 4 处）：
+
+- `plugin.test.mjs`「缺陷 25：界面那条路（提炼 → 草稿预览 → 装/丢）与工具走同一份实现」——
+  真 store + 假模型：候选 key → 草稿（含 SKILL.md 原文 + installPath）→ 装（标 `derivedInto`）
+  → 丢；并断言端点清单与描述符**一一对应**（少一个 = "按钮打到不存在的端点"，症状还是"点了没反应"）。
+- `client.test.mjs` 三条：草稿预览与两个按钮都打到 Remote；提炼失败 → 原因可见 + 自动退化成待办；
+  草稿来自宿主（没有候选行也能渲染出草稿，"丢掉"打到 `reject`）。
+- `preview.test.mjs`：预览页里把整条第二阶段走一遍（点提炼 → 看到 SKILL.md → 装进技能库）。
+
+⚠️ **这条改动要重启 desktop**（宿主模块 + 客户端 bundle 都变了）。重启后判据：
+`status.md` 的「界面通道（Remote）」应写 **7 个端点**；
+点「提炼成技能」后卡片应出现草稿面板（`~/.dsh/memory/.memory/pending-skills/<name>/SKILL.md` 同时出现）。
+
+#### 缺陷 26（2026-10-16）：重启后底部**一直**挂着 `HTTP 404` —— 失败之后没人重试
+
+用户重启 desktop 之后，回合尾部只有一行：
+
+```
+界面通道出错：client api: memfuse/list failed: transport failure for /api/memfuse/list: HTTP 404
+```
+
+**先证明宿主这侧是好的**（别急着改客户端）：
+
+```powershell
+# ~/.dsh/memory/.memory/state.json
+remoteChannel = {"endpoints":7}     # ← 7 个端点全部通过"装完回读"自校验
+runtimeFaults = {}                  # ← 没有运行期故障
+```
+
+即 `installRemoteHost()` 的 `typert.local.get()` 7/7 通过 ——
+**404 不是"没装上"，而是那一次请求赶在宿主网关能应答之前**
+（宿主侧应答判据是 `claimsEndpoint()`：`typert.local.get(endpoint) !== undefined || hasSeen(endpoint)`，
+`dsh-api-gateway/lib/index.js:698`；客户端那侧是 `createWebConnectionRpc` 的 POST，
+`dsh-client-connection/lib/client.js:1227` 抛的就是这句原文）。
+
+**为什么它会一直挂着**（这才是缺陷本身）：卡片的刷新只挂在**渲染**上 ——
+
+```js
+touch() {                                    // 渲染时推一次刷新（去抖 1.5s）
+  if (now - this.lastTouch < 1500 || this.loading) return;
+  …
+}
+```
+
+`load()` 失败会 `publish()` → **立刻**触发一次渲染 → 那次渲染又调 `touch()`，而它距上一次
+`lastTouch` 只有几毫秒 → **被去抖挡掉**。于是第一次 `list` 失败之后，
+**没有任何东西会再拉一次**：那行错误就一直挂在回合尾部，直到用户碰巧发出下一条消息
+（新回合 → 新渲染 → 距上次 touch 已超过 1.5s → 才终于重拉成功）。
+
+> 上一轮我把这条解释成"启动竞态、会自愈"——**只说对了一半**：它确实会自愈，
+> 但自愈的触发条件是"用户再发一条消息"，而不是时间。
+
+修法（客户端两条）：
+
+1. **失败后自己重试**：`scheduleRetry()` —— 最多 3 次，退避 1s / 2s / 4s；
+   任意一次成功就 `clearRetry()`（撤掉还没到点的定时器 + 计数清零）。
+   ⚠️ Node 里 `setTimeout` 返回的对象有 `unref()`，要顺手调一下，否则测试进程会被
+   这几个定时器吊住；浏览器里 `setTimeout` 返回数字、没有 `unref` ——
+   所以写成 `typeof timer?.unref === 'function'`。
+2. **出错时渲染不吃去抖**：`touch()` 里 `const broken = this.snapshot.status === 'error'`，
+   出错就跳过 1.5s 那道门（错误横幅要能立刻被下一次成功收掉）。
+   `markSeenForVisible` 的失败同样接上重试 —— 它也会写 `snapshot.error`。
+
+回归：`test/client.test.mjs` 两条 ——
+① **不渲染卡片**、只等重试定时器，断言快照自己从 `error` 回到 `ready`（`calls === 2`）；
+② 紧跟渲染，断言出错时那次渲染**真的**又拉了一次（去抖不许挡）。
+（第 ① 条故意不渲染：渲染会走第 ② 条那条路，就测不到定时器了。）
+
+#### 离线预览页：不重启也能看这张卡片（`docs/preview/turn-tail-card.html`）
+
+被上面两个坑教育之后补的：卡片只在真机上出现，**没候选时什么都看不到**，
+"它到底长什么样、点下去会发生什么"过去只能读代码。现在有一页离屏预览：
+
+```
+npm run preview          # 起一个本地静态服务并打开 docs/preview/turn-tail-card.html
+```
+
+⚠️ 必须走 http（`docs/preview/serve.mjs`，零依赖 40 行）：预览页用的是
+`<script type="module">`，浏览器在 `file://` 下按 opaque origin 处理模块脚本，
+Chrome/Edge 会直接 CORS 拒掉 —— 表现是"页面壳子出来了、卡片一直不出现"
+（又是本项目最讨厌的那类静默失败）。**双击 HTML 看不到卡片，不是页面坏了。**
+
+它**加载真实的 `lib/client.js`**（同一个 bundle、同一段 CSS、同一张卡片、同一份字典），
+宿主那一侧是假数据（`docs/preview/preview.mjs`），并且：
+
+- 文案走**真字典 + 真插值**，所以"文案写成函数"这类错在预览里就当场炸；
+- `ctx.remote.memfuse` 的访问**照样有注入校验** —— 把缺陷 15 变成活体回归；
+- 侧栏能看宿主状态、每次远程调用的日志、以及**下一轮注入里会多出哪段 Block E**；
+- 四个场景按钮：① 什么都不点进下一轮（卡片消失 = `seen`）② 这一簇长大了（重新出现）
+  ③ 又来一组新候选 ④ 重置。
+
+`test/preview.test.mjs` 用一份迷你 DOM 把它压一遍（渲染、插值、注入链、seen 语义，
+以及**缺陷 25 的第二阶段**：点提炼 → 看到 SKILL.md → 装进技能库）。
+
 ### 配置入口长什么样：**两处**，而且这一版**没有**单独的「配置」按钮（2026-10-15 实测更正）
 
 **我之前的说法是错的**：AGENTS.md / spec 里写「行上会出现『配置』按钮」。

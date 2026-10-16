@@ -34,10 +34,12 @@
     "url": "https://github.com/a1141171521/dsh-plugin-memfuse/issues"
   },
   "scripts": {
-    "test": "node --test test/plugin.test.mjs test/client.test.mjs && node test/smoke.mjs",
+    "test": "node --test test/plugin.test.mjs && node test/client.test.mjs && node test/preview.test.mjs && node test/smoke.mjs",
     "test:smoke": "node test/smoke.mjs",
     "test:plugin": "node --test test/plugin.test.mjs",
-    "test:client": "node --test test/client.test.mjs",
+    "test:client": "node test/client.test.mjs",
+    "test:preview": "node test/preview.test.mjs",
+    "preview": "node docs/preview/serve.mjs",
     "demo": "node test/demo.mjs",
     "demo:suggest": "node test/demo-suggest.mjs",
     "smoke": "node .memfuse-smoke/smoke.mjs"

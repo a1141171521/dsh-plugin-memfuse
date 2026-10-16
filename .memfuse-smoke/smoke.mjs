@@ -29,6 +29,16 @@ const fail = (s) => {
   process.exitCode = 1;
 };
 
+/**
+ * 冒烟用的提示词。
+ *
+ * ⚠️ **必须能命中 seed 里那三条「部署」记忆**（workspace 作用域，tags 含 deploy）——
+ * Block B（相关召回）只在**召回命中**时才渲染（`inject.js`：`if (rel.length)`）。
+ * 早先用 `'hi'`：命中数恒为 0 → Block B 永远不出现 → 那条检查项永远 ❌，
+ * 看起来像"注入坏了"，其实是提示词选错了（教训：**检查项要能被控制变量解释**）。
+ */
+const PROMPT = '帮我部署到测试环境';
+
 // ── 前置检查 ────────────────────────────────────────────
 async function preflight() {
   const problems = [];
@@ -47,6 +57,37 @@ async function exists(p) {
   } catch {
     return false;
   }
+}
+
+/**
+ * 真库有没有被**夹具的内容**污染？
+ *
+ * 判据必须是内容，不能是 mtime：本机（公司机）desktop 宿主一直活着，
+ * 它自己随时在写真库的 state.json / status.md —— mtime 变化说明不了任何事
+ * （本会话就在写）。而下面这些东西**只有夹具才可能有**：
+ *   - seed 种下的那几条记忆（id / 标题）
+ *   - state.json 的 `root` 指向 `.memfuse-smoke`
+ */
+async function realStoreLeak() {
+  const found = [];
+  const markers = ['m_deploy_1', '部署要走 scripts/deploy.sh'];
+  try {
+    const memDir = path.join(realStore, 'memories');
+    for (const f of await fsp.readdir(memDir)) {
+      if (!f.endsWith('.md')) continue;
+      const text = await fsp.readFile(path.join(memDir, f), 'utf8');
+      if (markers.some((m) => text.includes(m))) found.push(`memories/${f} 含夹具记忆`);
+    }
+  } catch {
+    // 目录不存在 = 没碰过
+  }
+  try {
+    const s = JSON.parse(await fsp.readFile(realState, 'utf8'));
+    if (String(s?.root ?? '').includes('memfuse-smoke')) found.push('state.json 的 root 指向夹具');
+  } catch {
+    // 读不到 = 没碰过
+  }
+  return found;
 }
 
 /** 跑一次 dsh，忽略退出码（模型可能因 key 失效而失败，但那不影响注入装配）。 */
@@ -87,6 +128,22 @@ async function readMemfuseBlock() {
 
 // ── 主流程 ──────────────────────────────────────────────
 log('=== dsh-memfuse 本机冒烟 ===\n');
+
+// 真库的**运行前**状态：本机（公司机）~/.dsh/memory 一直在用（白天就在用），
+// 所以"隔离"要证明的是**这次运行没去写它**，而不是"它必须不存在"。
+// 判据：state.json 的 mtime 不变；若它本来不存在，运行后也不能冒出来。
+const realStore = path.join(os.homedir(), '.dsh', 'memory');
+const realState = path.join(realStore, '.memory', 'state.json');
+const stampOf = async (p) => {
+  try {
+    const st = await fsp.stat(p);
+    return String(st.mtimeMs);
+  } catch {
+    return null;
+  }
+};
+const realStoreBefore = await exists(realStore);
+const realStampBefore = await stampOf(realState);
 
 const problems = await preflight();
 if (problems.length) {
@@ -159,7 +216,7 @@ const patches = ['--patch', overlayPath, '--patch', probeOverlayPath];
 // 2) 第一次跑：Block E 应该出现
 log('\n[2/4] 跑真宿主（期望出现 Block E）…');
 await fsp.rm(report, { force: true });
-const r1 = await runDsh(['--profile', profile, ...patches, 'hi']);
+const r1 = await runDsh(['--profile', profile, ...patches, PROMPT]);
 if (r1.timedOut) log('    （超时，但注入装配通常已完成）');
 
 if (!(await exists(report))) {
@@ -215,7 +272,7 @@ log('\n[3/4] 写入 skillDismissed，重跑（期望 Block E 消失）…');
 }
 
 await fsp.rm(report, { force: true });
-const r2 = await runDsh(['--profile', profile, ...patches, 'hi']);
+const r2 = await runDsh(['--profile', profile, ...patches, PROMPT]);
 if (!(await exists(report))) {
   fail('第二次跑探针也没写出报告');
   process.exit(1);
@@ -229,9 +286,21 @@ if (hasE2) fail('dismiss 没生效');
 
 // 4) 隔离校验
 log('\n[4/4] 隔离校验…');
-const realStore = path.join(os.homedir(), '.dsh', 'memory');
-const leaked = await exists(realStore);
-log(`    ${leaked ? '❌' : '✅'} 真库 ~/.dsh/memory ${leaked ? '被创建了（不该）' : '未被触碰'}`);
-if (leaked) fail('隔离失败：碰到了真库');
+{
+  const served = await realStoreLeak();
+  const appeared = !realStoreBefore && (await exists(realStore));
+  const ok = !appeared && served.length === 0;
+  if (appeared) fail('隔离失败：本次运行把真库创建出来了');
+  if (served.length) fail(`隔离失败：真库读到了夹具才有的东西 → ${served.join('；')}`);
+  if (realStampBefore !== (await stampOf(realState))) {
+    // ⚠️ mtime 变了**不能**当故障证据：这台机器上 desktop 宿主一直活着，
+    // 它自己随时在写真库的 state.json / status.md（本会话就在写）。
+    // 所以判据必须是**内容**：真库里有没有出现只有夹具才有的东西。
+    log('    ℹ️  真库 state.json 的 mtime 变了 —— 那是**活着的 desktop 宿主**在写，不算泄漏（内容已核对）');
+  }
+  log(
+    `    ${ok ? '✅' : '❌'} 真库 ${realStore} ${realStoreBefore ? '未被夹具内容污染' : '未被创建'}`,
+  );
+}
 
 log('\n' + (process.exitCode ? '❌ 有失败项' : '✅ 本机冒烟全部通过'));
