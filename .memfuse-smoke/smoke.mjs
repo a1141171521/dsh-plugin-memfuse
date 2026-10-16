@@ -62,7 +62,7 @@ async function exists(p) {
 /**
  * 真库有没有被**夹具的内容**污染？
  *
- * 判据必须是内容，不能是 mtime：本机（公司机）desktop 宿主一直活着，
+ * 判据必须是内容，不能是 mtime：本机（备用机）desktop 宿主一直活着，
  * 它自己随时在写真库的 state.json / status.md —— mtime 变化说明不了任何事
  * （本会话就在写）。而下面这些东西**只有夹具才可能有**：
  *   - seed 种下的那几条记忆（id / 标题）
@@ -129,7 +129,7 @@ async function readMemfuseBlock() {
 // ── 主流程 ──────────────────────────────────────────────
 log('=== dsh-memfuse 本机冒烟 ===\n');
 
-// 真库的**运行前**状态：本机（公司机）~/.dsh/memory 一直在用（白天就在用），
+// 真库的**运行前**状态：本机（备用机）~/.dsh/memory 一直在用（白天就在用），
 // 所以"隔离"要证明的是**这次运行没去写它**，而不是"它必须不存在"。
 // 判据：state.json 的 mtime 不变；若它本来不存在，运行后也不能冒出来。
 const realStore = path.join(os.homedir(), '.dsh', 'memory');
@@ -170,7 +170,7 @@ await fsp.rm(path.join(here, 'memory'), { recursive: true, force: true });
 }
 
 // overlay 里的路径**必须在运行时生成** —— 版本库里那份不能写死绝对路径，
-// 否则换一台机器（公司机在 E:\，本机在 D:\）就直接跑不起来。
+// 否则换一台机器（盘符不同、安装位置不同）就直接跑不起来。
 const fwd = (p) => p.split(path.sep).join('/');
 const overlayPath = path.join(here, 'overlay.generated.yml');
 const probeOverlayPath = path.join(here, 'probe-overlay.generated.yml');

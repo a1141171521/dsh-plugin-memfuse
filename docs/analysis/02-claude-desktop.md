@@ -1,7 +1,7 @@
 # Claude Desktop 记忆 剖析
 
 > 目标：`Claude 2.37337.1.0`（MSIX / Store，`Claude_pzs8sxrjxfjjc`）
-> 安装：`C:\Program Files\WindowsApps\Claude_2.37337.1.0_x64__pzs8sxrjxfjjc\app\`
+> 安装：`<WINDOWSAPPS>\<PackageFamily>\app\`
 > 宿主：Electron，`resources/app.asar` 49 MB
 
 ---

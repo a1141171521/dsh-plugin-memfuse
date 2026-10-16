@@ -1,6 +1,6 @@
 # 云端超级记忆 剖析
 
-> 目标：`D:\云端超级记忆\`（VS Code 1.135.0 分支，产品版本 1.4.0）
+> 目标：`<PRODUCT_DIR>\`（VS Code 1.135.0 分支，产品版本 1.4.0）
 > 形态：解包 Electron 应用（`resources/app/` 非 asar）
 > 存储：`C:\Users\<user>\.<产品目录>\memory.db`（SQLite 3，WAL）
 

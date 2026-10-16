@@ -1,4 +1,4 @@
-# 下一轮开发清单（2026-10-16 收尾 → 公司机继续）
+# 下一轮开发清单（2026-10-16 收尾 → 换机器继续）
 
 > 本文件是给**下一次接手**看的：今天做到哪、停在哪、明天第一步查什么。
 > 背景与取舍的完整记录在 `docs/spec.md` §H7/§H8，不在这里重复。
@@ -291,7 +291,7 @@ ctx.slots.inject('plugins.bundle.config', () =>
 排查路径（**先查本机宿主包，不是文档、不是猜** —— AGENTS.md 纪律）：
 
 ```powershell
-# 宿主包在 D:\DeepseekHarness\... （本机），公司机是 E:\DSH Desktop\...
+# 宿主包在 <HARNESS_SRC>\... （机器 A），机器 B 是 <DSH_APP>\...
 # 1) 找 remote 服务的定义与注册方式
 rg -l "remote" packages/*/lib | rg "dsh-remote|api-remotes"
 # 2) 看官方插件里有没有插件自挂 remote 方法的先例
@@ -333,16 +333,16 @@ rg "remote\.\w+\.(register|provide|define)\(" -g '!node_modules'
 
 ## 2. 环境差异（换机器必读）
 
-| | 本机 | 公司机 |
+| | 机器 A | 机器 B |
 |---|---|---|
-| 宿主 | `D:\DeepseekHarness\` | `E:\DSH Desktop\` |
-| AGENTS.md 里的冒烟命令 | 路径要换成 `D:\DeepseekHarness\...` | 原样可用 |
+| 宿主 | `<HARNESS_SRC>\` | `<DSH_APP>\` |
+| AGENTS.md 里的冒烟命令 | 路径要换成 `<HARNESS_SRC>\...` | 原样可用 |
 | 夹具 profile | `~/.dsh/profiles/memfuse-smoke` **已建** | **需重建**（见下） |
 | API key | ❌ **失效**（`****eUU1 is invalid`）→ 跑不了真模型往返 | 未知 |
 
 > 好消息：`.memfuse-smoke/smoke.mjs` 里**没有任何写死的绝对路径**，overlay 运行时生成，换机器直接跑。
 
-**公司机首次准备夹具**（三条命令）：
+**备用机（第二台开发机）首次准备夹具**（三条命令）：
 
 ```powershell
 $prof = "$env:USERPROFILE\.dsh\profiles\memfuse-smoke"
@@ -353,8 +353,8 @@ New-Item -ItemType Junction -Path "$prof\node_modules\dsh-memfuse" -Target <仓�
 New-Item -ItemType Junction -Path "$prof\node_modules\memfuse-probe" -Target <仓库路径>\.memfuse-smoke\probe
 ```
 
-**git 推送**：本机 `github.com:443` 直连被墙，仓库级代理已配 `127.0.0.1:7897`（需 Clash 开着）。
-公司机若不通：`git config --unset http.proxy` 后改走 SSH（本机实测 `ssh.github.com:443` 与 `github.com:22` 都通）。
+**git 推送**：本机 `github.com:443` 直连被墙，仓库级代理已配 `<LOCAL_PROXY_PORT>`（需 Clash 开着）。
+备用机若不通：`git config --unset http.proxy` 后改走 SSH（本机实测 `ssh.github.com:443` 与 `github.com:22` 都通）。
 
 ---
 
@@ -363,7 +363,7 @@ New-Item -ItemType Junction -Path "$prof\node_modules\memfuse-probe" -Target <�
 | 坑 | 现象 | 根因 / 修法 |
 |---|---|---|
 | **冒烟提示词与 seed 不匹配** | 检查项「相关召回（Block B）」永远 ❌，看起来像注入坏了 | Block B **只在召回命中时渲染**（`inject.js: if (rel.length)`）；smoke 原来发 `'hi'`，而 seed 是三条**部署**记忆 → 命中恒为 0。修法：`smoke.mjs` 用 `PROMPT = '帮我部署到测试环境'`（已修） |
-| **拿 mtime 证明隔离** | 「真库被改写了」—— 但那是**活着的 desktop 宿主**在写自己的库 | 公司机上 desktop 一直开着，它随时写 `~/.dsh/memory/.memory/{state.json,status.md}`（本会话就在写）。**隔离要判内容**：真库里有没有出现只有夹具才有的东西（seed 的 `m_deploy_*` / `state.root` 指向 `.memfuse-smoke`）。已改成内容判据 |
+| **拿 mtime 证明隔离** | 「真库被改写了」—— 但那是**活着的 desktop 宿主**在写自己的库 | 备用机上 desktop 一直开着，它随时写 `~/.dsh/memory/.memory/{state.json,status.md}`（本会话就在写）。**隔离要判内容**：真库里有没有出现只有夹具才有的东西（seed 的 `m_deploy_*` / `state.root` 指向 `.memfuse-smoke`）。已改成内容判据 |
 | **PowerShell `Set-Content -Encoding UTF8` 写 BOM** | `JSON.parse` 报 `Unexpected token ''`，profile 起不来 | 用编辑器/工具写，或 `[IO.File]::WriteAllText` + `UTF8Encoding($false)`。（改 `.mjs` 也会带 BOM：Node 能忍，但别留着） |
 | **Windows ESM 绝对路径** | `ERR_UNSUPPORTED_ESM_URL_SCHEME: protocol 'd:'` | `import(pathToFileURL(p).href)` |
 | **测试脚本自己推簇 key** | 误报"dismiss 没生效" | 按目录列 id 推 key 是**错的**（把 P0 那条也算进簇）→ 必须调插件自己的 `buildSuggestions()` |

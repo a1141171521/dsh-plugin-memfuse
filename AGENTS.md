@@ -182,8 +182,8 @@ DSH 的长期记忆插件。纯文本 Markdown 存储、本地检索。
 **怎么自己再验一遍**（不用重启 desktop，换个进程就行）：
 
 ```powershell
-$dnode = 'E:\DSH Desktop\resources\runtime\primary-runtime\dependencies\node\bin\node.exe'
-$dbin  = 'E:\DSH Desktop\resources\app\dsh\node_modules\@deepseek-ai\dsh\lib\bin.js'
+$dnode = '<DSH_APP>\resources\runtime\primary-runtime\dependencies\node\bin\node.exe'
+$dbin  = '<DSH_APP>\resources\app\dsh\node_modules\@deepseek-ai\dsh\lib\bin.js'
 & $dnode $dbin memfuse-smoke "用一句话说明 DSH 是什么。不要用任何工具。"
 # 夹具 profile：~/.dsh/profiles/memfuse-smoke（从 headless 模板建，junction 到本仓库）
 # 用完删目录即净。加新条目记得用 `- insert:`，直接写 `- id:` 会静默不加载。
@@ -198,6 +198,19 @@ $dbin  = 'E:\DSH Desktop\resources\app\dsh\node_modules\@deepseek-ai\dsh\lib\bin
 候选卡片还要看 `{root:'conversation.chat.turnTail'}` 里有没有 `id: "dsh-memfuse#suggestions"`。
 **卡片有没有真的渲染过**，看 `~/.dsh/memory/.memory/state.json` 里有没有 `skillSeen` 键
 （`status.md` 的「界面已看过（skillSeen）」同理）—— 一直是 0 组 = 从来没成功拉到过数据。
+
+## 占位符（公开仓库里不写本机绝对路径）
+
+文档、注释、测试夹具里**一律用占位符**，别把真实路径写回去（仓库是 public，环境布局没必要公开）：
+
+| 占位符 | 含义 |
+|---|---|
+| `<DSH_APP>` | 桌面版 DSH 安装目录（`resources\runtime\...\node.exe`、`resources\app\dsh\node_modules\@deepseek-ai\` 都在它下面） |
+| `<HARNESS_SRC>` | DSH 源码版仓库根（查 `tool-cordis` 源码时才用） |
+| `<VAULT>` | 本机 Markdown 知识库根（`memory_*` 工具那套） |
+| `<REPO_DIR>` | 本仓库的本地路径（装 profile 时用） |
+| `<WINDOWSAPPS>` / `<PRODUCT_DIR>` | 第三方应用安装目录（剖析文档里） |
+| `<LOCAL_PROXY_PORT>` | 本地代理端口 |
 
 ## 硬规则（违反会出事，详见 HANDOFF §4）
 
@@ -228,7 +241,7 @@ $dbin  = 'E:\DSH Desktop\resources\app\dsh\node_modules\@deepseek-ai\dsh\lib\bin
   PS 5.1 按 GBK 读 UTF-8 会把整份文件变成乱码（真机踩过，只能 `git checkout` 重来）。
   要么用编辑工具，要么用 Node 脚本读写。
 - **改宿主相关代码前，先查本机宿主包**（不是文档、不是猜）：
-  - 源码：`E:\DSH Desktop\resources\app\dsh\node_modules\@deepseek-ai\`
+  - 源码：`<DSH_APP>\resources\app\dsh\node_modules\@deepseek-ai\`
   - 实时契约：`cordis_inspect_query`（Service / Event / Config / Tool / Slot）
 
 ## ⚠️ 改 Host half：ESM 缓存与三条免重启的路（2026-10-15 实测更正）
@@ -246,7 +259,7 @@ status.md 被重写），但那只换配置、不换模块。判据只有一个�
 |---|---|
 | 本会话可调用工具里只有两个**只读**的 | `cordis_inspect_query(host, Tool, listTools)`；且 `dsh-tool-cordis/lib/index.js` 全文 100 行、只 register 那 2 个 |
 | `cordis` 预设挂的就是这个包 | `dsh-web-app/presets/cordis.patch.yml:140` → `- id: tool-cordis / name: '@deepseek-ai/dsh-tool-cordis'` |
-| 动态那一套只在**源码版**仓库里 | `E:\DeepSeekHarness\deepseek-harness\packages\extensions\tool-cordis\src\index.ts` → L149 `cordis_define`、L241 `cordis_run`、L330 `cordis_stop`、L352 `cordis_undefine`、L97 `cordis_inspect_self` |
+| 动态那一套只在**源码版**仓库里 | `<HARNESS_SRC>\packages\extensions\tool-cordis\src\index.ts` → L149 `cordis_define`、L241 `cordis_run`、L330 `cordis_stop`、L352 `cordis_undefine`、L97 `cordis_inspect_self` |
 
 **✅ 真正可用的三条路**（按推荐度）：
 
@@ -259,9 +272,9 @@ status.md 被重写），但那只换配置、不换模块。判据只有一个�
 ## 记忆系统（两条链路都在用）
 
 - **memfuse 自己的库**：`~/.dsh/memory`，工具 `memfuse_*`（desktop + web 都指向它）
-- **Obsidian vault**：`E:\KnowledgeBase`，工具 `memory_*`（**desktop 已改用 memfuse，故这边只剩 web / 手动**）
+- **本地 Markdown 知识库（vault）**：`<VAULT>`，工具 `memory_*`（**desktop 已改用 memfuse，故这边只剩 web / 手动**）
 
 ```powershell
-node E:\KnowledgeBase\.memory\kb.js recall "dsh-memfuse"
-node E:\KnowledgeBase\.memory\kb.js index    # 写完后重建索引
+node <VAULT>\.memory\kb.js recall "dsh-memfuse"
+node <VAULT>\.memory\kb.js index    # 写完后重建索引
 ```

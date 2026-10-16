@@ -100,8 +100,8 @@ npm test          # 应该看到 59 + 26 + 5 + 23 = 113 项全绿（全部零 LL
 | dsh-memsearch | 极简自动写入 | 依赖 558MB onnx 模型、无遗忘无打分无排序 |
 | **memfuse** | — | **纯文本下的完整遗忘链 + 失败可见** ← 无人占据 |
 
-**仓库都在本机**，可以随时回去读：
-`..\dsh-memory-evolve`、`..\dsh-memsearch`、`..\dsh-memory`（Obsidian 那套）。
+**参照仓库都在本地**，可以随时回去读：
+`..\dsh-memory-evolve`、`..\dsh-memsearch`、`..\dsh-memory`（Markdown 知识库那套）。
 
 > ⚠️ **一个 store 只能有一个 owner**：memfuse 与 `dsh-memory` / `dsh-memory-evolve`
 > 不能同时启用（工具名与语义都会冲突）。工具名已用 `memfuse_*` 前缀隔离。
@@ -356,7 +356,7 @@ tag 含逗号裂成两个、内部字段 `_bucket` 落盘。
 **对策（三条，缺一不可）**：
 
 1. **属性名要对着宿主实现查**，不要对着类型声明猜（`api-catalog` 里 `Session` 从来没出现过
-   `events`）。查实现：`E:\DSH Desktop\resources\app\dsh\node_modules\@deepseek-ai\dsh-session\lib\index.js`
+   `events`）。查实现：`<DSH_APP>\resources\app\dsh\node_modules\@deepseek-ai\dsh-session\lib\index.js`
 2. **假 ctx 必须模拟真机形状**：这次把测试改成 `{ id, ownEvents: () => events }`（真机就只有这个）。
    形状来源写进注释，标上是哪次探针实测的。
 3. **"读不到输入"必须留痕**：`sessionEvents()` 返回 `via: null` → `noteFault('captureFail')` +
@@ -454,16 +454,16 @@ test('功能：一句话说明它承诺什么', async (t) => {
 
 ### ⚠️ 冒烟的环境前提（会重复踩）
 
-本机**两套 DSH 运行时**：桌面版 `E:\DSH Desktop`（**0.2.0-rc.2**）与源码版
-`E:\DeepSeekHarness\deepseek-harness`（**0.1.0-rc.8**）。两者的 `~/.dsh/.credentials.yaml`
+本机（开发机）**两套 DSH 运行时**：桌面版 `<DSH_APP>`（**0.2.0-rc.2**）与源码版
+`<HARNESS_SRC>`（**0.1.0-rc.8**）。两者的 `~/.dsh/.credentials.yaml`
 布局**不兼容**（桌面版是 version 1 结构化 `version`/`refs`/`records`，源码版只认扁平），
 用源码版 CLI 起 web profile 会在 credentials 阶段直接崩。
 
 ⇒ **启动 web profile 必须用桌面版宿主**：
 
 ```powershell
-$dnode = 'E:\DSH Desktop\resources\runtime\primary-runtime\dependencies\node\bin\node.exe'
-$dbin  = 'E:\DSH Desktop\resources\app\dsh\node_modules\@deepseek-ai\dsh\lib\bin.js'
+$dnode = '<DSH_APP>\resources\runtime\primary-runtime\dependencies\node\bin\node.exe'
+$dbin  = '<DSH_APP>\resources\app\dsh\node_modules\@deepseek-ai\dsh\lib\bin.js'
 & $dnode --expose-internals $dbin --profile web --port 19388 --no-open
 ```
 
@@ -522,9 +522,9 @@ $dbin  = 'E:\DSH Desktop\resources\app\dsh\node_modules\@deepseek-ai\dsh\lib\bin
    - 它在关键路径上吗？（是的话，能不能挪到侧路）
    - 它失败时用户看得见吗？（看不见就加可见性）
    - 它是真源还是派生视图？（派生视图必须可删可重建）
-4. **记忆系统**：本机接了 Obsidian 记忆库（`E:\KnowledgeBase`），
+4. **记忆系统**：本机接了 Markdown 知识库（`<VAULT>`），
    项目记忆在 `10-记忆/项目/dsh-memfuse 插件：仓库位置、结构与当前进度-2.md`。
-   干完活要写记忆并重建索引：`node E:\KnowledgeBase\.memory\kb.js index`。
+   干完活要写记忆并重建索引：`node <VAULT>\.memory\kb.js index`。
 
 ---
 

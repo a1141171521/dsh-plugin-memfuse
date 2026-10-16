@@ -583,10 +583,10 @@
 
 ```powershell
 # 安装（任何一版 dsh CLI 都行：它只转发 pnpm + reconcile dsh.profile.bundles）
-dsh plugin --profile web add E:/AIProject/DeepSeekPlugin/dsh-plugin-memfuse
+dsh plugin --profile web add <REPO_DIR>
 ```
 
-结果：`profiles/web/package.json` 的 `dependencies` 得到 `link:E:/...`，
+结果：`profiles/web/package.json` 的 `dependencies` 得到 `link:<REPO_DIR>`，
 `dsh.profile.bundles` 自动追加 `dsh-memfuse`，`node_modules/dsh-memfuse` 是指向源码的
 **junction**（改代码即时生效，不用重装）。
 
@@ -594,8 +594,8 @@ dsh plugin --profile web add E:/AIProject/DeepSeekPlugin/dsh-plugin-memfuse
 
 | 运行时 | 版本 | `.credentials.yaml` 布局 |
 |---|---|---|
-| **桌面版** `E:\DSH Desktop`（正在跑） | **0.2.0-rc.2** | version 1 结构化（`version` / `refs` / `records`） |
-| 源码版 `E:\DeepSeekHarness\deepseek-harness` | 0.1.0-rc.8 | 只认扁平布局（0.2 里被称作 "pre-release flat layout"） |
+| **桌面版** `<DSH_APP>`（正在跑） | **0.2.0-rc.2** | version 1 结构化（`version` / `refs` / `records`） |
+| 源码版 `<HARNESS_SRC>` | 0.1.0-rc.8 | 只认扁平布局（0.2 里被称作 "pre-release flat layout"） |
 
 用**源码版 CLI 启动** web profile 会在 credentials 阶段直接崩：
 
@@ -606,8 +606,8 @@ credentials-local: the value for "version" in ~/.dsh/.credentials.yaml must be a
 ⇒ **冒烟必须用桌面版宿主**：
 
 ```powershell
-$dnode = 'E:\DSH Desktop\resources\runtime\primary-runtime\dependencies\node\bin\node.exe'
-$dbin  = 'E:\DSH Desktop\resources\app\dsh\node_modules\@deepseek-ai\dsh\lib\bin.js'
+$dnode = '<DSH_APP>\resources\runtime\primary-runtime\dependencies\node\bin\node.exe'
+$dbin  = '<DSH_APP>\resources\app\dsh\node_modules\@deepseek-ai\dsh\lib\bin.js'
 & $dnode --expose-internals $dbin --profile web --port 19388 --no-open
 ```
 
@@ -988,7 +988,7 @@ cordis 的 `inject` 数组没有 optional 语法（`Inject.resolve` 只认数组
 | profile | 记忆插件 | 说明 |
 |---|---|---|
 | **web** | `dsh-memfuse` | ✅ **已装好可直接用**（`package.json` 里 `link:` + `node_modules` 软链） |
-| desktop | `dsh-memory`（Obsidian） | ⚠️ **不要再装 memfuse** —— 硬规则 #6：一个 store 只能有一个 owner |
+| desktop | `dsh-memory`（Markdown 知识库） | ⚠️ **不要再装 memfuse** —— 硬规则 #6：一个 store 只能有一个 owner |
 
 **启用抽取**只需在 `~/.dsh/profiles/web/cordis.patch.yml` 里加：
 
@@ -2186,7 +2186,7 @@ skill:
 
 | # | 决策 | 状态 / 建议 |
 |---|---|---|
-| 1 | 与已装的 dsh-memory（Obsidian）关系 | ✅ **已执行**：插件名 `dsh-memfuse` + 工具名 `memfuse_*`，两者可并存（vault = 知识库，memfuse = 工作记忆） |
+| 1 | 与已装的 dsh-memory（Markdown 知识库）关系 | ✅ **已执行**：插件名 `dsh-memfuse` + 工具名 `memfuse_*`，两者可并存（vault = 知识库，memfuse = 工作记忆） |
 | 2 | 图谱做到什么程度 | ❌ **按审查建议移出清单**（只产 mermaid 文本，价值不足；且 §3.5.5 已判定不值得做） |
 | 3 | 权重自适应要不要做 | ❌ **按审查建议移出清单**（与"可审计、无黑盒漂移"的定位冲突） |
 | 4 | 抽取先不先用 LLM | ⏳ 待拍板。建议**先零 LLM 兜底**（F1），跑两周看原始问答落盘够不够用 |
