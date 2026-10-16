@@ -669,7 +669,7 @@ export const inject = ['tools', 'systemPrompt', 'llm'];
 
 ### 冒烟用的临时探针
 
-`E:\AIProject\DeepSeekPlugin\.memfuse-smoke\{probe.mjs, overlay.yml}` ——
+`<仓库根>\.memfuse-smoke\{probe/index.js, overlay.yml}` ——
 用 `dsh --profile web --patch <overlay.yml>` 临时挂载的**只读**探针，
 **不在 profile 里**（不加 `--patch` 就不存在）。它做四件事：
 列工具清单 · 调 `assemble()` · 真实调 `llm.stream` · 监听并 dump 两个事件的 payload 形状。
@@ -1241,7 +1241,7 @@ extractExchange(真实事件) → userLen=14  "继续 dsh-memfuse"      ← 修�
 dsh memfuse-smoke --from-default-profile headless --dump-config
 # 2) 建 junction，让 profile 能解析到本地源码
 New-Item -ItemType Junction -Path "$env:USERPROFILE\.dsh\profiles\memfuse-smoke\node_modules\dsh-memfuse" `
-         -Target 'E:\AIProject\DeepSeekPlugin\dsh-plugin-memfuse'
+         -Target '<本仓库路径>'
 # 3) patch 里加插 memfuse 条目（见下面的坑）+ 复用 desktop 的 llm 配置段
 # 4) 跑一轮真实对话（headless = 答一次就退出）
 dsh memfuse-smoke "用一句话说明 DSH 是什么。不要用任何工具。"

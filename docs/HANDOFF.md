@@ -39,8 +39,8 @@
 **第一条命令**：
 
 ```powershell
-cd E:\AIProject\DeepSeekPlugin\dsh-plugin-memfuse
-npm test          # 应该看到 49 + 23 = 72 项全绿
+cd <本仓库路径>
+npm test          # 应该看到 59 + 26 + 5 + 23 = 113 项全绿（全部零 LLM 调用）
 ```
 
 **⚠️ 改 Host half 必须重启 DSH** —— Node 的 ESM 模块缓存，同进程内 `import()`
