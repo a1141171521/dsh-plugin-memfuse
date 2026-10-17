@@ -2849,3 +2849,49 @@ test('缺陷 34：启动抽取落定后要补写 status.md（派生视图不能�
   );
   console.log('  ✅ 启动抽取落定 → 补写 status.md，派生视图与真源一致');
 });
+
+test('缺陷 34b：抽取成功之后不许再挂着更早的「无新素材，跳过」（自相矛盾的两行）', async (t) => {
+  const root = path.join(os.tmpdir(), 'memfuse-status-skip-' + Date.now());
+  t.after(() => fsp.rm(root, { recursive: true, force: true }));
+  await fsp.mkdir(path.join(root, '.memory'), { recursive: true });
+
+  const h = fakeCtx();
+  const api = mod.apply(h.ctx, {
+    root,
+    git: false,
+    verbose: false,
+    extract: { enabled: true, provider: 'p', model: 'm', autoRunOnStart: false },
+  });
+  await api.ready;
+
+  const stateFile = path.join(root, '.memory', 'state.json');
+  const statusFile = path.join(root, '.memory', 'status.md');
+  const writeState = async (patch) =>
+    fsp.writeFile(
+      stateFile,
+      JSON.stringify({ version: 1, extractEnabled: true, ...patch }, null, 2),
+      'utf8',
+    );
+  const readStatus = () => fsp.readFile(statusFile, 'utf8');
+
+  // ① 跳过晚于成功（正常的"这次没新素材"）→ 两行都要有
+  await writeState({
+    lastExtractSuccess: '2026-01-01T00:00:00.000Z',
+    lastExtractSkippedAt: '2026-01-02T00:00:00.000Z',
+  });
+  await api.status();
+  let s = await readStatus();
+  assert.match(s, /最近成功: 2026-01-01/, '最近成功要写');
+  assert.match(s, /最近一次: 2026-01-02/, '这次跳过确实更晚，必须写出来');
+
+  // ② 成功晚于跳过（真机现场：成功 09:01 压着旧的 08:45 跳过）→ 只留成功
+  await writeState({
+    lastExtractSuccess: '2026-01-03T00:00:00.000Z',
+    lastExtractSkippedAt: '2026-01-02T00:00:00.000Z',
+  });
+  await api.status();
+  s = await readStatus();
+  assert.match(s, /最近成功: 2026-01-03/, '最近成功要跟上');
+  assert.ok(!/最近一次: 2026-01-02/.test(s), '成功之后不许再写更早的跳过，否则读起来自相矛盾');
+  console.log('  ✅ 只写"更晚的那次"：跳过在成功之前就不显示');
+});
