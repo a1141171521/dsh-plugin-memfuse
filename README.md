@@ -4,7 +4,7 @@
 > 纯文本 Markdown 是真源，检索在本机完成，**读 / 写 / 注入 / 检索一次模型都不调**。
 > 每轮对话把该记住的东西注入 system prompt；会话结束再把原始问答兜底落盘。
 
-[![tests](https://img.shields.io/badge/tests-133%20passing-brightgreen)](#测试)
+[![tests](https://img.shields.io/badge/tests-134%20passing-brightgreen)](#测试)
 [![llm](https://img.shields.io/badge/关键路径-零%20LLM-blue)](#亮点-4不使用-llm-是一等公民)
 [![license](https://img.shields.io/badge/license-MIT-blue)](LICENSE)
 
@@ -97,7 +97,7 @@ stats: { recalled: 4, injected: 3, positive: 2, negative: 0 }
 - 关着时**原始问答照样兜底落盘**（`sessions/`），素材不会丢；
 - 开关开着却没选到模型 = **可见故障**（必须报出来，不许写"✅ 正常"）。
 
-> 全部 133 项测试都在**零 LLM 调用**下通过。
+> 全部 134 项测试都在**零 LLM 调用**下通过。
 
 ### 亮点 5：失败必须可见（"功能存在但从不生效"是头号大敌）
 
@@ -186,7 +186,7 @@ stats: { recalled: 4, injected: 3, positive: 2, negative: 0 }
 git clone https://github.com/a1141171521/dsh-plugin-memfuse.git
 cd dsh-plugin-memfuse
 
-npm test              # 133 项断言（不需要 DSH、不需要模型、不需要网络）
+npm test              # 134 项断言（不需要 DSH、不需要模型、不需要网络）
 npm run preview       # 离线预览页：在浏览器里看候选卡片与技能草稿长什么样
 npm run demo          # 看产出物（index.md / status.md）长什么样
 ```
@@ -320,7 +320,7 @@ dsh-plugin-memfuse/
 ## 测试
 
 ```bash
-npm test          # 133 项全绿 = plugin 76 + client 29 + 预览 5 + smoke 23
+npm test          # 134 项全绿 = plugin 77 + client 29 + 预览 5 + smoke 23
 ```
 
 **全部不需要模型、不需要网络、不需要 DSH**。另外还有两条真机验证路径：

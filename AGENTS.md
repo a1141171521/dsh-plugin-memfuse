@@ -11,7 +11,7 @@
 | 3 | `docs/spec.md` | **唯一权威**的功能清单 + 技术线 + 各阶段实施记录（含真机发现的缺陷） |
 | 4 | `README.md` | 对外说明（**部分已过时**，以 spec.md 为准） |
 
-**先跑 `npm test`**（应看到 **76 + 29 + 5 + 23 = 133 项全绿**）确认环境正常，再动手。
+**先跑 `npm test`**（应看到 **77 + 29 + 5 + 23 = 134 项全绿**）确认环境正常，再动手。
 想直接看候选卡片长什么样：`npm run preview`（离线预览页，不用重启、不用先有候选）。
 
 ## 这是什么
@@ -25,7 +25,7 @@ DSH 的长期记忆插件。纯文本 Markdown 存储、本地检索。
   推送前扫一遍：**不带凭据**；本机用户名 / 绝对路径改占位符（仓库是 public）。
 - **已装进 desktop + web 两个 profile**（都是**符号链接/junction 指向本仓库**，改文件即生效，
   只差重启让客户端重新加载 bundle），真机跑通。
-- 测试 **133 项全绿**（plugin 76 + client 29 + 预览 5 + smoke 23）；真机功能 40/40、补测 29/29、真实会话闭环、真实模型往返全通。
+- 测试 **134 项全绿**（plugin 77 + client 29 + 预览 5 + smoke 23）；真机功能 40/40、补测 29/29、真实会话闭环、真实模型往返全通。
 - **候选卡片的离线预览页**：`npm run preview`（起本地静态服务再打开
   `docs/preview/turn-tail-card.html` —— **别直接双击**：模块脚本在 `file://` 下会被 CORS 拒）。
   它加载**真实的 `lib/client.js`**（同 bundle / 同 CSS / 同字典），宿主那侧是假数据；
@@ -251,6 +251,11 @@ DSH 的长期记忆插件。纯文本 Markdown 存储、本地检索。
     ⚠️ **别把抽取挪到写 status 之前** —— 那是把模型调用塞回关键路径（缺陷 28 的老路）。
     ⚠️ 测试教训：**不能**用 `setImmediate` 轮询等它（`waitForLlm` 用 `setTimeout`，轮询推不动
     真实时间；第一版用例单跑过、整套跑挂）。**要重启生效。** 见 spec 缺陷 34
+  - 缺陷 34b（**成功之后还挂着更早的跳过**）：34 生效后 `status.md` 变成
+    「最近成功: 09:01」压着「最近一次: 08:45 无新素材，跳过」—— 读起来像"最近一次没跑"。
+    根因：`lastExtractSkippedAt` 成功之后不会被清，`writeStatus` 只要它存在就无条件写。
+    修：只在这次跳过**晚于** `lastExtractSuccess` 时才写（ISO 字符串可直接比大小）。
+    回归 1 条。**要重启生效。** 见 spec 缺陷 34b
 - **设置页**：✅ 两个半边都齐了。宿主半边 `lib/config.js`（`Config status: schema`）+
   浏览器半边 `lib/client.js`（注册**两处**：`plugins.bundle.config` key = 包名、
   `plugins.row.config` key = `dsh-memfuse#dsh-memfuse`）。

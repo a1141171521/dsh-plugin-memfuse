@@ -372,7 +372,7 @@ session/event 监听器叠了多份，同一个 turn/end 被投递 N 次各写�
 | **H7 技能建议（Block E）** | 够格时主动在注入里提示，**零 LLM** |
 | `dismiss` action | 用户"不用"后该组不再提示；**簇长大 key 变 → 重新提一次** |
 | `skill.suggest` / `skillSuggestMax` | 配置 + 设置页开关已加（`suggest` 已补 `.volatile()`，见缺陷 17） |
-| 测试 | **133 项全绿**（plugin 76 / client 29 / 预览 5 / smoke 23） |
+| 测试 | **134 项全绿**（plugin 77 / client 29 / 预览 5 / smoke 23） |
 | **真机冒烟** | 用探针走宿主 `systemPrompt.assemble()` 抓到真实组装块，且 Block E 的 dismiss 语义已验证 |
 | 夹具工具 | `.memfuse-smoke/`，**路径运行时生成**，跨机器可跑 |
 | spec.md | §H7 / §H8 已写（含四个静默缺陷、预览页、防回归写法） |
@@ -380,7 +380,7 @@ session/event 监听器叠了多份，同一个 turn/end 被投递 N 次各写�
 命令：
 
 ```powershell
-npm test          # 133 项（假 ctx，不需要宿主、不需要模型）
+npm test          # 134 项（假 ctx，不需要宿主、不需要模型）
 npm run smoke     # 真宿主冒烟（需要 dsh 在 PATH，不需要模型）
 npm run preview   # 打开候选卡片的离线预览页
 ```
@@ -644,5 +644,24 @@ npm run smoke      # 真宿主；探针会抓组装块
 轮询推进不了真实时间。第一版用例单个跑过、整套跑就挂；换成 `await api.startupExtraction` 才稳。
 
 回归：plugin 76 项。**要重启才生效**（宿主机里的还是上一版模块）。
-**下一步**：重启后核对 `status.md` 的「最近一次」应与 `state.json` 的 `lastExtractSkippedAt`
-（或 `lastExtractSuccess`）一致。
+
+✅ **已验收（重启后 17:01）**：`status.md` 的「最近成功」= `state.json` 的 `lastExtractSuccess`
+（`09:01:28.066Z`，status 在 state 之后 23ms 写盘）；启动抽取真跑成（记忆 144 → 150），
+捕获 90 → 93 轮，`runtimeFaults` 空。
+
+### 0.12g 成功之后还挂着更早的跳过（缺陷 34b）
+
+34 生效后，`status.md` 看起来还是别扭：
+
+```
+- 最近成功: 2026-10-17T09:01:28.066Z
+- 最近一次: 2026-10-17T08:45:51.765Z 无新素材，跳过（…）
+```
+
+第 09:01 那次是**真跑成了**的，可下面还压着 08:45 的跳过记录 —— 读起来像"最近一次没跑"。
+根因：`lastExtractSkippedAt` 成功之后不会被清，`writeStatus` 只要它存在就无条件写。
+
+修：只有这次跳过**晚于** `lastExtractSuccess` 时才写（ISO 字符串可直接比大小）。
+
+回归：plugin 77 项。**要重启才生效。**
+**下一步**：重启后确认 `status.md` 里「最近一次」那行**只在"最近一次确实是跳过"时**出现。
