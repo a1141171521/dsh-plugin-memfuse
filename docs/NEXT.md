@@ -372,7 +372,7 @@ session/event 监听器叠了多份，同一个 turn/end 被投递 N 次各写�
 | **H7 技能建议（Block E）** | 够格时主动在注入里提示，**零 LLM** |
 | `dismiss` action | 用户"不用"后该组不再提示；**簇长大 key 变 → 重新提一次** |
 | `skill.suggest` / `skillSuggestMax` | 配置 + 设置页开关已加（`suggest` 已补 `.volatile()`，见缺陷 17） |
-| 测试 | **132 项全绿**（plugin 75 / client 29 / 预览 5 / smoke 23） |
+| 测试 | **133 项全绿**（plugin 76 / client 29 / 预览 5 / smoke 23） |
 | **真机冒烟** | 用探针走宿主 `systemPrompt.assemble()` 抓到真实组装块，且 Block E 的 dismiss 语义已验证 |
 | 夹具工具 | `.memfuse-smoke/`，**路径运行时生成**，跨机器可跑 |
 | spec.md | §H7 / §H8 已写（含四个静默缺陷、预览页、防回归写法） |
@@ -380,7 +380,7 @@ session/event 监听器叠了多份，同一个 turn/end 被投递 N 次各写�
 命令：
 
 ```powershell
-npm test          # 132 项（假 ctx，不需要宿主、不需要模型）
+npm test          # 133 项（假 ctx，不需要宿主、不需要模型）
 npm run smoke     # 真宿主冒烟（需要 dsh 在 PATH，不需要模型）
 npm run preview   # 打开候选卡片的离线预览页
 ```
@@ -614,7 +614,7 @@ npm run smoke      # 真宿主；探针会抓组装块
    故障文案不再放事件条数（每步都在变，注入块的告警会跟着抖）。
 5. `requireTurnEnd` 现在要求那条 `turn/end` 是正常收尾。
 
-回归：plugin 75 项（新增缺陷 33 / 33b / 33c / 33d 四条）。
+回归：plugin 76 项（新增缺陷 33 / 33b / 33c / 33d 四条；34 另见 §0.12f）。
 
 **验收时顺便确认的两件事**（都是误会，记录以免下次重复怀疑）：
 - 16:24 → 16:33 之间捕获文件没长，不是捕获停了：第 49/50 轮是 `方案A` / `重启了`（各 3 字，
@@ -624,3 +624,25 @@ npm run smoke      # 真宿主；探针会抓组装块
 **下一步**：重启后聊两轮 → 注入块顶部不该再出现那条告警；`status.md` 的「运行期故障」应为空。
 `status.md` 的 `代码版本:` 现在是 `2026-10-17-capture-multisession`（这一行由代码写死，
 是判断"宿主到底加载了哪个模块"的唯一可靠信号；旧值是 `2026-10-15-session-events-fix`）。
+
+### 0.12f 派生视图落后于真源（缺陷 34）
+
+重启验收时发现 `status.md` 的「最近一次」停在上一轮（写 16:43:10，而 `state.json` 里
+`lastExtractSkippedAt` 已经是 16:45:51）—— 看起来像"启动抽取根本没跑"。
+
+根因是**顺序**：status.md 在启动初始化里**先写**，而启动抽取是 fire-and-forget，抽完没有第二次
+写盘；手动 `memfuse_extract` 也一样，抽完不刷新 status。
+
+修（**不是**把抽取挪到写 status 之前 —— 那等于把模型调用塞回关键路径，缺陷 28 的老路）：
+
+1. 启动抽取落定后在 `finally` 里补写 status（成功 / 跳过 / 失败都刷；只在 `extract.enabled` 为真时做，
+   关着总开关写是白写）；
+2. `memfuse_extract` 返回前也刷一次（自带 try/catch：刷视图失败不许把一次成功的抽取说成失败）；
+3. 把启动抽取的 promise 暴露成 `api.startupExtraction`，让"抽完 + 补写"能被 await 出来。
+
+⚠️ 测试教训：**不能**用 `setImmediate` 轮询去等它 —— `waitForLlm` 用的是 `setTimeout`，
+轮询推进不了真实时间。第一版用例单个跑过、整套跑就挂；换成 `await api.startupExtraction` 才稳。
+
+回归：plugin 76 项。**要重启才生效**（宿主机里的还是上一版模块）。
+**下一步**：重启后核对 `status.md` 的「最近一次」应与 `state.json` 的 `lastExtractSkippedAt`
+（或 `lastExtractSuccess`）一致。

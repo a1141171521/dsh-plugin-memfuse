@@ -11,7 +11,7 @@
 | 3 | `docs/spec.md` | **唯一权威**的功能清单 + 技术线 + 各阶段实施记录（含真机发现的缺陷） |
 | 4 | `README.md` | 对外说明（**部分已过时**，以 spec.md 为准） |
 
-**先跑 `npm test`**（应看到 **75 + 29 + 5 + 23 = 132 项全绿**）确认环境正常，再动手。
+**先跑 `npm test`**（应看到 **76 + 29 + 5 + 23 = 133 项全绿**）确认环境正常，再动手。
 想直接看候选卡片长什么样：`npm run preview`（离线预览页，不用重启、不用先有候选）。
 
 ## 这是什么
@@ -25,7 +25,7 @@ DSH 的长期记忆插件。纯文本 Markdown 存储、本地检索。
   推送前扫一遍：**不带凭据**；本机用户名 / 绝对路径改占位符（仓库是 public）。
 - **已装进 desktop + web 两个 profile**（都是**符号链接/junction 指向本仓库**，改文件即生效，
   只差重启让客户端重新加载 bundle），真机跑通。
-- 测试 **132 项全绿**（plugin 75 + client 29 + 预览 5 + smoke 23）；真机功能 40/40、补测 29/29、真实会话闭环、真实模型往返全通。
+- 测试 **133 项全绿**（plugin 76 + client 29 + 预览 5 + smoke 23）；真机功能 40/40、补测 29/29、真实会话闭环、真实模型往返全通。
 - **候选卡片的离线预览页**：`npm run preview`（起本地静态服务再打开
   `docs/preview/turn-tail-card.html` —— **别直接双击**：模块脚本在 `file://` 下会被 CORS 拒）。
   它加载**真实的 `lib/client.js`**（同 bundle / 同 CSS / 同字典），宿主那侧是假数据；
@@ -63,7 +63,7 @@ DSH 的长期记忆插件。纯文本 Markdown 存储、本地检索。
 - **H7 技能建议**（2026-10-15 追加）：够格时在注入里出 **Block E**（**零 LLM**，只给簇语义不给技能正文），
   用户点头才 `distill`。`dismiss` 后该组不再出现；**簇长大 → key 变 → 重新提一次**。
   真机已用探针（宿主自己的 `systemPrompt.assemble()`）抓到真实组装块验证。
-- **真机累计发现 33 个缺陷，全部修复**。最隐蔽的十七个：
+- **真机累计发现 34 个缺陷，全部修复**。最隐蔽的十七个：
   - 缺陷 5：`agent/pre-step` 是 waterfall，不调 `next()` → **每轮对话崩**
   - 缺陷 11：`Config` 没放进 `export default` → **设置页静默消失、零报错**
   - 缺陷 12：**`session.events` 在宿主上不存在**（真名 `ownEvents()`）→ 兜底捕获整条路径
@@ -242,6 +242,15 @@ DSH 的长期记忆插件。纯文本 Markdown 存储、本地检索。
     静默；有真人输入但本轮还没收尾 → 静默；有真人输入、轮次也收尾了却配不出问答 → 才记
     `captureFail`。故障文案**去掉事件条数**（每步都变 → 注入块告警跟着抖）。回归 1 条。
     见 spec 缺陷 33c
+  - 缺陷 34（**派生视图落后于真源**）：重启后 `status.md` 的「最近一次」停在上一轮（写 16:43:10，
+    而 `state.json` 里 `lastExtractSkippedAt` 已是 16:45:51），看起来像"启动抽取没跑"。
+    根因是**顺序**：status.md 在启动初始化里先写、启动抽取 fire-and-forget 落定后没人再写；
+    `memfuse_extract` 抽完同样不刷新。修：① 启动抽取落定后在 `finally` 补写 status
+    （成功/跳过/失败都刷，且只在 `extract.enabled` 时做）；② 抽取工具返回前也刷一次；
+    ③ 启动抽取 promise 暴露成 `api.startupExtraction` 供 await。
+    ⚠️ **别把抽取挪到写 status 之前** —— 那是把模型调用塞回关键路径（缺陷 28 的老路）。
+    ⚠️ 测试教训：**不能**用 `setImmediate` 轮询等它（`waitForLlm` 用 `setTimeout`，轮询推不动
+    真实时间；第一版用例单跑过、整套跑挂）。**要重启生效。** 见 spec 缺陷 34
 - **设置页**：✅ 两个半边都齐了。宿主半边 `lib/config.js`（`Config status: schema`）+
   浏览器半边 `lib/client.js`（注册**两处**：`plugins.bundle.config` key = 包名、
   `plugins.row.config` key = `dsh-memfuse#dsh-memfuse`）。
