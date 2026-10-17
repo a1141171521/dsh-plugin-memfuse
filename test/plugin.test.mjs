@@ -2210,3 +2210,602 @@ test('H7 clusterKey / renderSuggestions 的纯函数行为', async (t) => {
   assert.ok(!/undefined|null/.test(text), `渲染结果不该出现 undefined/null：\n${text}`);
   console.log('  ✅ clusterKey 顺序无关 / sharedTags 过半判定 / 渲染要素齐全');
 });
+
+// ── 缺陷 28（2026-10-17，DSH 0.2.1-rc.1 兼容性事故）──────────────────────────
+//
+// 现场：`memfuse_status` 调下去再也不返回，连「停止对话」都点不动，只能强杀应用。
+// 根因两条叠加：
+//   ① 新宿主 ToolDefinition 对**已经在跑**的 execute 是 **drain** 语义
+//      （"already-started work is still drained"）—— 我们不放，它就一直等；
+//   ② 六个工具的 execute 第一行都是 `await ready`，而 ready 里串着宿主侧调用
+//      （可选注入 / Remote 挂载 / 启动抽取）。任一个永不 settle → 全体死锁。
+// 修法：ready 带预算（到点降级放行）+ 启动抽取挪出关键路径 + 每个工具声明 timeoutMs。
+test('缺陷 28：withBudget 到点必须放行 —— 启动链靠它保命，不许悬挂', async () => {
+  let fired = false;
+  const started = Date.now();
+  const result = await mod.withBudget(new Promise(() => {}), 30, () => {
+    fired = true;
+  });
+  assert.equal(result, null, '超时返回 null（调用方据此降级）');
+  assert.equal(fired, true, '超时回调必须被调用 —— 故障要留痕，不许静默（硬规则 4）');
+  assert.ok(Date.now() - started < 2000, '到点就走，不许等原 promise');
+
+  const passthrough = await mod.withBudget(Promise.resolve({ ok: 1 }), 1000, () => {});
+  assert.deepEqual(passthrough, { ok: 1 }, '没超时就原样透传');
+
+  assert.equal(typeof mod.STARTUP_BUDGET_MS, 'number', '启动预算要可观测');
+  assert.ok(
+    mod.TOOL_TIMEOUT_MS > mod.STARTUP_BUDGET_MS,
+    '工具上限必须大于启动预算 —— 让插件先降级、别让宿主替我们超时',
+  );
+  console.log(
+    `  ✅ withBudget 到点放行（启动预算 ${mod.STARTUP_BUDGET_MS}ms / 工具上限 ${mod.TOOL_TIMEOUT_MS}ms）`,
+  );
+});
+
+test('缺陷 28：每个工具都要声明 timeoutMs（否则卡住时宿主会一直等）', async (t) => {
+  t.after(() => fsp.rm(tmpRoot, { recursive: true, force: true }));
+  const h = fakeCtx();
+  const api = mod.apply(h.ctx, { root: tmpRoot, git: false, verbose: false });
+  await api.ready;
+
+  assert.equal(h.tools.length, 6);
+  for (const def of h.tools) {
+    assert.equal(
+      typeof def.timeoutMs,
+      'number',
+      `${def.name} 必须声明 timeoutMs —— 宿主对已启动的 execute 是 drain 语义，没上限就会永久吊住整轮对话`,
+    );
+    assert.ok(def.timeoutMs > 0 && def.timeoutMs <= 120000, `${def.name} 的 timeoutMs 不合理：${def.timeoutMs}`);
+    assert.ok(
+      def.timeoutMs > mod.STARTUP_BUDGET_MS,
+      `${def.name} 的工具超时要大于启动预算，否则宿主会先超时`,
+    );
+  }
+  console.log(`  ✅ ${h.tools.length} 个工具都声明了 timeoutMs=${h.tools[0].timeoutMs}ms`);
+});
+
+test('缺陷 28：启动抽取不在 ready 的关键路径上（llm 不返回也不许拖住工具）', async (t) => {
+  const root = path.join(os.tmpdir(), `memfuse-plugin-28-${Date.now()}`);
+  t.after(() => fsp.rm(root, { recursive: true, force: true }));
+  // 一个**永不产出**的模型流：以前它会让 ready 永久 pending
+  const neverLlm = {
+    stream() {
+      return {
+        [Symbol.asyncIterator]() {
+          return { next: () => new Promise(() => {}) };
+        },
+      };
+    },
+  };
+  const h = fakeCtx({ llm: neverLlm, services: { agentDefaultModel: { provider: 'p', model: 'm' } } });
+  const started = Date.now();
+  const api = mod.apply(h.ctx, {
+    root,
+    git: false,
+    verbose: false,
+    extract: { enabled: true, autoRunOnStart: true, provider: 'p', model: 'm' },
+  });
+  await api.ready;
+  const took = Date.now() - started;
+  assert.ok(took < mod.STARTUP_BUDGET_MS, `ready 用了 ${took}ms —— 启动抽取不许在关键路径上`);
+
+  const statusTool = h.tools.find((d) => d.name === 'memfuse_status');
+  const out = await statusTool.execute({}, {});
+  assert.match(String(out), /total/, '工具必须照常返回（不许挂在 ready 上）');
+  console.log(`  ✅ llm 永不返回时 ready 仍 ${took}ms 返回，工具照常可用`);
+});
+
+// ─────────────────── 缺陷 29：卡在"模型/预检的那次网络调用上" ───────────────────
+
+test('缺陷 29：drainStream 到点必须放弃等待并关流（上游光连不吐）', async () => {
+  let closed = false;
+  const stuck = {
+    [Symbol.asyncIterator]() {
+      return {
+        next: () => new Promise(() => {}), // 永远不推进（连接半开 / 中转站挂住）
+        return: async () => {
+          closed = true;
+          return { done: true };
+        },
+      };
+    },
+  };
+  let faulted = 0;
+  const started = Date.now();
+  await assert.rejects(
+    (async () => {
+      // eslint-disable-next-line no-unused-vars
+      for await (const _ of mod.drainStream(stuck, 80, { onTimeout: () => faulted++ })) {
+        /* 永远不会来 */
+      }
+    })(),
+    /没有任何推进/,
+  );
+  const took = Date.now() - started;
+  assert.equal(faulted, 1, 'onTimeout 必须被调一次 —— 故障要留痕，不许静默');
+  assert.equal(closed, true, '放弃时要 it.return() 关掉流，别把连接和上游 token 晾着');
+  assert.ok(took < 2000, `本该 80ms 就放弃，实际 ${took}ms`);
+  console.log(`  ✅ drainStream：${took}ms 放弃等待 + 关流`);
+});
+
+test('缺陷 29：预算是嵌套的（模型调用 ≤ 工具总预算 < 宿主窗口）', () => {
+  // 顺序错了就会"宿主替我们报超时"，把一次成功但偏慢的抽取改写成失败。
+  assert.ok(mod.MODEL_CALL_TIMEOUT_MS <= mod.EXTRACT_BUDGET_MS, '单次模型调用不能超过工具总预算');
+  assert.ok(mod.EXTRACT_BUDGET_MS < mod.TOOL_TIMEOUT_MS, '工具自己的总预算必须小于宿主窗口');
+  assert.ok(mod.TOOL_TIMEOUT_MS > mod.STARTUP_BUDGET_MS, '启动预算要比宿主窗口小，先自己降级');
+  assert.ok(mod.PROBE_BUDGET_MS < mod.MODEL_CALL_TIMEOUT_MS, '预检只是省一次调用，不能比调用本身还久');
+  console.log(
+    `  ✅ 预算嵌套：预检 ${mod.PROBE_BUDGET_MS} ≤ 模型 ${mod.MODEL_CALL_TIMEOUT_MS} ≤ 工具 ${mod.EXTRACT_BUDGET_MS} < 宿主 ${mod.TOOL_TIMEOUT_MS}`,
+  );
+});
+
+test('缺陷 29：模型流卡住时 runExtraction 必须到点返回，不许永远挂着', async (t) => {
+  const root = path.join(os.tmpdir(), `memfuse-hang-${Date.now()}`);
+  t.after(() => fsp.rm(root, { recursive: true, force: true }));
+  // 预检正常（很快），但**真调用永远不推进** —— 这是真机那次卡住的最小形态
+  const hangLlm = {
+    listProviders: async () => [{ id: 'p' }],
+    listModels: async () => [{ id: 'm' }],
+    stream: () => ({
+      [Symbol.asyncIterator]: () => ({ next: () => new Promise(() => {}) }),
+    }),
+  };
+  const h = fakeCtx({ llm: hangLlm });
+  const api = mod.apply(h.ctx, {
+    root,
+    git: false,
+    verbose: false,
+    extract: { enabled: true, provider: 'p', model: 'm', autoRunOnStart: false },
+  });
+  await api.ready;
+  await fsp.writeFile(path.join(root, 'sessions', '2026-10-17.md'), `x${'内容。'.repeat(120)}`, 'utf8');
+
+  const started = Date.now();
+  const res = await api.runExtraction({ deadline: Date.now() + 1600 });
+  const took = Date.now() - started;
+
+  assert.equal(res.ok, false, '卡住的抽取不许报成功');
+  assert.match(res.errors.join(' '), /没有任何推进/, `错误里要说清是"没推进"，实际：${JSON.stringify(res.errors)}`);
+  assert.ok(took < 6000, `本该按预算收尾，实际 ${took}ms`);
+  console.log(`  ✅ 模型流卡住 → ${took}ms 收尾并报错（不再吊死整轮对话）`);
+});
+
+test('缺陷 29：没有新素材时不许写"成功"（以前会把真故障盖掉）', async (t) => {
+  const root = path.join(os.tmpdir(), `memfuse-skip-${Date.now()}`);
+  t.after(() => fsp.rm(root, { recursive: true, force: true }));
+  const h = fakeCtx({
+    llm: fakeLlm(JSON.stringify([
+      { kind: 'fact', title: '部署脚本在 scripts/deploy.sh', summary: '部署入口。', body: '部署走 scripts/deploy.sh。', anchor: '要部署时', durability: 'durable', confidence: 0.9, evidence: 'implicit' },
+    ])),
+  });
+  const api = mod.apply(h.ctx, {
+    root,
+    git: false,
+    verbose: false,
+    extract: { enabled: true, provider: 'p', model: 'm', autoRunOnStart: false },
+  });
+  await api.ready;
+  await fsp.writeFile(path.join(root, 'sessions', '2026-10-17.md'), `x${'内容。'.repeat(120)}`, 'utf8');
+
+  const first = await api.runExtraction({});
+  assert.equal(first.ok, true, JSON.stringify(first));
+  assert.equal(first.files, 1);
+
+  const stateFile = path.join(root, '.memory', 'state.json');
+  const before = JSON.parse(await fsp.readFile(stateFile, 'utf8'));
+  assert.ok(before.lastExtractSuccess, '真跑过一轮才有"最近成功"');
+
+  // 第二次：水位线已在文件尾 → 没有任何新素材
+  const second = await api.runExtraction({});
+  assert.equal(second.files, 0);
+  assert.equal(second.skipped, true, '要明确标成"跳过"，不是"成功"');
+
+  const after = JSON.parse(await fsp.readFile(stateFile, 'utf8'));
+  assert.equal(after.lastExtractSuccess, before.lastExtractSuccess, '空跑不许刷新"最近成功"的时间戳');
+  assert.ok(after.lastExtractSkippedAt, '空跑要留一个"跳过"的时间戳（能看见，但不算成功）');
+  console.log('  ✅ 无新素材 → 记 skipped，不伪造 lastExtractSuccess');
+});
+
+test('缺陷 30：捕获不能只押在 session/event 上，pre-step 也要兜底', async (t) => {
+  const root = path.join(os.tmpdir(), 'memfuse-capture-' + Date.now());
+  t.after(() => fsp.rm(root, { recursive: true, force: true }));
+  const h = fakeCtx();
+  const api = mod.apply(h.ctx, { root, git: false, verbose: false, capture: { enabled: true } });
+  await api.ready;
+
+  const session = {
+    id: 's-capture-1',
+    events: [
+      {
+        seq: 1,
+        type: 'user/message',
+        data: { source: { kind: 'user' }, content: [{ type: 'text', text: '帮我把部署脚本改一下，顺手加个回滚' }] },
+      },
+      {
+        seq: 2,
+        type: 'assistant/message',
+        data: { turn: 1, step: 1, message: { role: 'assistant', content: [{ type: 'text', text: '改好了，回滚脚本放在 scripts/rollback.sh。' }] } },
+      },
+      { seq: 3, type: 'turn/end', data: { turn: 1, reason: 'stop' } },
+    ],
+  };
+
+  // pre-step 的 payload 里**没有 session**（宿主派发 {messages, ...position, signal}），
+  // 所以先让插件通过 session/event 记住它 —— 这正是缺陷 30c 的修法。
+  for (const fn of h.handlers.get('session/event') || []) await fn(session, { type: 'step/end', seq: 9 });
+
+  // 之后只走 pre-step，**不**再派发 turn/end —— 模拟"事件投递没到、只能靠兜底"
+  await h.dispatchPreStep({ messages: [], turn: 2 });
+
+  let text = '';
+  for (let i = 0; i < 50; i++) {
+    const names = await fsp.readdir(path.join(root, 'sessions')).catch(() => []);
+    if (names.length) {
+      const parts = await Promise.all(
+        names.map((n) => fsp.readFile(path.join(root, 'sessions', n), 'utf8').catch(() => '')),
+      );
+      text = parts.join('');
+      if (text.includes('rollback.sh')) break;
+    }
+    await new Promise((r) => setImmediate(r));
+  }
+
+  assert.ok(text.includes('帮我把部署脚本改一下'), 'pre-step 必须触发捕获，实际：' + JSON.stringify(text.slice(0, 160)));
+  assert.ok(text.includes('scripts/rollback.sh'), 'assistant 正文（data.message.content）要能取到');
+  console.log('  ✅ pre-step 触发捕获：事件投递不到也不丢素材');
+});
+
+test('缺陷 30b：半截回答不许落盘（靠事件流里的 turn/end 判定，不靠 payload 字段）', async (t) => {
+  const root = path.join(os.tmpdir(), 'memfuse-capture2-' + Date.now());
+  t.after(() => fsp.rm(root, { recursive: true, force: true }));
+  const h = fakeCtx();
+  const api = mod.apply(h.ctx, { root, git: false, verbose: false, capture: { enabled: true } });
+  await api.ready;
+
+  // 第 1 轮已收尾（后面有 turn/end）；第 2 轮**进行中**（没有 turn/end）
+  const session = {
+    id: 's-capture-2',
+    events: [
+      { seq: 1, type: 'user/message', data: { source: { kind: 'user' }, content: [{ type: 'text', text: '第一个问题的内容在这里' }] } },
+      { seq: 2, type: 'assistant/message', data: { turn: 1, step: 1, message: { role: 'assistant', content: [{ type: 'text', text: '第一个问题的完整回答。' }] } } },
+      { seq: 3, type: 'turn/end', data: { turn: 1, reason: 'stop' } },
+      { seq: 4, type: 'user/message', data: { source: { kind: 'user' }, content: [{ type: 'text', text: '第二个问题的内容在这里' }] } },
+      { seq: 5, type: 'assistant/message', data: { turn: 2, step: 1, message: { role: 'assistant', content: [{ type: 'text', text: '半截回答，这一轮还没结束。' }] } } },
+    ],
+  };
+
+  for (const fn of h.handlers.get('session/event') || []) await fn(session, { type: 'step/end', seq: 9 });
+  await h.dispatchPreStep({ messages: [], turn: 2 });
+
+  let text = '';
+  for (let i = 0; i < 50; i++) {
+    const names = await fsp.readdir(path.join(root, 'sessions')).catch(() => []);
+    if (names.length) {
+      const parts = await Promise.all(
+        names.map((n) => fsp.readFile(path.join(root, 'sessions', n), 'utf8').catch(() => '')),
+      );
+      text = parts.join('');
+      if (text.includes('第一个问题的完整回答')) break;
+    }
+    await new Promise((r) => setImmediate(r));
+  }
+
+  assert.ok(text.includes('第一个问题的完整回答'), '要补写已收尾的第 1 轮，实际：' + JSON.stringify(text.slice(0, 160)));
+  assert.ok(!text.includes('半截回答'), '这一轮还没收尾，半截回答绝不能落盘');
+  console.log('  ✅ 只记已收尾的轮次，半截回答不落盘');
+});
+
+test('缺陷 30c：插件被重载 / 进程重启都不许重复记同一轮', async (t) => {
+  const root = path.join(os.tmpdir(), 'memfuse-capture3-' + Date.now());
+  t.after(() => fsp.rm(root, { recursive: true, force: true }));
+
+  const session = {
+    id: 's-capture-3',
+    events: [
+      { seq: 1, type: 'user/message', data: { source: { kind: 'user' }, content: [{ type: 'text', text: '这一轮的问题内容在这里' }] } },
+      { seq: 2, type: 'assistant/message', data: { turn: 1, step: 1, message: { role: 'assistant', content: [{ type: 'text', text: '这一轮的最后回答。' }] } } },
+      { seq: 3, type: 'turn/end', data: { turn: 1, reason: 'stop' } },
+    ],
+  };
+
+  // 起一个"插件实例"：投递 turn/end，再走 pre-step 兜底。
+  async function bootAndCapture() {
+    const h = fakeCtx();
+    const api = mod.apply(h.ctx, { root, git: false, verbose: false, capture: { enabled: true } });
+    await api.ready;
+    for (const fn of h.handlers.get('session/event') || []) await fn(session, session.events[2]);
+    for (const fn of h.handlers.get('session/event') || []) await fn(session, { type: 'step/end', seq: 9 });
+    await h.dispatchPreStep({ messages: [], turn: 2 });
+    await waitStable();
+  }
+
+  /** 等落盘稳定（连续三次读到相同内容）。固定 tick 数在整套测试一起跑时不够稳。 */
+  async function waitStable() {
+    let prev = null;
+    let same = 0;
+    for (let i = 0; i < 300 && same < 3; i++) {
+      const t = await readAll();
+      if (t === prev) same++;
+      else { same = 0; prev = t; }
+      await new Promise((r) => setImmediate(r));
+    }
+  }
+
+  const readAll = async () => {
+    const names = await fsp.readdir(path.join(root, 'sessions')).catch(() => []);
+    const parts = await Promise.all(
+      names.map((n) => fsp.readFile(path.join(root, 'sessions', n), 'utf8').catch(() => '')),
+    );
+    return parts.join('');
+  };
+
+  await bootAndCapture();
+  const first = await readAll();
+  const blocks = (first.match(/=== 本轮最终问答/g) || []).length;
+  assert.equal(blocks, 1, '第一次应当正好 1 块，实际 ' + blocks);
+
+  // 模拟"插件被重载 / 进程重启"：全新实例、内存去重表是空的、同一轮再触发两次。
+  await bootAndCapture();
+  await bootAndCapture();
+  const after = await readAll();
+  const blocks2 = (after.match(/=== 本轮最终问答/g) || []).length;
+  assert.equal(blocks2, 1, '重载后不许重复记（内容指纹去重），实际 ' + blocks2 + ' 块');
+  console.log('  ✅ 重载/重启后不重复记同一轮（内容指纹去重）');
+});
+
+test('缺陷 31：水位线越界（捕获文件被清理过）不许让抽取静默停摆', async (t) => {
+  const root = path.join(os.tmpdir(), 'memfuse-wm-' + Date.now());
+  t.after(() => fsp.rm(root, { recursive: true, force: true }));
+  await fsp.mkdir(path.join(root, 'sessions'), { recursive: true });
+  await fsp.mkdir(path.join(root, '.memory'), { recursive: true });
+  const day = path.join(root, 'sessions', '2026-10-17.md');
+  await fsp.writeFile(day, 'x' + '内容。'.repeat(120), 'utf8');
+  // 人为把水位线设到比文件还长 —— 模拟「捕获文件被人工清理 / 截断过」
+  await fsp.writeFile(
+    path.join(root, '.memory', 'state.json'),
+    JSON.stringify({ version: 1, extracted: { '2026-10-17.md': 999999 } }, null, 2),
+    'utf8',
+  );
+
+  const llm = fakeLlm(JSON.stringify([
+    { kind: 'fact', title: '水位线测试条目', summary: 's', body: 'b', anchor: 'a', durability: 'durable', confidence: 0.9, evidence: 'explicit' },
+  ]));
+  const h = fakeCtx({ llm });
+  const api = mod.apply(h.ctx, {
+    root, git: false, verbose: false,
+    extract: { enabled: true, provider: 'p', model: 'm', autoRunOnStart: false },
+  });
+  await api.ready;
+
+  // 第一次：水位越界 → 不许调模型，但必须留痕（不能静默）
+  const first = await api.runExtraction({});
+  assert.equal(first.files, 0, '越界水位不该被当成「有新内容」');
+  assert.equal(llm.calls.length, 0, '越界时不该白跑一次模型');
+  const st = JSON.parse(await fsp.readFile(path.join(root, '.memory', 'state.json'), 'utf8'));
+  assert.ok(st.runtimeFaults && st.runtimeFaults.extractWatermark, '越界必须记进运行期故障，不许静默');
+  assert.match(String(st.runtimeFaults.extractWatermark.message), /水位线/, '故障消息要说清是水位线越界');
+
+  // 第二次：文件追加了新内容 → 必须照常抽（证明没被越界水位永久卡死）
+  await fsp.appendFile(day, 'y' + '新增内容。'.repeat(120), 'utf8');
+  const second = await api.runExtraction({});
+  assert.equal(second.files, 1, '追加新内容后必须继续抽');
+  assert.ok(llm.calls.length > 0, '必须真的调了模型');
+  console.log('  ✅ 水位线越界：留痕 + 夹齐，不静默停摆，也不整篇重抽');
+});
+
+test('缺陷 32：用户只说了几个字 → 正常跳过，不许记成故障（假故障会淹掉真问题）', async (t) => {
+  const root = path.join(os.tmpdir(), 'memfuse-short-' + Date.now());
+  t.after(() => fsp.rm(root, { recursive: true, force: true }));
+  const h = fakeCtx();
+  const api = mod.apply(h.ctx, { root, git: false, verbose: false, capture: { enabled: true } });
+  await api.ready;
+
+  // 真机现场：用户那句就是「重启了」（3 个字），低于 minPromptLength(10)
+  const session = {
+    id: 's-short',
+    events: [
+      { seq: 1, type: 'user/message', data: { source: { kind: 'user' }, content: [{ type: 'text', text: '重启了' }] } },
+      { seq: 2, type: 'assistant/message', data: { turn: 1, step: 1, message: { role: 'assistant', content: [{ type: 'text', text: '好的，重启完成。' }] } } },
+      { seq: 3, type: 'turn/end', data: { turn: 1, reason: 'stop' } },
+    ],
+  };
+
+  for (const fn of h.handlers.get('session/event') || []) await fn(session, session.events[2]);
+  for (let i = 0; i < 30; i++) await new Promise((r) => setImmediate(r));
+
+  const names = await fsp.readdir(path.join(root, 'sessions')).catch(() => []);
+  assert.equal(names.length, 0, '太短的提问不该落盘');
+  const health = api.health();
+  assert.equal(health.ok, true, '短消息是正常跳过，绝不能记成 captureFail（假故障）：' + JSON.stringify(health));
+  console.log('  ✅ 短消息正常跳过，不写假故障');
+});
+
+/** 读当前 root 下所有捕获文件拼起来的文本。 */
+async function readCaptures(root) {
+  const names = await fsp.readdir(path.join(root, 'sessions')).catch(() => []);
+  const parts = await Promise.all(
+    names.map((n) => fsp.readFile(path.join(root, 'sessions', n), 'utf8').catch(() => '')),
+  );
+  return parts.join('');
+}
+
+/** 等到捕获内容满足 expect（或超时），再等连续三次读到相同内容（落盘稳定）。 */
+async function waitCapture(root, expect) {
+  let prev = null;
+  let same = 0;
+  for (let i = 0; i < 400; i++) {
+    const text = await readCaptures(root);
+    if (expect(text)) {
+      if (text === prev) same++;
+      else { same = 0; prev = text; }
+      if (same >= 3) return text;
+    } else {
+      same = 0;
+      prev = null;
+    }
+    await new Promise((r) => setImmediate(r));
+  }
+  return readCaptures(root);
+}
+
+/** 让排队的异步捕获跑完（不管成没成）。 */
+async function settle() {
+  for (let i = 0; i < 60; i++) await new Promise((r) => setImmediate(r));
+}
+
+test('缺陷 33：子代理会话不许冒充主会话（否则每步报一条「没找到真人输入」的假告警）', async (t) => {
+  const root = path.join(os.tmpdir(), 'memfuse-subagent-' + Date.now());
+  t.after(() => fsp.rm(root, { recursive: true, force: true }));
+  const h = fakeCtx();
+  const api = mod.apply(h.ctx, { root, git: false, verbose: false, capture: { enabled: true } });
+  await api.ready;
+
+  // 主会话：真人提问 + 完整回答 + 正常收尾
+  const main = {
+    id: 's-main',
+    seq: 4,
+    header: { origin: 'user' },
+    events: [
+      { seq: 1, type: 'user/message', data: { source: { kind: 'user' }, content: [{ type: 'text', text: '帮我把部署脚本改一下，顺手加个回滚' }] } },
+      { seq: 2, type: 'assistant/message', data: { turn: 1, step: 1, message: { role: 'assistant', content: [{ type: 'text', text: '改好了，回滚脚本放在 scripts/rollback.sh。' }] } } },
+      { seq: 3, type: 'turn/end', data: { turn: 1, reason: { kind: 'completed' } } },
+    ],
+  };
+  // 子代理会话：真机形状 —— user/message 全是运行时注入，没有一条 source.kind === 'user'
+  const sub = {
+    id: 's-sub',
+    seq: 129,
+    header: { origin: 'subagent' },
+    events: [
+      { seq: 1, type: 'user/message', data: { source: { kind: 'runtime-context' }, content: [{ type: 'text', text: 'Current runtime context. This snapshot supersedes earlier runtime-context snapshots.' }] } },
+      { seq: 2, type: 'assistant/message', data: { turn: 1, step: 1, message: { role: 'assistant', content: [{ type: 'text', text: '只读审计结论：没有发现严重问题。' }] } } },
+      { seq: 3, type: 'turn/end', data: { turn: 1, reason: { kind: 'completed' } } },
+    ],
+  };
+
+  // 真机顺序：主会话先发事件，子代理随后发 —— 老代码那个全局 lastSession 会被子代理抢走
+  for (const fn of h.handlers.get('session/event') || []) await fn(main, { type: 'step/end', seq: 4 });
+  for (const fn of h.handlers.get('session/event') || []) await fn(sub, { type: 'step/end', seq: 128 });
+  for (const fn of h.handlers.get('session/event') || []) await fn(sub, sub.events[2]);
+  await h.dispatchPreStep({ messages: [], turn: 2 });
+  const text = await waitCapture(root, (x) => x.includes('rollback.sh'));
+
+  assert.ok(text.includes('rollback.sh'), '主会话必须被捕获，实际：' + JSON.stringify(text.slice(0, 200)));
+  assert.ok(!text.includes('只读审计结论'), '子代理会话的内容绝不能进记忆库');
+  const health = api.health();
+  assert.equal(health.ok, true, '子代理会话不许产生假告警：' + JSON.stringify(health));
+  console.log('  ✅ 多会话并存：只抓主会话，子代理跳过且不留痕');
+});
+
+test('缺陷 33b：报错 / 被中断的轮次不许写进记忆（半截回答与错误回显都是脏数据）', async (t) => {
+  const root = path.join(os.tmpdir(), 'memfuse-turnfail-' + Date.now());
+  t.after(() => fsp.rm(root, { recursive: true, force: true }));
+  const h = fakeCtx();
+  const api = mod.apply(h.ctx, { root, git: false, verbose: false, capture: { enabled: true } });
+  await api.ready;
+
+  // 真机现场：turn/end 的 reason 是 { kind: 'error', error: {...} }
+  const session = {
+    id: 's-turnfail',
+    seq: 3,
+    header: { origin: 'user' },
+    events: [
+      { seq: 1, type: 'user/message', data: { source: { kind: 'user' }, content: [{ type: 'text', text: '给我解释一下这段代码在干什么' }] } },
+      { seq: 2, type: 'assistant/message', data: { turn: 1, step: 1, message: { role: 'assistant', content: [{ type: 'text', text: '400: model is unavailable on every account (per-model cooldown)' }] } } },
+      { seq: 3, type: 'turn/end', data: { turn: 1, reason: { kind: 'error', error: { message: 'model is unavailable', code: 'INVALID_REQUEST' } } } },
+    ],
+  };
+
+  for (const fn of h.handlers.get('session/event') || []) await fn(session, session.events[2]);
+  await settle();
+  assert.equal(
+    (await fsp.readdir(path.join(root, 'sessions')).catch(() => [])).length,
+    0,
+    '报错的轮次不许落盘',
+  );
+
+  // 紧接着一轮正常收尾 → 必须落盘，而且只落正常那一轮
+  session.events.push(
+    { seq: 4, type: 'user/message', data: { source: { kind: 'user' }, content: [{ type: 'text', text: '那换成简单点的方式再讲一遍吧' }] } },
+    { seq: 5, type: 'assistant/message', data: { turn: 2, step: 1, message: { role: 'assistant', content: [{ type: 'text', text: '这段代码把配置读进来，然后校验必填项。' }] } } },
+    { seq: 6, type: 'turn/end', data: { turn: 2, reason: { kind: 'completed' } } },
+  );
+  session.seq = 6;
+  for (const fn of h.handlers.get('session/event') || []) await fn(session, session.events[5]);
+  const text = await waitCapture(root, (x) => x.includes('校验必填项'));
+
+  assert.ok(text.includes('校验必填项'), '正常收尾的轮次必须落盘，实际：' + JSON.stringify(text.slice(0, 200)));
+  assert.ok(!text.includes('model is unavailable'), '错误回显不许进记忆库');
+  assert.equal(api.health().ok, true, '这一轮失败是被捕获对象自己的失败，不该记成 captureFail');
+  console.log('  ✅ 只记正常收尾的轮次，报错轮次不进库也不重试');
+});
+
+test('缺陷 33c：pre-step 落在「本轮还没收尾」上不算故障（以前每步都挂一条假告警）', async (t) => {
+  const root = path.join(os.tmpdir(), 'memfuse-midturn-' + Date.now());
+  t.after(() => fsp.rm(root, { recursive: true, force: true }));
+  const h = fakeCtx();
+  const api = mod.apply(h.ctx, { root, git: false, verbose: false, capture: { enabled: true } });
+  await api.ready;
+
+  // 这一轮**进行中**：真人提问 + 半截回答，还没有 turn/end
+  const session = {
+    id: 's-midturn',
+    seq: 2,
+    header: { origin: 'user' },
+    events: [
+      { seq: 1, type: 'user/message', data: { source: { kind: 'user' }, content: [{ type: 'text', text: '帮我把部署脚本改一下，顺手加个回滚' }] } },
+      { seq: 2, type: 'assistant/message', data: { turn: 1, step: 1, message: { role: 'assistant', content: [{ type: 'text', text: '我先看一下现有脚本……' }] } } },
+    ],
+  };
+
+  for (const fn of h.handlers.get('session/event') || []) await fn(session, { type: 'step/end', seq: 2 });
+  await h.dispatchPreStep({ messages: [], turn: 1 });
+  await settle();
+
+  const names = await fsp.readdir(path.join(root, 'sessions')).catch(() => []);
+  assert.equal(names.length, 0, '这一轮还没收尾，什么都不该落盘');
+  const health = api.health();
+  assert.equal(health.ok, true, '「本轮还没收尾」是正常状态，不许记成 captureFail：' + JSON.stringify(health));
+  console.log('  ✅ 一轮进行中的 pre-step 静默通过，不写假故障');
+});
+
+test('缺陷 33d：上一轮报错之后的新一轮，兜底捕获不许被"省扫描"那道门关死', async (t) => {
+  const root = path.join(os.tmpdir(), 'memfuse-afterfail-' + Date.now());
+  t.after(() => fsp.rm(root, { recursive: true, force: true }));
+  const h = fakeCtx();
+  const api = mod.apply(h.ctx, { root, git: false, verbose: false, capture: { enabled: true } });
+  await api.ready;
+
+  const session = {
+    id: 's-afterfail',
+    seq: 3,
+    header: { origin: 'user' },
+    events: [
+      { seq: 1, type: 'user/message', data: { source: { kind: 'user' }, content: [{ type: 'text', text: '给我解释一下这段代码在干什么' }] } },
+      { seq: 2, type: 'assistant/message', data: { turn: 1, step: 1, message: { role: 'assistant', content: [{ type: 'text', text: '400: model is unavailable' }] } } },
+      { seq: 3, type: 'turn/end', data: { turn: 1, reason: { kind: 'error', error: { message: 'model is unavailable', code: 'INVALID_REQUEST' } } } },
+    ],
+  };
+  // 第一轮报错，而且 session/event 投递到了 —— 插件记下"上一轮不可捕"
+  for (const fn of h.handlers.get('session/event') || []) await fn(session, session.events[2]);
+  await settle();
+
+  // 第二轮正常收尾，但**故意不投递它的 turn/end**（模拟事件投递不到，只能靠 pre-step 兜底）
+  session.events.push(
+    { seq: 4, type: 'user/message', data: { source: { kind: 'user' }, content: [{ type: 'text', text: '那换成简单点的方式再讲一遍吧' }] } },
+    { seq: 5, type: 'assistant/message', data: { turn: 2, step: 1, message: { role: 'assistant', content: [{ type: 'text', text: '这段代码把配置读进来，然后校验必填项。' }] } } },
+    { seq: 6, type: 'turn/end', data: { turn: 2, reason: { kind: 'completed' } } },
+  );
+  session.seq = 6;
+  await h.dispatchPreStep({ messages: [], turn: 3 });
+  const text = await waitCapture(root, (x) => x.includes('校验必填项'));
+
+  assert.ok(
+    text.includes('校验必填项'),
+    '报错轮次之后的正常轮次必须靠兜底补上（"省扫描"那道门不许把兜底关死），实际：' + JSON.stringify(text.slice(0, 200)),
+  );
+  assert.ok(!text.includes('model is unavailable'), '报错的上一轮仍不许进库');
+  assert.equal(api.health().ok, true, '这条路径不该产生 captureFail');
+  console.log('  ✅ 报错轮次之后：兜底照常工作，且不会把失败轮次记进去');
+});
