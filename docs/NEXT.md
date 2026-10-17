@@ -189,18 +189,38 @@ preview 新增 1 条（预览页里把整条第二阶段走一遍）。
 
 回归：client 两条（① 只等定时器、不渲染卡片 → 自己回到 `ready`；② 紧跟渲染 → 真的又拉了一次）。
 
+### 0.9 缺陷 26 没修干净：同一个 404 又回来了（缺陷 27）
+
+用户**又**重启了一次，底部**还是**那一行 404。0.8 的修法给了"3 次 / 7 秒"的预算 ——
+宿主把端点挂上可能要十几秒，预算烧光就 `retryCount >= 3` **永久放弃**；而且 `retryCount`
+是**全局**的，一次开机竞态烧光之后**任何对话的任何失败**都不再重试。
+
+**这一轮先把宿主那侧的证据取全**（别再靠猜）：
+
+| 判据 | 实测 |
+|---|---|
+| `state.json` → `runtimeFaults` / `remoteChannel` | `{}` / `{"endpoints":7}`（⚠️ 持久化，只证明"历史上装好过"） |
+| `lastInjection.at` / `lastExtractSuccess` | 当天 → 宿主半边在跑 |
+| `cordis_inspect_query(client, Slots, listSubTree, {root:'conversation.chat.turnTail'})` | `dsh-memfuse#suggestions` = **活跃 occupant** → 客户端半边也装着 |
+| `POST /api/memfuse/list` 与 `POST /api/nope/nope` | **都是 401** → 网关先认证再路由，外面分不出 claim 在不在 |
+
+修（`lib/client.js`）：① 重试**不设次数上限**（`1/2/4/8/15/30/30…`，封顶 30s）；
+② 新的一次渲染（出错 + 无定时器）把预算重置回 1s；③ `wake()`：`visibilitychange`/`focus`
+立刻重试；④ 文案分层：重试中说「还没就绪…第 N 次…**原始原因：**<原文>」，不再重试才说
+「界面通道出错」。回归：client 新增 3 条（29 项）。
+
 ---
 
 ## 0. 今天已完成并提交 ✅
 
 | 项 | 状态 |
 |---|---|
-| **H8 界面数据通道 + 回合尾候选卡片** | ✅ 真机 4/4 端点可路由；卡片已能渲染，**缺陷 15~26 全修**（"一次摆 5 行"→ 行数跟 `skill.suggestMax`；"一闪而过"→ 按回合领一次并钉住；"再也不出现"→ 那道门比错了东西，见缺陷 24；"点完没有下一步"→ 卡片内两段式提炼，见缺陷 25；"404 一直挂着"→ 失败后退避重试，见缺陷 26），待真机验收 |
+| **H8 界面数据通道 + 回合尾候选卡片** | ✅ 真机 4/4 端点可路由；卡片已能渲染，**缺陷 15~27 全修**（"一次摆 5 行"→ 行数跟 `skill.suggestMax`；"一闪而过"→ 按回合领一次并钉住；"再也不出现"→ 那道门比错了东西，见缺陷 24；"点完没有下一步"→ 卡片内两段式提炼，见缺陷 25；"404 一直挂着"→ 重试不设上限 + 切回窗口就重试，见缺陷 26/27），待真机验收 |
 | **离线预览页** | ✅ `docs/preview/turn-tail-card.html`（`npm run preview`），有测试兜着 |
 | **H7 技能建议（Block E）** | 够格时主动在注入里提示，**零 LLM** |
 | `dismiss` action | 用户"不用"后该组不再提示；**簇长大 key 变 → 重新提一次** |
 | `skill.suggest` / `skillSuggestMax` | 配置 + 设置页开关已加（`suggest` 已补 `.volatile()`，见缺陷 17） |
-| 测试 | **113 项全绿**（plugin 59 / client 26 / 预览 5 / smoke 23） |
+| 测试 | **116 项全绿**（plugin 59 / client 29 / 预览 5 / smoke 23） |
 | **真机冒烟** | 用探针走宿主 `systemPrompt.assemble()` 抓到真实组装块，且 Block E 的 dismiss 语义已验证 |
 | 夹具工具 | `.memfuse-smoke/`，**路径运行时生成**，跨机器可跑 |
 | spec.md | §H7 / §H8 已写（含四个静默缺陷、预览页、防回归写法） |
@@ -208,7 +228,7 @@ preview 新增 1 条（预览页里把整条第二阶段走一遍）。
 命令：
 
 ```powershell
-npm test          # 113 项（假 ctx，不需要宿主、不需要模型）
+npm test          # 116 项（假 ctx，不需要宿主、不需要模型）
 npm run smoke     # 真宿主冒烟（需要 dsh 在 PATH，不需要模型）
 npm run preview   # 打开候选卡片的离线预览页
 ```

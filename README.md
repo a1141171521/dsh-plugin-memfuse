@@ -4,11 +4,11 @@
 > 纯文本 Markdown 是真源，检索在本机完成，**读 / 写 / 注入 / 检索一次模型都不调**。
 > 每轮对话把该记住的东西注入 system prompt；会话结束再把原始问答兜底落盘。
 
-[![tests](https://img.shields.io/badge/tests-113%20passing-brightgreen)](#测试)
+[![tests](https://img.shields.io/badge/tests-116%20passing-brightgreen)](#测试)
 [![llm](https://img.shields.io/badge/关键路径-零%20LLM-blue)](#亮点-4不使用-llm-是一等公民)
 [![license](https://img.shields.io/badge/license-MIT-blue)](LICENSE)
 
-> **权威文档**：[`docs/spec.md`](docs/spec.md)（功能清单 + 技术线 + 26 个真机缺陷的完整记录）。
+> **权威文档**：[`docs/spec.md`](docs/spec.md)（功能清单 + 技术线 + 27 个真机缺陷的完整记录）。
 > 本文是给"第一次看到这个仓库的人"看的；接手开发请先读
 > [`docs/NEXT.md`](docs/NEXT.md)（本轮做到哪）与 [`docs/HANDOFF.md`](docs/HANDOFF.md)（宿主契约）。
 
@@ -97,7 +97,7 @@ stats: { recalled: 4, injected: 3, positive: 2, negative: 0 }
 - 关着时**原始问答照样兜底落盘**（`sessions/`），素材不会丢；
 - 开关开着却没选到模型 = **可见故障**（必须报出来，不许写"✅ 正常"）。
 
-> 全部 113 项测试都在**零 LLM 调用**下通过。
+> 全部 116 项测试都在**零 LLM 调用**下通过。
 
 ### 亮点 5：失败必须可见（"功能存在但从不生效"是头号大敌）
 
@@ -108,7 +108,7 @@ stats: { recalled: 4, injected: 3, positive: 2, negative: 0 }
 手动写入（memfuse_write）与检索仍然可用。
 ```
 
-这条规则是拿真机换来的：本项目在真机上抓到 **26 个缺陷**，其中一半的表现是
+这条规则是拿真机换来的：本项目在真机上抓到 **27 个缺陷**，其中一半的表现是
 **"界面上什么都不显示"**（卡片不出现、设置页消失、按钮点了没反应）——
 所以现在每一处都强制留痕：候选卡片连不上通道会**在回合尾部写一行原始报错**，
 设置页会显示"候选卡片：已连上（N 组）"或"读不到数据：<原始报错>"。
@@ -186,7 +186,7 @@ stats: { recalled: 4, injected: 3, positive: 2, negative: 0 }
 git clone https://github.com/a1141171521/dsh-plugin-memfuse.git
 cd dsh-plugin-memfuse
 
-npm test              # 113 项断言（不需要 DSH、不需要模型、不需要网络）
+npm test              # 116 项断言（不需要 DSH、不需要模型、不需要网络）
 npm run preview       # 离线预览页：在浏览器里看候选卡片与技能草稿长什么样
 npm run demo          # 看产出物（index.md / status.md）长什么样
 ```
@@ -320,7 +320,7 @@ dsh-plugin-memfuse/
 ## 测试
 
 ```bash
-npm test          # 113 项全绿 = plugin 59 + client 26 + 预览 5 + smoke 23
+npm test          # 116 项全绿 = plugin 59 + client 29 + 预览 5 + smoke 23
 ```
 
 **全部不需要模型、不需要网络、不需要 DSH**。另外还有两条真机验证路径：

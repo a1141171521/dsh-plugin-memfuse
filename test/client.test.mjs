@@ -1188,3 +1188,104 @@ test('client half：保存按钮的灰/亮要能被解释（dirty → saved → 
   assert.equal(snapshot().dirty, true);
   console.log('  ✅ dirty / saved 状态齐了（灰按钮有解释、保存后有反馈）');
 });
+
+/**
+ * 缺陷 27：缺陷 26 的修法只给了"3 次 / 7 秒"的预算，真机重启后又挂回同一行 404。
+ *
+ * 三个必须锁住的点：
+ *   ① 重试**没有次数上限**（7 秒烧光就永久放弃 = 那行错误钉死在回合尾部）；
+ *   ② 重试中说的是"还没就绪"而不是"通道出错"，但**原始报错不许被吞**（硬规则 4）；
+ *   ③ 窗口重新可见（`wake()`）要立刻再试，并把退避重置 —— 用户切回来时宿主早好了。
+ */
+test('缺陷 27：重试不许"3 次就放弃" —— 开机竞态可能持续十几秒', async () => {
+  let calls = 0;
+  const okPayload = {
+    groups: [],
+    restCount: 0,
+    restKeys: [],
+    seen: 0,
+    dismissed: 0,
+    pendingDistill: [],
+    pendingSkills: [],
+  };
+  const h = await loadClientHalf({
+    value: {},
+    listImpl: async () => {
+      calls += 1;
+      // 前 5 次全失败 —— 旧实现第 4 次就不再来（3 次预算），这里必须撑到第 6 次
+      if (calls <= 5) {
+        throw new Error('client api: memfuse/list failed: transport failure for /api/memfuse/list: HTTP 404');
+      }
+      return { ok: true, value: okPayload };
+    },
+  });
+  // 把退避压到毫秒级（生产里是 1s/2s/4s/8s/15s/30s…）
+  h.exports.__retryConfig.baseMs = 1;
+  h.exports.__retryConfig.maxMs = 4;
+  h.exports.apply(h.ctx);
+  await settle();
+  const { face } = cardProps(h);
+  const feed = face.hooks.memfuseSuggestions;
+  assert.equal(feed.getSnapshot().status, 'error');
+
+  const deadline = Date.now() + 3000;
+  while (feed.getSnapshot().status !== 'ready' && Date.now() < deadline) {
+    await new Promise((resolve) => setTimeout(resolve, 10));
+  }
+  const after = feed.getSnapshot();
+  assert.equal(after.status, 'ready', `第 6 次才成功 —— 不许放弃（calls=${String(calls)}，还留着：${after.error ?? ''}）`);
+  assert.equal(after.error, null);
+  assert.ok(calls >= 6, `必须真的重试到第 6 次（实际 ${String(calls)} 次）`);
+  console.log(`  ✅ 前 5 次失败、第 ${String(calls)} 次成功 —— 重试没有次数上限`);
+});
+
+test('缺陷 27：重试中说「还没就绪」，但原始报错照样看得见', async () => {
+  const h = await loadClientHalf({
+    value: {},
+    listImpl: async () => {
+      throw new Error('client api: memfuse/list failed: transport failure for /api/memfuse/list: HTTP 404');
+    },
+  });
+  h.exports.apply(h.ctx);
+  await settle();
+  const { reg, props, face } = cardProps(h);
+  const snap = face.hooks.memfuseSuggestions.getSnapshot();
+  assert.equal(snap.status, 'error');
+  assert.equal(snap.retrying, true, '还有下一次重试排着 → retrying 必须是 true');
+
+  const rendered = JSON.stringify(reg.Component(props));
+  assert.match(rendered, /还没就绪/, '别摆出"出错了"的架势 —— 说清它正在自动重试');
+  assert.match(rendered, /HTTP 404/, '原始原因不许吞掉（硬规则 4）');
+  assert.doesNotMatch(rendered, /界面通道出错/, '重试中不该说"通道出错"');
+  console.log('  ✅ 重试中给「还没就绪 + 原始原因」，不吓人也不吞错');
+});
+
+test('缺陷 27：切回窗口（wake）要立刻再试，不等退避', async () => {
+  let calls = 0;
+  const h = await loadClientHalf({
+    value: {},
+    listImpl: async () => {
+      calls += 1;
+      if (calls === 1) throw new Error('boom-404');
+      return {
+        ok: true,
+        value: { groups: [], restCount: 0, restKeys: [], seen: 0, dismissed: 0, pendingDistill: [], pendingSkills: [] },
+      };
+    },
+  });
+  // 故意把下一次重试排到很远的将来：只有 wake() 能把它提前
+  h.exports.__retryConfig.baseMs = 60000;
+  h.exports.__retryConfig.maxMs = 60000;
+  h.exports.apply(h.ctx);
+  await settle();
+  const { props, face } = cardProps(h);
+  assert.equal(face.hooks.memfuseSuggestions.getSnapshot().status, 'error');
+
+  const before = calls;
+  props.wake(); // 用户切回窗口 / 页面重新可见
+  await settle();
+  assert.equal(calls, before + 1, 'wake() 必须立刻再拉一次，不许干等那 60 秒');
+  assert.equal(face.hooks.memfuseSuggestions.getSnapshot().status, 'ready');
+  console.log('  ✅ 切回窗口立刻重试，成功即收掉错误');
+});
+

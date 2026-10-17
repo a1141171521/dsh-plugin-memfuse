@@ -11,7 +11,7 @@
 | 3 | `docs/spec.md` | **唯一权威**的功能清单 + 技术线 + 各阶段实施记录（含真机发现的缺陷） |
 | 4 | `README.md` | 对外说明（**部分已过时**，以 spec.md 为准） |
 
-**先跑 `npm test`**（应看到 **59 + 26 + 5 + 23 = 113 项全绿**）确认环境正常，再动手。
+**先跑 `npm test`**（应看到 **59 + 29 + 5 + 23 = 116 项全绿**）确认环境正常，再动手。
 想直接看候选卡片长什么样：`npm run preview`（离线预览页，不用重启、不用先有候选）。
 
 ## 这是什么
@@ -25,7 +25,7 @@ DSH 的长期记忆插件。纯文本 Markdown 存储、本地检索。
   推送前扫一遍：**不带凭据**；本机用户名 / 绝对路径改占位符（仓库是 public）。
 - **已装进 desktop + web 两个 profile**（都是**符号链接/junction 指向本仓库**，改文件即生效，
   只差重启让客户端重新加载 bundle），真机跑通。
-- 测试 **113 项全绿**（plugin 59 + client 26 + 预览 5 + smoke 23）；真机功能 40/40、补测 29/29、真实会话闭环、真实模型往返全通。
+- 测试 **116 项全绿**（plugin 59 + client 29 + 预览 5 + smoke 23）；真机功能 40/40、补测 29/29、真实会话闭环、真实模型往返全通。
 - **候选卡片的离线预览页**：`npm run preview`（起本地静态服务再打开
   `docs/preview/turn-tail-card.html` —— **别直接双击**：模块脚本在 `file://` 下会被 CORS 拒）。
   它加载**真实的 `lib/client.js`**（同 bundle / 同 CSS / 同字典），宿主那侧是假数据；
@@ -63,7 +63,7 @@ DSH 的长期记忆插件。纯文本 Markdown 存储、本地检索。
 - **H7 技能建议**（2026-10-15 追加）：够格时在注入里出 **Block E**（**零 LLM**，只给簇语义不给技能正文），
   用户点头才 `distill`。`dismiss` 后该组不再出现；**簇长大 → key 变 → 重新提一次**。
   真机已用探针（宿主自己的 `systemPrompt.assemble()`）抓到真实组装块验证。
-- **真机累计发现 26 个缺陷，全部修复**。最隐蔽的十七个：
+- **真机累计发现 27 个缺陷，全部修复**。最隐蔽的十七个：
   - 缺陷 5：`agent/pre-step` 是 waterfall，不调 `next()` → **每轮对话崩**
   - 缺陷 11：`Config` 没放进 `export default` → **设置页静默消失、零报错**
   - 缺陷 12：**`session.events` 在宿主上不存在**（真名 `ownEvents()`）→ 兜底捕获整条路径
@@ -140,6 +140,18 @@ DSH 的长期记忆插件。纯文本 Markdown 存储、本地检索。
     自愈条件是**用户再发一条消息**，不是时间）。修：① 失败后退避重试（1s/2s/4s，最多 3 次，
     成功即 `clearRetry()`；Node 里记得 `timer.unref?.()`，否则测试进程被吊住）；
     ② 出错状态下 `touch()` 不吃去抖。见 spec 缺陷 26
+  - 缺陷 27（**同一个 404 又回来了** —— 缺陷 26 的修法不够）：用户重启后底部还是那句
+    `界面通道出错：…HTTP 404`。先证明宿主活着（`runtimeFaults = {}`、
+    `lastInjection.at` 是当天、`conversation.chat.turnTail` 里 `dsh-memfuse#suggestions`
+    是**活跃 occupant**、`POST /api/nope/nope` 也回 401 = 网关先认证再路由，外面看不出来）。
+    病根：① **"最多 3 次 / 7 秒"太短** —— 宿主挂端点可能十几秒，预算烧光就
+    `retryCount >= 3` **永久放弃**；② `retryCount` 是**全局**的 —— 一次开机竞态烧光之后，
+    之后**任何对话的任何失败**都不再重试；③ 文案在骗人（还在重试却写「通道出错」）。
+    修：① 重试**不设次数上限**，`1/2/4/8/15/30/30…` 封顶 30s；② 新的一次渲染
+    （出错 + 无定时器）把预算重置回 1s；③ `wake()`：`visibilitychange`/`focus` 时立刻重试
+    （`apply()` 里 `child.effect` 挂监听）；④ 文案分层 —— 重试中说
+    「还没就绪…第 N 次…**原始原因：**<原文>」（原始报错不许吞，硬规则 4），
+    只有不再重试才写「界面通道出错」。回归 3 条（client 29 项）。见 spec 缺陷 27
 - **设置页**：✅ 两个半边都齐了。宿主半边 `lib/config.js`（`Config status: schema`）+
   浏览器半边 `lib/client.js`（注册**两处**：`plugins.bundle.config` key = 包名、
   `plugins.row.config` key = `dsh-memfuse#dsh-memfuse`）。
