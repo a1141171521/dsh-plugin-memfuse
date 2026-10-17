@@ -112,23 +112,81 @@ npm test          # 应该看到 59 + 29 + 5 + 23 = 116 项全绿（全部零 LL
 
 ```
 lib/
-├── index.js      96KB  入口：6 个工具 + 注入接线 + 宿主探测 + 捕获 + 维护 + status.md
-├── store.js      18KB  存储层：frontmatter 往返 + 原子写 + drift guard + 锁
-├── policy.js     14KB  策略层（纯函数）：打分 / 准入 / 生命周期 / 反馈 / 升级
-├── skill.js       9KB  SKILL.md 格式 I/O + 四个静默坑的对策 + approve/reject
-├── recall.js      7KB  本地检索：CJK bigram + BM25 + excerpt
-├── distill.js     7KB  技能提炼：候选打分 + 标签聚类 + 提炼提示词
-├── extract.js     7KB  记忆抽取：提示词 + 容错解析 + 准入 + 偏好加成
-├── inject.js      5KB  注入装配：Block A/B/C/D + 信任边界 + 预算
-├── queue.js       3KB  待确认队列：一条一项一文件
-├── antiseptic.js  4KB  反腐烂：重复检测 + stale 计划（标记，不删除）
-├── guard.js       3KB  凭据扫描：scanThreat / redactThreats
-└── paths.js       1KB  路径布局（所有存储位置集中在这里）
+├── index.js     124KB 2783 行  宿主半边入口：6 个工具 + 注入接线 + 宿主探测 + 捕获 + 维护 + status.md（**待拆，见下**）
+├── client.js     83KB 1738 行  浏览器半边：设置页表单 + 回合尾候选卡片（**不拆文件，见下**）
+├── store.js      18KB  489 行  存储层：frontmatter 往返 + 原子写 + drift guard + 锁
+├── policy.js     14KB  357 行  策略层（纯函数）：打分 / 准入 / 生命周期 / 反馈 / 升级
+├── distill.js    13KB  335 行  技能提炼：候选打分 + 标签聚类 + 提炼提示词
+├── remote.js     13KB  294 行  界面数据通道：手写 Typert 贡献，7 个端点
+├── config.js     11KB  178 行  宿主半边 Config schema（设置页的字段定义）
+├── skill.js       9KB  242 行  SKILL.md 格式 I/O + 四个静默坑的对策 + approve/reject
+├── recall.js      9KB  229 行  本地检索：CJK bigram + BM25 + excerpt
+├── extract.js     9KB  216 行  记忆抽取：提示词 + 容错解析 + 准入 + 偏好加成
+├── inject.js      8KB  175 行  注入装配：Block A/B/C/D/E + 信任边界 + 预算
+├── antiseptic.js  5KB  121 行  反腐烂：重复检测 + stale 计划（标记，不删除）
+├── queue.js       3KB  105 行  待确认队列：一条一项一文件
+├── guard.js       3KB   68 行  凭据扫描：scanThreat / redactThreats
+└── paths.js       1KB   42 行  路径布局（所有存储位置集中在这里）
 ```
 
 **纯函数层**（`policy` / `recall` / `inject` / `antiseptic` / `distill` 的解析部分）
 不依赖 DSH，可以单独跑测试。**IO 层**（`store` / `queue` / `skill` / `guard`）
 只依赖 `node:`。
+
+### 2.1 两个「巨石」的处置（2026-10-16，外部反馈）
+
+**`lib/index.js`（2783 行）可以拆** —— Node 直接 `import()` 它，相对导入原生可用。
+按现有函数边界拆成 12 个模块，入口只留 `apply()` + 再导出：
+
+| 新文件 | 内容 | 原行范围 |
+|---|---|---|
+| `lib/state.js` | deepMerge / newId / readState / writeState | 136–176 |
+| `lib/health.js` | FAULT_LABEL / noteFault / healthOf / runMaintenance | 178–360 |
+| `lib/status.js` | writeStatus / probeHost | 362–532 |
+| `lib/tools-kit.js` | textOutput / registerTool / textOfMessage / commitOrWarn | 533–600 |
+| `lib/usage.js` | touchMemory / mutate / skillDirOf | 603–690 |
+| `lib/suggest.js` | DISMISS_MAX / computeSuggestions / selectUiSuggestions / dismissSuggestion / markSuggestionsSeen / requestDistillKey / clearDistillRequest | 690–800 |
+| `lib/skill-actions.js` | readSkillSources / writeSkillSources / pendingSkillDrafts / distillCluster / approveSkill / rejectSkill / hasShownSkill | 801–990 |
+| `lib/capture.js` | pad2 / localDate / hhmm / isHumanMessage / extractExchange / sessionEvents / captureTurn | 1009–1170 |
+| `lib/llm.js` | llmByCtx / llmFor / emptyOutputReason / makeModelCaller / writeCandidate | 1173–1300 |
+| `lib/targets.js` | probeTarget / conversationTarget / extractTarget / fallbackTarget / followFallback / pickTarget / runWithTarget | 1342–1550 |
+| `lib/extract-run.js` | runExtraction | 1552–1688 |
+| `lib/util.js` | plainify / isOn | 1689–1713 |
+
+依赖顺序（无环）：util → state → health → status → usage → suggest → skill-actions →
+capture → llm → targets → extract-run → index(apply)。
+
+**必须保住的契约**：入口继续导出 `name` / `inject` / `Config` / `apply` / `default`，
+以及 `healthOf` / `computeSuggestions` / `selectUiSuggestions` / `dismissSuggestion` /
+`markSuggestionsSeen` / `requestDistillKey` / `clearDistillRequest` / `pendingSkillDrafts` /
+`distillCluster` / `approveSkill` / `rejectSkill` / `hasShownSkill` / `extractExchange` /
+`sessionEvents` / `runMaintenance`（`test/plugin.test.mjs` 直接 import 入口与这些叶子模块）。
+`apply()`（1714–2783，约 1070 行）**最后拆**：那里面是 27 个真机缺陷换来的事件顺序与
+装配顺序，测试兜不住的部分全在那儿。
+
+**`lib/client.js`（1738 行）不拆文件** —— 这是宿主契约要求的形状，不是懒：
+
+1. 宿主 `@deepseek-ai/dsh-client-modules` 把 `exports["./client"]` 解析成**一个**
+   `clientPath`，`readFileSync` 一次读成 bundle，再拼进 combo script 送浏览器。
+   官方包的 client 文件是**构建产物**（tsdown），宿主找不到时的报错原文是
+   `client bundle not found; run pnpm run build before launch`。我们这份是手写的，没有构建步骤。
+2. 那个加载器**不支持相对 require**：`require('./x.js')` 会抛
+   `missed the module table — not a platform seed word, not a materialized module,
+   and no registered package factory`。实测扫官方全部 `lib/client.js`：**零处** `require('./...')`。
+3. 唯一的多文件通路是 `require.async('./client.<name>.js')`：
+   - 文件名必须匹配 `CLIENT_CHUNK = /^client\.[A-Za-z0-9][A-Za-z0-9._-]*\.js$/`，
+     文件放在入口同级（`join(dirname(clientPath), fileName)`），宿主按需路由
+     `/plugins/<包名>/client.<name>.js?rev=` 服务；
+   - 但它是**异步**的，而 bundle 工厂是**同步**的 → 卡片/设置页组件不能同步注册，
+     只能"先注册壳、再异步换真身" —— 正是本项目已经踩出 4 个"卡片永不出现"缺陷的地方；
+   - 更坑的是 **rev 只由入口文件的 stat 算**（`artifactRevision` 取自
+     `statSync(clientPath)` 的 `{mtimeMs, ctimeMs, size}`）：chunk 改了而入口没动 → rev 不变 →
+     chunk 以 `IMMUTABLE_CACHE` 送达 → 浏览器继续吃旧文件（重启也未必好，得硬刷新）。
+     今天单文件没有这个坑：改 `lib/client.js` 就是改入口，rev 必变。
+
+真要拆客户端**源码**，正路是引入构建步骤（tsdown 把 `src/client/*.ts` 打成**一个**
+`lib/client.js`）——代价是多一条工具链，且要在 AGENTS.md 里写清"零第三方**运行时**依赖"
+与构建期依赖的边界。收益不抵风险，暂不做；可读性靠文件顶部的分节目录。
 
 ### 数据布局
 
