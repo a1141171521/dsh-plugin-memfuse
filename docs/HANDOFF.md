@@ -40,7 +40,7 @@
 
 ```powershell
 cd <本仓库路径>
-npm test          # 应该看到 59 + 29 + 5 + 23 = 116 项全绿（全部零 LLM 调用）
+npm test          # 应该看到 75 + 29 + 5 + 23 = 132 项全绿（全部零 LLM 调用）
 ```
 
 **⚠️ 改 Host half 必须重启 DSH** —— Node 的 ESM 模块缓存，同进程内 `import()`
@@ -161,7 +161,7 @@ capture → llm → targets → extract-run → index(apply)。
 `markSuggestionsSeen` / `requestDistillKey` / `clearDistillRequest` / `pendingSkillDrafts` /
 `distillCluster` / `approveSkill` / `rejectSkill` / `hasShownSkill` / `extractExchange` /
 `sessionEvents` / `runMaintenance`（`test/plugin.test.mjs` 直接 import 入口与这些叶子模块）。
-`apply()`（1714–2783，约 1070 行）**最后拆**：那里面是 27 个真机缺陷换来的事件顺序与
+`apply()`（1714–2783，约 1070 行）**最后拆**：那里面是 28 个真机缺陷换来的事件顺序与
 装配顺序，测试兜不住的部分全在那儿。
 
 **`lib/client.js`（1738 行）不拆文件** —— 这是宿主契约要求的形状，不是懒：
@@ -548,7 +548,9 @@ $dbin  = '<DSH_APP>\resources\app\dsh\node_modules\@deepseek-ai\dsh\lib\bin.js'
 **只剩验证，没有已知缺陷**：
 
 1. **重启后确认三处**（host half 改了代码，不重启不生效 —— 见上面那条 ESM 缓存警告）：
-   - `~/.dsh/memory/.memory/status.md` 的 `代码版本:` 是不是 `2026-10-15-session-events-fix`
+   - `~/.dsh/memory/.memory/status.md` 的 `代码版本:` 是不是 `2026-10-17-capture-multisession`
+     （2026-10-15 那版写的是 `2026-10-15-session-events-fix`；这一行由代码写死，
+     是判断"宿主到底加载了哪个模块"的**唯一可靠信号**）
    - 新增的「## 零 LLM 捕获」节：**已捕获轮次 > 0**、`sessions/2026-10-15.md` 有内容
      （且落盘的 `[User]:` 是真人那句，不是 `<system-reminder>` 模板）
    - 「设置 → 内置插件」里 dsh-memfuse 配置页仍在（`status: schema`）

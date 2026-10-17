@@ -2263,3 +2263,379 @@ skill:
 | — 遗忘链 | **自有** | 五家唯一的差异化 |
 | — Block D 失败可见 | **自有** | 五家唯一的差异化 |
 | — 打分与预算化注入 | 自有（借鉴 云端超级记忆 系数） | 五家里 evolve/memsearch/Claude/Codex 都没有 |
+
+#### 缺陷 28（2026-10-17）：DSH 升到 `0.2.1-rc.1` 后，**工具调用挂死、对话停不下来**
+
+用户升级 DSH（`0.2.0-rc.2` → `0.2.1-rc.1`，安装目录也换了，新版是 `<DSH_APP>` +
+`app.asar` 打包）后，调 `memfuse_status` **永不返回**，
+连「停止对话」都点不动，只能强杀应用。之后用户把插件禁用。
+
+**先证明不是宿主挂了**（都在现场取的证据）：
+
+| 判据 | 实测 |
+|---|---|
+| 新版本 | `@deepseek-ai/dsh-desktop 0.2.1-rc.1`；`cordis 4.0.5` |
+| `typert` 服务 | 还在，`register/get` 签名不变 |
+| `llm.stream(GenerateOptions)` | 还在（多了 `purpose` / `aborted` finish） |
+| `agent/pre-step`（waterfall） | 签名不变：`next()` → `{kind:'reject'\|'enter'}`，payload 多了 `signal` |
+| `state.json` | `remoteChannel = {failed:"cannot create effect on inactive context"}`、`runtimeFaults.remoteFail` 同一时刻（`07:07:02Z` = 15:07:02） |
+| `lastExtractError` | 「宿主未提供 llm 服务（该 profile 未装 llm 插件）」—— 而那个 profile **装了**模型 |
+
+**根因（两件事叠在一起，缺一不成灾）**：
+
+1. 新宿主的 `ToolDefinition` 新增 `timeoutMs?`，而取消语义是
+   **"already-started work is still drained"** —— **已经在跑**的 `execute` 不会被强杀，
+   宿主一直等它。工具 promise 不 settle ⇒ 用户看到"工具不返回 + 对话停不下来"。
+2. 本插件六个工具的 `execute` 第一行都是 `await ready`，而 `ready` 里串着**宿主侧调用**：
+   `ctx.inject(['llm']) / ['settings']` 的可选注入、Remote 贡献挂载、以及**启动抽取**
+   （`extract.autoRunOnStart` 默认 true，要调模型）。其中任何一个永不 settle，
+   全体工具立刻死锁 —— 而我们**一个 `timeoutMs` 都没声明**，没有任何东西能救。
+
+现场还能看出两条"次生"问题：
+- `remoteChannel` 记下 `cannot create effect on inactive context`：插件被禁用（fiber 释放）
+  时 `ready` 还在跑，它的 `child.effect(...)` 落在了**已失效的 ctx** 上 —— 这是新版本
+  对 lifecycle 的收紧（旧版静默吞）。
+- 「宿主未提供 llm 服务」是**误报**：新版本里 `ctx.inject` 的回调是异步到达的，
+  启动抽取抢跑就会误判成"宿主没有 llm"，把人往错方向带。
+
+**修法**（`lib/index.js`，四条 + 一条测试接缝）：
+
+1. **启动链一律带预算**：`withBudget(initTask, STARTUP_BUDGET_MS = 12s, onTimeout)`。
+   到点**降级放行**（工具照常可用，读到的是上次落盘的 state），并把
+   `startupTimeout` 记进 `runtimeFaults` → Block D / status.md（硬规则 4，不许静默）。
+   初始化**真的抛错**时照样抛回去（工具立刻返回看得见的错误），只是不再吊死。
+2. **启动抽取挪出关键路径**：`void ready.then(...)`，不再 `await`。它本来就有 try/catch。
+3. **每个工具都声明 `timeoutMs`**：在 `registerTool()` 里统一补 `TOOL_TIMEOUT_MS = 25s`
+   （比启动预算大 —— 让插件先自己降级，别让宿主替我们超时）。
+   ⚠️ 当时取的是 25s，**缺陷 29 证明这个值会帮倒忙**（宿主会把偏慢但成功的调用改写成超时），
+   已上调到 120s；真实语义见缺陷 29 第一节。
+4. **等可选注入落定**：启动抽取前 `waitForLlm(2000)`，避免把"注入还没到"误报成
+   "宿主没有 llm"。
+5. **测试接缝**：`withBudget` / `TOOL_TIMEOUT_MS` / `STARTUP_BUDGET_MS` 都从入口导出，
+   测试直接断言（否则 12s/25s 这种值没法在测试里验证）。
+
+⚠️ **`withBudget` 里的定时器绝对不要 `unref()`**：那个定时器就是"到点放行"的唯一凭据。
+unref 掉之后，事件循环没事可做时定时器还没响、循环就空了 —— `node --test` 直接报
+`Promise resolution is still pending but the event loop has already resolved`
+（这一轮真踩了，三条新用例同时红）。正确做法是**竞速结束后 `clearTimeout`**。
+
+**回归**（`test/plugin.test.mjs`，本文件 62 项）：
+① `withBudget` 到点返回 `null` 且触发回调、没超时原样透传、`TOOL_TIMEOUT_MS > STARTUP_BUDGET_MS`；
+② 六个工具**逐个**断言 `typeof timeoutMs === 'number'` 且大于启动预算；
+③ 一个**永不产出**的 `llm.stream` 下，`ready` 仍能在预算内返回、`memfuse_status` 照常返回
+（这条就是事故本身的复现形态）。
+
+**验收（真机）**：重新启用插件 → 重启 desktop →
+`~/.dsh/memory/.memory/status.md` 的「运行期故障」若出现 `startupTimeout` / `remoteFail`，
+就说明故障被**如实记下**（而不是把整轮对话吊死）；工具调用必须始终有返回。
+
+#### 缺陷 29（2026-10-17）：缺陷 28 只治了一半 —— `memfuse_extract` 还是**永不返回**
+
+缺陷 28 修完、插件重新启用后，用户实测的结论是「**一半好了一半没好**」：
+
+| 工具 | 结果 |
+|---|---|
+| `memfuse_status` / `memfuse_recall` / `memfuse_skill` | 立刻返回 ✅ |
+| `memfuse_extract`（dryRun） | **一直不返回**，只能再次禁用插件 ❌ |
+
+这条差异本身就是诊断结论：**卡点不在 `ready`，而在"真的去调模型"那条路上。**
+缺陷 28 把启动抽取挪出了关键路径，于是 `ready` 能结束、只读工具全活；
+但 `memfuse_extract` 自己仍然直接 `await` 模型，于是原样再卡一次。
+
+**先纠正一条被读错的宿主语义**（这是缺陷 28 修法里的第三项）：
+
+```js
+// @deepseek-ai/dsh-tool-call-timeout-policy 的真实实现
+const result = await next();                        // 先无条件等工具跑完
+if (timeoutOf(d.signal, 'TOOL_TIMEOUT') !== void 0) // 跑完才问"刚才超时没"
+  return toolTimeoutResult(timeoutMs);
+```
+
+`timeoutMs` 是**协作式**的，不是硬超时。README 原文：
+「永不完成的下游调用无法产生超时结果」「忽略该信号的工具不会在超时时停止」。
+所以给工具补 `timeoutMs` 对"永不 settle"**完全无效** —— 它只是到点把 `exec.signal`
+置成 aborted，工具自己理会才有效。而且它还有**反向副作用**：工具跑超了却成功返回时，
+结果仍会被替换成 `tool call timed out after Nms` —— 25s 那个值会把一次正常但偏慢的
+抽取**改写成失败**。已上调到 120s（大于我们自己的所有内部预算）。
+
+**真凶（三条，都有现场证据）**：
+
+1. **预检会做网络请求，而且没有预算**。`probeTarget()` 调 `llm.listProviders()` /
+   `llm.listModels(provider)`，而宿主把它们**转交给 adapter**
+   （`dsh-llm/lib/index.js`：`listModels` → `adapter.listModels(provider)`）。
+   对 OpenAI 兼容中转站，这就是一次 `/v1/models` 请求。
+   实测同一条路：**一次 52 秒，一次 12 毫秒**（`state.json` 里
+   `lastExtractSuccess` 与 `status.md` 的生成时间相差 52s / 12ms）。而这个预检
+   本来只是"省一次 API 调用"。`pickTarget()` 最多还会调它**两次**（主目标 + 降级目标）。
+2. **模型流没有预算**。`for await (const chunk of llm.stream(...))` 在上游"光连不吐"
+   （限流 / 连接半开 / 代理挂住）时会**永远挂着**，而 `GenerateOptions` 里
+   **没有 `signal` 字段** —— 掐不断它，只能不再等它。
+3. **"没新素材"被写成了"成功"**。`runExtraction()` 只要 `errors.length === 0` 就
+   `lastExtractSuccess = now`，哪怕 `processed === 0`（一个文件都没处理、一次模型都没调）。
+   于是 `status.md` 上写着「最近成功：刚刚 / 健康 ✅ 正常」，把真故障盖得干干净净 ——
+   这一轮排查就是被它带偏了两次。**假成功和静默失败一样有害**（硬规则 4）。
+
+排查途中还排除了两个看似可疑、实际无关的方向，记下来省下次的时间：
+
+- dryRun 把整个会话文件（50149 字节）塞给模型？**不会** ——
+  `extract.js:129` 内部已经 `slice(0, 12000)`。
+- `minChars` 把文件全挡掉了？**不会** —— 默认 200。真正的坑是
+  **`Get-ChildItem .Length` 是字节数，而 `full.length` 是字符数**（中文 3 字节/字），
+  两者一混就会把"水位线正好在文件尾"误判成"有 26271 字符待处理"。
+
+**修法**（`lib/index.js`，五个预算 + 一处诚实）：
+
+1. **预检有预算** `PROBE_BUDGET_MS = 2000`：`listProviders` / `listModels` 都用
+   `withBudget` 包起来，超时按"查不动"**放行**（与"宿主没提供这个方法"同一种处理），
+   并记 `probeTimeout` 到 `runtimeFaults`。52 秒的启动抽取 → ≤2 秒。
+2. **模型调用有预算** `MODEL_CALL_TIMEOUT_MS = 90000`：新增 `drainStream()`，
+   手动拿迭代器，每个 `next()` 都和"无进展到点"、"被取消"竞速；到点抛可读错误
+   （经 `extractCandidates` 记进 `lastExtractError` → Block D），并在放弃时
+   `it.return()` **关掉流**。定时器同样不 `unref`，`finally` 里清掉。
+   ⚠️ 判据是「**多久没有新 chunk**」而**不是**「整次调用多久」：后者会腰斩
+   "每 10 秒吐一块、健康跑 100 秒"的长回答，还把它报成"没有任何推进" ——
+   又一次把成功说成失败。所以每收到一块就**重新上弦**，总时长另由 `absDeadline` 兜底。
+3. **响应取消**：`memfuse_extract` / `memfuse_skill distill` 把 `exec.signal` 一路传下去。
+   用户点「停止」时工具立刻返回 —— 顶栏那个按钮终于点得动了。
+4. **总预算** `EXTRACT_BUDGET_MS = 100000`（单次工具调用）/ `STARTUP_EXTRACT_BUDGET_MS = 240000`
+   （后台启动抽取）：`makeModelCaller` 每调用一次先算**剩余预算**，用完就明确报错；
+   循环里也检查，别让第 2、3 个文件各再等一整个调用预算。
+   **预算必须嵌套**：`PROBE(2s) ≤ MODEL_CALL(90s) ≤ EXTRACT(100s) < TOOL_TIMEOUT(120s)`，
+   否则宿主会先超时并把我们的结果改写成失败。
+5. **不再伪造成功**：`processed === 0` 时只写 `lastExtractSkippedAt`，
+   `status.md` 如实写「最近一次：… 无新素材，跳过（这次没调模型，不算成功也不算失败）」；
+   `memfuse_status` 也带出 `lastSkipped`。
+6. **读文件失败不再静默**：`fsp.readFile(...).catch(() => '')` 改成显式 try/catch +
+   记进 `errors`。以前读失败 = 空字符串 = 被当成"没有新内容"跳过，整轮还算成功。
+
+⚠️ 顺带一条宿主契约：`dsh-session-checkpoint-policy` 会在 `llm/stream` 和 `tools/execute`
+前面 `await ctx.sessions.flush(...)` 等落盘。**我们的模型调用没传 `sessionId`**，
+所以走 `return next()` 直接放行 —— 不是卡点（查过，别再来一遍）。
+
+**回归**（`test/plugin.test.mjs`，本文件 66 项）：
+① `drainStream` 对"永不推进"的流在预算内抛错、触发 `onTimeout`、并调用 `it.return()` 关流；
+② 预算**嵌套关系**逐个断言（顺序错了宿主就会替我们报超时）；
+③ 模型流卡住时 `runExtraction` 在预算内收尾并报「没有任何推进」（不再吊死整轮对话）；
+④ **没有新素材时不许刷新 `lastExtractSuccess`**，只写 `lastExtractSkippedAt`。
+
+**验收（真机）**：重新启用插件 → 重启 → 调 `memfuse_extract dryRun=true`，
+**必须在 2 分钟内拿到结果**（成功、或一条说清"没推进 / 预算用完"的错误）。
+`status.md` 的抽取管线应能区分「最近成功」「最近一次：无新素材，跳过」「最近错误」三态。
+✅ **2026-10-17 真机已验证**：`dryRun=true` 正常返回，`zjpai/deepseek-flash` 抽出 6 条候选，
+`runtimeFaults` 仍为 `{}`（既没触发无进展判定，预检也没超时）。
+
+#### 缺陷 30（2026-10-17）：捕获**间歇性停摆** —— 抽取没原料，而界面写着「健康 ✅」
+
+缺陷 29 修好之后 `memfuse_extract` 正常返回了，但**启动抽取一直报"无新素材"**。
+一查发现 `sessions/2026-10-17.md` 的 mtime 停在 **14:22:45**、体积 50149 字节，
+而在 **14:22 – 15:07 这段窗口里插件是启用的**，对话也没停 —— 45 分钟一个字节没长。
+`status.md` 却写「健康: ✅ 正常」。
+
+这是本项目第 6 次踩同一个坑：**功能存在但从不生效**（硬规则 4）。
+
+⚠️ **诚实边界**：排查到一半（15:56:14）该文件**又自己写入了 1956 字节**（50149 → 52105，
+正常增长）。所以这是**间歇性**故障，**根因尚未确认**。本次修的是两件确定能修的事 ——
+"断了必须能看见"和"多一个触发点" —— 不是"确认到的根因"。下一次复现时，
+`captureFail` 会直接把断点说出来。
+
+**先证伪两个看起来很像的猜测**（都查实了，别再回头）：
+
+| 猜测 | 结论 | 证据 |
+|---|---|---|
+| 抽取器读不了 0.2.1 的事件 | **不成立** | 用 `extractExchange()` 直接跑真实会话事件，正确返回 `userText`（32 字）与 `assistantSeq`（10177） |
+| `assistant/message` 的正文下沉到 `data.message.content`，插件读不到 | **不成立** | `textOfMessage` 早就兼容两种形状；真机统计：`data.content` 0 条、`data.message` 1741 条，取文本正常 |
+
+真正的洞是**一串静默 return**：`captureTurn()` 里"没找到真人输入 / 没找到正文"直接
+`return null`，落盘失败只 `logger.warn`（desktop 的 console 用户看不见）。
+于是**无论断在哪一环，外部表现都一模一样：什么都不写，也什么都不说**。
+
+> 附带更正一个我自己踩歪的判断：`Get-ChildItem .Length` 是**字节数**，
+> `fs.readFile(...,'utf8').length` 是**字符数**（中文 3 字节/字）。混用会把
+> "水位线正好在文件尾"误读成"还有 26271 字符待处理"，从而错误地怀疑 `minChars`。
+
+**修法**（`lib/index.js`）：
+
+1. **三条静默路径全部留痕**：没找到真人输入 / 没找到带正文的 assistant 消息 /
+   落盘失败，统一 `noteFault(store.runtimeFaults, 'captureFail', …)`，
+   并带上 `via`（哪个访问器）与事件条数 —— 这两个数字就是下次的排查现场。
+   正常去重（同一轮已写过）仍然不记，避免噪声。
+2. **加第二捕获触发点**：`session/event` 仍是第一触发点，但 `agent/pre-step`
+   **每轮必到**（本轮的记忆注入就靠它），在那里补一次捕获。
+   两个触发点共用 `lastCapturedSeq` 去重（按 `session.id` + `assistantSeq`），
+   所以不会写重；最坏情况是**晚一轮**落盘，不会丢。
+
+**回归**（`test/plugin.test.mjs`，本文件 68 项）：只派发 `agent/pre-step`、
+**不**派发 `session/event`，素材仍必须落盘，且 assistant 正文要从
+`data.message.content` 取到。
+
+**验收（真机）**：重启后聊一轮，看 `sessions/<今天>.md` 的 mtime 应当持续更新；
+`status.md` 的「已捕获轮次」应当增长。若出现 `captureFail`，它的 message 会直接指出
+是"没找到真人输入"还是"没找到正文"。
+
+✅ **真机已验证（2026-10-17 16:05）**：捕获恢复（`sessions/2026-10-17.md` 52105 → 67562 字节、
+「已捕获轮次」82 → 89），且启动抽取**真跑成**了（`最近成功 16:04:12`，写入 6 条新记忆，
+总数 129 → 136）。`recall` 当场就召回了上一轮刚抽出来的那条（捕获链路本身）。
+
+#### 缺陷 30b（2026-10-17）：第二触发点自己带来的新 bug —— **同一提问被记两遍、回复各是半截**
+
+上面那个"加 pre-step 触发点"的修法**上线后立刻暴露一个设计错误**（真机现场）：
+
+```
+### 16:05   [User]: 我重启了。现在你再给我验证一下插件功能都是都正常了。
+           [DSH]: 重启后我先做一次全量检查：…          ← 半截
+### 16:05   [User]: 我重启了。现在你再给我验证一下插件功能都是都正常了。
+           [DSH]: 启动后的现场很干净，而且**关键证据都出现了**：…  ← 又是半截
+```
+
+原因：`agent/pre-step` 是在**一轮的每个 step 之前**都触发的，而 `captureTurn()` 用
+"最后一条有正文的 assistant 消息"当轮次边界 —— 一轮还没跑完时它就会把中间那条当结论写下去。
+`lastCapturedSeq` 只能去重同一个 assistant seq，救不了"每步一个 seq"。
+
+⚠️ **第一版修法是错的，必须记下来**：当时用 `{ beforeTurn: payload.turn }` 过滤，
+真机上**一次都没生效** —— 因为 `agent/pre-step` 的 payload 是
+`{ messages, ...position, signal }`，**根本没有 `agent`**，也就取不到 session、
+`payload.turn` 也比不上 `data.turn`。整段兜底代码从没真正执行过。
+
+正确的修法是两条，都**不依赖任何 payload 字段**：
+
+1. **session 从 `session/event` 顺手存**（`lastSession`）—— pre-step 的 payload 里没有它。
+2. **判"这一轮收尾没"只看事件流**：`extractExchange(events, { requireTurnEnd: true })`
+   要求这条 assistant 消息之后**出现过 `turn/end`**，否则跳过 —— 只捕获已收尾的轮次。
+3. **调换扫描顺序**：先定位 assistant 正文，再从它**往前**配对同轮的 user 消息。
+   原来先找 user 再找 assistant，一旦 assistant 被过滤掉，就会把"这一轮的提问"配上
+   "上一轮的回答" —— 静默的数据错配，比重复更糟。
+
+这样一轮只会落一块：要么 `turn/end` 立刻写，要么下一次 pre-step 补写，两者靠
+`assistantSeq` 去重。
+
+**回归**（本文件 68 项）：同轮的半截回答**不许落盘**；同一轮重复派发 pre-step
+**不许重复写**；补写的必须是上一轮完整的那一对。
+
+⚠️ **这条修复要重启才生效** —— 之前那一版仍在运行，所以现场可能还会看到重复块。
+
+#### 缺陷 30c（2026-10-17）：同一轮被写 2~7 遍 —— **插件被重载会叠监听器**
+
+30b 修完重启后，真机上仍然出现同一条提问被记 8 次以上（`sessions/2026-10-17.md`
+行 898/903/916/925/937/942/947/1008…）。时间线给出了线索：
+**重复只发生在我反复改 `lib/index.js` 的那段时间**，而且每次修改后重复数就涨一档。
+
+判断：插件被宿主**重载**，`apply()` 跑了多次 → `session/event` 监听器叠了多份，
+于是**同一个 `turn/end` 被投递给了 N 份监听器**，各写一次。
+重启后内存里的 `lastCapturedSeq` 归零，跨进程也拦不住。
+
+修法必须**幂等** —— 不能依赖"apply() 只跑一次"，也不能依赖进程内状态：
+
+1. 每块写一个**不可见标记**：`<!-- cap:<sessionId>:<assistantSeq> -->`。
+2. **追加前先读当天那份文件**，发现已有同标记就跳过。
+
+标记里**必须带 `sessionId`**：不同会话出现一模一样的问答是正常的（测试和真实场景都有），
+只按文本内容去重会把它们误杀 —— 现有 F1 用例正好抓到了这一点
+（"换个 session id 不算同轮"）。
+
+这样去重**不依赖注册次数、也不依赖进程**，重载、重启、多开都不会重复。
+
+**回归**（本文件 69 项）：
+① 只派发 pre-step、不派发 turn/end，素材仍要落盘（30 的兜底）；
+② 有 `turn/end` 的轮次才记，半截回答不许落盘（30b）；
+③ 模拟"插件被重载两次"（全新实例、去重表为空），同一轮**只许 1 块**（30c）。
+
+⚠️ **同样要重启才生效**。
+
+#### 缺陷 31（2026-10-17）：捕获文件被清理后，**抽取水位线越界 → 再次静默停摆**
+
+按用户选的方案 A 清理掉重复块后（`sessions/2026-10-17.md` 41 块 → 19 块，
+删除 14777 + 3935 字节，备份两份 `.bak-dedupe-*` / `.bak-quoted-*`），文件从 84765 字节缩到 29672 字符。
+而 `state.json` 里的抽取水位线是 **35340** —— 比文件还长。
+
+后果和缺陷 29 的"假成功"是同一类：`full.slice(already)` 恒为空 → 每一轮都判"没有新素材" →
+**抽取永久停摆**，而 `status.md` 还写「健康 ✅」。
+
+**更麻烦的一点**：插件把 `state` 缓存在内存里，人工改 `state.json` 会被它**回写覆盖** ——
+所以"改文件修水位"这条路不可靠，必须在代码里自愈。
+
+修（`runExtraction`）：检测到 `alreadyRaw > full.length` 时，
+① 把水位**夹到文件尾**（这段内容不重抽 —— 宁可漏掉，也不要整篇重抽导致 auto 模式重复写库）；
+② 记 `extractWatermark` 到 `runtimeFaults`（→ Block D / status.md），说清是哪个文件、原水位多少、文件多长。
+之后新追加的素材照常抽取。
+
+**回归**（本文件 70 项）：水位越界时 `files=0`、不调模型、`runtimeFaults.extractWatermark` 有值；
+追加新内容后 `files=1` 且真的调了模型（证明没被永久卡死）。
+
+#### 缺陷 32（2026-10-17）：短消息被记成"捕获失败"—— **假故障把真问题淹了**
+
+缺陷 31 重启验收时，注入块顶上挂着一条告警：
+
+> 会话捕获失败（捕获跳过：本轮没找到真人输入（via=ownEvents()，事件 11008 条，userText=3 字））
+
+`userText=3 字` 就是用户那句「重启了」。它低于 `minPromptLength`（默认 10），
+**跳过是对的**；错在这段代码把"太短"和"根本没找到真人输入"塞进了同一个故障分支。
+于是每遇到一次短消息，界面就报一次「记忆功能部分不可用」。
+
+**假故障和静默失败一样有害**：它会把真正的故障淹掉（本项目已经因为"假成功"被带偏过两次）。
+
+修：拆成两条独立分支 ——
+① `!userText`（真的一条真人消息都没有）→ 记 `captureFail`，带 `via` 与事件条数；
+② `userText.length < minPromptLength` → **静默跳过**（正常行为），不写任何故障。
+
+**回归**（本文件 71 项）：用户只说「重启了」时，不落盘、且 `health().ok === true`（不许出现 captureFail）。
+
+#### 缺陷 33（2026-10-17）：子代理会话冒充主会话 —— **兜底捕获抓错人，还每步刷一条假告警**
+
+缺陷 32 修完重启，注入块底部又挂上新告警：
+
+> 会话捕获失败（捕获跳过：本轮没找到真人输入（via=ownEvents()，事件 35 条））
+
+破案线索是那个**事件条数每步都在涨**：35 → 64 → 70 → 86 → 94 → 129。主会话当时有 11190 条事件，
+对不上；扫 `~/.dsh/sessions/` 发现，这个回合起的 subagent 会话正好 129 条 —— 抓错人了。
+
+定位到 `lastSession`。`agent/pre-step` 的 payload 里没有 session（宿主只给
+`{messages, ...position, signal}`），所以缺陷 30c 用一个**全局**变量 `lastSession` 记
+"最后一个发事件的会话"，给兜底捕获用。但 `session/event` 是所有会话共用的，子代理一开跑就把它改写：
+兜底捕获于是去抓子代理的事件流。子代理会话的 `user/message` 全是运行时注入（`source.kind` 不是
+`user`），`extractExchange` 配不出问答 → 每步报一次"没找到真人输入"；而真正该兜底的主会话，
+只有在"最后发事件的是它"时才轮得到。
+
+**也就是说：这条兜底路径在多会话并发时等于失效，而且只会在界面上留一条误导性、永不清除的告警。**
+
+修：
+
+① **按会话分别记账**：`captureSessions`（`session.id → { session, turnEndSeq, reason, capturable, sweepSeq }`，
+上限 32 个）。谁的事件都不会覆盖别人。宿主有 `sessions` 服务时（`ctx.get('sessions')`，可选依赖）
+再用 `list()` 补一遍，拿不到就只用事件流攒的表。
+② **子代理会话跳过且不留痕**：`session.header.origin === 'subagent'` 不是人机对话。
+③ pre-step 只在会话有**新事件**时扫（`session.seq` 没变就跳过），避免每步 O(n) 白扫。
+
+#### 缺陷 33b（2026-10-17）：报错的轮次也被当成"最终回答"记进记忆库
+
+查 33 时顺带查出来的：`turn/end` 的 `data.reason` 从来没被看过。宿主的 `TurnEndReason` 有
+`completed / aborted / blocked / error / max-tokens / interrupted / forked` 七种，
+上一版一律捕获 —— 真机现场 16:33 那块记的就是一个 **400 "model is unavailable（per-model cooldown）"**
+的报错回合，`[DSH]` 正文是错误回显。
+
+修：只捕获**正常收尾**的轮次。`error / aborted / interrupted / forked / blocked` 不记、也不重试
+（失败的是这一轮本身，用户已经看见了，不是捕获故障，所以不写 `captureFail`）。
+`requireTurnEnd` 也同步要求"那条 turn/end 是正常收尾"。
+
+⚠️ 连带修一处**自己挖的坑**：pre-step 的"上一轮没正常收尾就别重试"那道门，必须放行
+"收尾之后又来了新事件"的情况。否则事件投递不到（`turn/end` 没派发过来）时，这道门会让
+兜底彻底关死 —— 而真正防脏数据的是 `requireTurnEnd`（它只认正常收尾的 turn/end），
+不是那道门；那道门只该负责省掉没意义的重复扫描。
+
+判据用**黑名单**而不是白名单（fail-open）：宿主以后多出没见过的 kind 时，宁可多记一轮，
+也不能因为一个字符串让捕获静默停摆 —— 那正是缺陷 30 的形态。
+
+#### 缺陷 33c（2026-10-17）：一轮进行中的 pre-step 被记成故障
+
+`captureTurn` 的"没找到真人输入"分支同时还兜住了另一个**正常**情形：`agent/pre-step` 在一轮的
+**每个 step 之前**都会到，此时本轮当然还没写 `turn/end`。缺陷 30b 已经加了 `requireTurnEnd` 防止半截
+落盘，但故障分支没跟着分档，于是每步都记一次"没找到真人输入"。
+
+修：分三档 —— ① 会话里**从来没有**真人输入（子代理 / 纯系统会话）→ 静默；
+② 有真人输入但本轮还没收尾（`quietNoExchange`）→ 静默；③ 有真人输入、轮次也收尾了却配不出问答
+→ 才记 `captureFail`。故障文案里不再放事件条数：pre-step 每步都重算，条数一变注入块里的告警
+文案就跟着抖（真机现场恰好就是这个现象，看着像出了大事，其实只是多调了几个工具）。
+
+**回归**（本文件 75 项）：新增四条 —— ① 主会话 + 子代理会话并存时只抓主会话、子代理不进库、
+`health().ok === true`；② `reason: { kind: 'error' }` 的轮次不落盘、不重试，随后正常收尾的轮次照常落盘；
+③ 一轮进行中的 pre-step 静默通过，不写假故障；④ 上一轮报错、下一轮正常收尾但 `turn/end` 不投递时，
+兜底仍必须补上（那道省扫描的门不许把兜底关死）。

@@ -11,7 +11,7 @@
 | 3 | `docs/spec.md` | **唯一权威**的功能清单 + 技术线 + 各阶段实施记录（含真机发现的缺陷） |
 | 4 | `README.md` | 对外说明（**部分已过时**，以 spec.md 为准） |
 
-**先跑 `npm test`**（应看到 **59 + 29 + 5 + 23 = 116 项全绿**）确认环境正常，再动手。
+**先跑 `npm test`**（应看到 **75 + 29 + 5 + 23 = 132 项全绿**）确认环境正常，再动手。
 想直接看候选卡片长什么样：`npm run preview`（离线预览页，不用重启、不用先有候选）。
 
 ## 这是什么
@@ -25,7 +25,7 @@ DSH 的长期记忆插件。纯文本 Markdown 存储、本地检索。
   推送前扫一遍：**不带凭据**；本机用户名 / 绝对路径改占位符（仓库是 public）。
 - **已装进 desktop + web 两个 profile**（都是**符号链接/junction 指向本仓库**，改文件即生效，
   只差重启让客户端重新加载 bundle），真机跑通。
-- 测试 **116 项全绿**（plugin 59 + client 29 + 预览 5 + smoke 23）；真机功能 40/40、补测 29/29、真实会话闭环、真实模型往返全通。
+- 测试 **132 项全绿**（plugin 75 + client 29 + 预览 5 + smoke 23）；真机功能 40/40、补测 29/29、真实会话闭环、真实模型往返全通。
 - **候选卡片的离线预览页**：`npm run preview`（起本地静态服务再打开
   `docs/preview/turn-tail-card.html` —— **别直接双击**：模块脚本在 `file://` 下会被 CORS 拒）。
   它加载**真实的 `lib/client.js`**（同 bundle / 同 CSS / 同字典），宿主那侧是假数据；
@@ -63,7 +63,7 @@ DSH 的长期记忆插件。纯文本 Markdown 存储、本地检索。
 - **H7 技能建议**（2026-10-15 追加）：够格时在注入里出 **Block E**（**零 LLM**，只给簇语义不给技能正文），
   用户点头才 `distill`。`dismiss` 后该组不再出现；**簇长大 → key 变 → 重新提一次**。
   真机已用探针（宿主自己的 `systemPrompt.assemble()`）抓到真实组装块验证。
-- **真机累计发现 27 个缺陷，全部修复**。最隐蔽的十七个：
+- **真机累计发现 33 个缺陷，全部修复**。最隐蔽的十七个：
   - 缺陷 5：`agent/pre-step` 是 waterfall，不调 `next()` → **每轮对话崩**
   - 缺陷 11：`Config` 没放进 `export default` → **设置页静默消失、零报错**
   - 缺陷 12：**`session.events` 在宿主上不存在**（真名 `ownEvents()`）→ 兜底捕获整条路径
@@ -152,6 +152,96 @@ DSH 的长期记忆插件。纯文本 Markdown 存储、本地检索。
     （`apply()` 里 `child.effect` 挂监听）；④ 文案分层 —— 重试中说
     「还没就绪…第 N 次…**原始原因：**<原文>」（原始报错不许吞，硬规则 4），
     只有不再重试才写「界面通道出错」。回归 3 条（client 29 项）。见 spec 缺陷 27
+  - 缺陷 28（**升级 DSH `0.2.1-rc.1` 后工具挂死、对话停不下来**）：调 `memfuse_status`
+    永不返回，连「停止对话」都点不动，只能强杀应用。**先证明宿主没挂**（typert / llm /
+    `agent/pre-step` 三个契约都没变；`state.json` 里 `remoteChannel` 记着
+    `cannot create effect on inactive context`）。根因两条叠加：
+    ① 新 `ToolDefinition` 的取消语义是 **"already-started work is still drained"** ——
+    已经在跑的 `execute` 不会被强杀；② 六个工具第一行都是 `await ready`，而 `ready`
+    串着宿主侧调用（可选注入 / Remote 挂载 / **启动抽取**），任一永不 settle 就全员死锁，
+    而我们**一个 `timeoutMs` 都没声明**。修：启动链 `withBudget(12s)` 到点**降级放行** +
+    启动抽取挪出关键路径 + `registerTool()` 统一补 `TOOL_TIMEOUT_MS=25s` +
+    启动抽取前 `waitForLlm()`（新版本注入是异步到达的，抢跑会误报"宿主没有 llm"）。
+    ⚠️ `withBudget` 里的定时器**绝不能 unref**（否则 `node --test` 报
+    `event loop has already resolved`），要竞速后 `clearTimeout`。回归 3 条（plugin 71 项）。
+    见 spec 缺陷 28
+  - 缺陷 29（**缺陷 28 只治了一半**）：重新启用后 `status` / `recall` / `skill` 全部秒回，
+    但 `memfuse_extract` **仍然永不返回**。差异本身就是结论：**卡点不在 `ready`，
+    而在"真的去调模型"那条路上**。先纠正一条读错的宿主语义
+    （`dsh-tool-call-timeout-policy` 是 `const result = await next()` —— **先等工具跑完、
+    跑完才检查超时**）：`timeoutMs` 对"永不 settle"**完全无效**，而且工具跑超了却成功返回时
+    结果仍会被改写成 `tool call timed out` —— 25s 会把偏慢的成功**说成失败**，已上调 120s。
+    真凶三条：① **预检做网络请求且没预算**（`probeTarget` → `llm.listProviders/listModels`，
+    宿主转交 adapter，实测同一条路**一次 52 秒、一次 12 毫秒**，而 `pickTarget` 最多调两次）；
+    ② **模型流没预算**（上游"光连不吐"时 `for await` 永远挂着，`GenerateOptions` **没有
+    `signal`**，掐不断只能不等）；③ **"没新素材"被写成"成功"**（`errors.length===0` 就刷
+    `lastExtractSuccess`，哪怕 `processed===0` → status.md 写「健康 ✅」把真故障盖掉，
+    **这轮排查被它带偏两次**）。修：`PROBE_BUDGET_MS=2s`（超时按"查不动"放行 + 记
+    `probeTimeout`）/ `drainStream()` 给整次调用加预算并在放弃时关流 / `exec.signal` 一路
+    传下去（「停止」终于点得动）/ `EXTRACT_BUDGET_MS=100s` 总预算 + 剩余预算递减 /
+    `processed===0` 只写 `lastExtractSkippedAt` / 读文件失败不再 `.catch(()=>'')`。
+    **预算必须嵌套**：`PROBE(2s) ≤ MODEL_CALL(90s) ≤ EXTRACT(100s) < TOOL_TIMEOUT(120s)`。
+    ⚠️ 排除过的假嫌疑：dryRun 塞 50KB？不会（`extract.js` 内部已 `slice(0,12000)`）；
+    `minChars` 挡掉？不会（默认 200）。真坑是 **`.Length` 是字节数、`full.length` 是字符数**
+    （中文 3 字节/字）。另：`dsh-session-checkpoint-policy` 的 `sessions.flush` 不是卡点
+    （我们的模型调用没传 `sessionId`，走 `next()` 放行）。回归 4 条（plugin 71 项）。
+    见 spec 缺陷 29
+  - 缺陷 30（**捕获静默停摆，抽取没原料**）：缺陷 29 修好后 `memfuse_extract` 正常返回，
+    但 `sessions/2026-10-17.md` 从 14:22 起**一个字节没长**；每次启动都报「无新素材」，
+    而 status.md 写「健康 ✅」。**先证伪两个猜测**：① 抽取器坏了？**没有** ——
+    拿真实会话事件直接跑 `extractExchange()`，正确返回 `userText` + `assistantSeq`；
+    ② `assistant/message` 的正文下沉到 `data.message.content` 了？**已经兼容**（`textOfMessage`
+    两种形状都吃）。真正的洞是**一连串静默 return**：`captureTurn` 里"没找到真人输入 /
+    没找到正文 / 追加失败"三条路都不留痕（落盘失败只 `logger.warn`，desktop 上看不见）。
+    修：① 三个静默分支全部 `noteFault(captureFail)`，带上 `via` 与事件条数；
+    ② **加第二捕获触发点** —— `agent/pre-step` 每轮必到（注入就靠它），在那里补一次捕获，
+    同一轮由 `lastCapturedSeq` 去重，最多晚一轮；`session/event` 仍是第一触发点。
+    回归 1 条（只派发 pre-step、不派发 session/event，素材仍必须落盘）。
+    ⚠️ **诚实边界**：15:56:14 它又自己写入了 1956 字节（50149→52105）—— 所以是**间歇性**
+    故障、**根因未确认**。本次修的是"断了必须能看见 + 多一个触发点"，不是根因；
+    下次复现时 `captureFail` 会直接点名断在哪一环。
+    见 spec 缺陷 30
+  - 缺陷 30b（**30 的修法自己带出来的新 bug**）：加完 pre-step 触发点，真机立刻出现
+    **同一提问被记好几遍、`[DSH]` 各是半截**。第一版修法用 `{beforeTurn: payload.turn}`
+    **完全没用** —— 真机上 `agent/pre-step` 的 payload 是 `{messages, ...position, signal}`，
+    **根本没有 `agent`**，所以 `payload.agent.session` 取不到、`payload.turn` 也比不上
+    `data.turn`，那段代码**一次都没真正执行过**。改用两条都**不依赖 payload 字段**的判据：
+    ① session 从 `session/event` 顺手存进 `lastSession`；② 判"这一轮收尾没"只看**事件流**：
+    这条 assistant 消息之后必须出现过 `turn/end`（`requireTurnEnd`）。
+    另**调换扫描顺序**：先找 assistant 正文、再往前配对同轮 user（原来先找 user，
+    assistant 被过滤后会配错轮，是静默的数据错配）。见 spec 缺陷 30b
+  - 缺陷 30c（**重载会叠监听器**）：真机上同一轮被写 2~7 遍，而且只发生在我**反复改代码**
+    的那段时间 —— 插件被宿主重载、`apply()` 跑了多次，`session/event` 监听器叠了多份；
+    重启后内存里的 seq 去重也归零。修：块里写一个不可见标记
+    `<!-- cap:<sessionId>:<seq> -->`，**追加前先读当天文件、发现有同标记就不写**。
+    标记必须带 sessionId —— 不同会话出现一模一样的问答是正常的，只按文本去重会误杀
+    （现有 F1 用例正好抓到了这点）。这样去重**不依赖注册次数、也不依赖进程**。
+    回归 3 条（半截不许落盘、重载/重启不重复记、不同会话相同文本照常记）。**要重启生效。**
+    见 spec 缺陷 30c
+  - 缺陷 33（**子代理会话把兜底捕获抢走了**）：缺陷 32 修完重启，注入块又挂上告警
+    「本轮没找到真人输入（via=ownEvents()，事件 35 条）」—— 而这个**条数每步都在涨**
+    （35→64→70→86→94→129）。主会话当天有 11190 条事件，对不上；扫 `~/.dsh/sessions/`
+    发现这个回合起的 subagent 会话正好 129 条。根因：`agent/pre-step` 的 payload 里没有
+    session，30c 就用一个**全局** `lastSession` 记"最后一个发事件的会话"，子代理一跑就把它
+    改写 → 兜底捕获去抓子代理的事件流，而那里没有真人输入（全是 `runtime-context`），
+    于是每步报一次假告警，真正该兜底的主会话反而轮不到。**即：多会话并发时这条兜底等于
+    失效，只留下一条永不清除的误导告警。** 修：换成按会话记账的 `captureSessions`（上限 32）
+    + 可选 `ctx.get('sessions')` 补来源 + 子代理会话（`header.origin === 'subagent'`）跳过
+    不留痕 + 只在 `session.seq` 变化时才扫。回归 1 条（主会话 + 子代理并存）。
+    见 spec 缺陷 33
+  - 缺陷 33b（**报错轮次也进了记忆库**）：`turn/end` 的 `data.reason` 从来没被看过。
+    宿主的 `TurnEndReason` 有 `completed / aborted / blocked / error / max-tokens /
+    interrupted / forked` 七种，上一版一律捕获 —— 真机 16:33 那块记的就是一个
+    **400「model is unavailable（per-model cooldown）」** 的报错回合，`[DSH]` 正文是错误回显。
+    修：只捕获正常收尾；判据用**黑名单 fail-open**（没见过的新 kind 照记，不能让一个字符串
+    让捕获静默停摆）。`requireTurnEnd` 同步要求那条 `turn/end` 是正常收尾。回归 1 条。
+    见 spec 缺陷 33b
+  - 缺陷 33c（**一轮进行中的 pre-step 被记成故障**）：pre-step 在一轮**每个 step** 前都会到，
+    此时本轮当然还没有 `turn/end`。30b 加了 `requireTurnEnd` 防半截落盘，但故障分支没跟着分档，
+    于是每步记一次"没找到真人输入"。修：分三档 —— 会话里从来没有真人输入（子代理/纯系统）→
+    静默；有真人输入但本轮还没收尾 → 静默；有真人输入、轮次也收尾了却配不出问答 → 才记
+    `captureFail`。故障文案**去掉事件条数**（每步都变 → 注入块告警跟着抖）。回归 1 条。
+    见 spec 缺陷 33c
 - **设置页**：✅ 两个半边都齐了。宿主半边 `lib/config.js`（`Config status: schema`）+
   浏览器半边 `lib/client.js`（注册**两处**：`plugins.bundle.config` key = 包名、
   `plugins.row.config` key = `dsh-memfuse#dsh-memfuse`）。

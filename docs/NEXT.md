@@ -189,6 +189,158 @@ preview 新增 1 条（预览页里把整条第二阶段走一遍）。
 
 回归：client 两条（① 只等定时器、不渲染卡片 → 自己回到 `ready`；② 紧跟渲染 → 真的又拉了一次）。
 
+### 0.10 DSH 升到 0.2.1-rc.1 后工具挂死、对话停不下来（缺陷 28）
+
+用户升级 DSH（`0.2.0-rc.2` → `0.2.1-rc.1`，安装目录换成新版布局 `<DSH_APP>` +
+`app.asar`）后调 `memfuse_status`，**永不返回**，连「停止对话」都点不动，只能强杀。
+随后用户把插件禁用。
+
+**先证明宿主没挂**（三个契约逐个核过，都没变）：`typert.register/get`、
+`llm.stream(GenerateOptions)`、`agent/pre-step`（waterfall，`next()` → `{kind:'reject'|'enter'}`）。
+`state.json` 只留下 `remoteChannel = {failed:"cannot create effect on inactive context"}`。
+
+**根因两条叠加**：① 新 `ToolDefinition` 的取消语义是 **"already-started work is still
+drained"** —— 已经在跑的 `execute` 不会被强杀，宿主一直等；② 六个工具第一行都是
+`await ready`，而 `ready` 串着宿主侧调用（可选注入 / Remote 挂载 / **启动抽取**），
+任一永不 settle ⇒ 全员死锁；而我们**一个 `timeoutMs` 都没声明**。
+
+修：启动链 `withBudget(12s)` 到点降级放行并记 `startupTimeout` 故障；
+启动抽取挪出关键路径（`void ready.then(...)`）；`registerTool()` 统一补
+`TOOL_TIMEOUT_MS = 25s`；启动抽取前 `waitForLlm(2s)` 修掉「宿主未提供 llm」的误报。
+
+⚠️ `withBudget` 的定时器**不能 `unref`**：unref 后事件循环可能先空，
+`node --test` 报 `Promise resolution is still pending but the event loop has already
+resolved`（这一轮三条新用例同时红）。正确做法是竞速结束后 `clearTimeout`。
+
+**下一步（要真机验收）**：重新启用插件 → 重启 desktop →
+① 任一 `memfuse_*` 工具必须**有返回**（不许再挂死）；
+② `status.md` 的「运行期故障」若出现 `startupTimeout` / `remoteFail`，那就是**被如实记下**了，
+把那条原文发我，就能定位到底是哪个宿主调用不回来。
+
+回归：plugin 三条（`withBudget` 到点放行、六个工具都声明 `timeoutMs`、
+`llm.stream` 永不产出时 `ready` 仍 8ms 返回且工具可用）。
+
+**→ 实测结果见 §0.11：缺陷 28 只治了一半。**
+
+### 0.11 缺陷 28 只治了一半：`memfuse_extract` 仍然永不返回（缺陷 29）
+
+重新启用插件后真机复测：`memfuse_status` / `recall` / `skill` **全部秒回**，
+但 `memfuse_extract`（dryRun）**一直不返回**，只能再次禁用。这条差异本身就是结论 ——
+**卡点不在 `ready`，而在"真的去调模型"那条路上。**
+
+**先纠正一条读错的宿主语义**：`dsh-tool-call-timeout-policy` 是
+`const result = await next()` —— **先等工具跑完，跑完才检查自己超时没**。
+所以 `timeoutMs` 对"永不 settle"**完全无效**（README 原话：「永不完成的下游调用
+无法产生超时结果」）；而且它还有反向副作用：工具跑超了却成功返回时，结果仍会被替换成
+`tool call timed out after Nms` —— 25s 会把一次正常但偏慢的抽取**改写成失败**。
+已上调到 120s。
+
+**真凶三条**：
+
+1. **预检做网络请求且没预算**：`probeTarget()` → `llm.listProviders()` / `listModels()`，
+   宿主**转交给 adapter**（对 OpenAI 兼容中转站就是 `/v1/models`）。
+   实测同一条路**一次 52 秒、一次 12 毫秒**（`lastExtractSuccess` 与 `status.md`
+   生成时间之差），而它只是"省一次 API 调用"。`pickTarget()` 最多调两次。
+2. **模型流没预算**：`for await (llm.stream(...))` 在上游"光连不吐"时永远挂着，
+   而 `GenerateOptions` **没有 `signal` 字段** —— 掐不断，只能不再等它。
+3. **"没新素材"被写成"成功"**：`errors.length === 0` 就刷 `lastExtractSuccess`，
+   哪怕 `processed === 0`。于是 status.md 写着「最近成功：刚刚 / 健康 ✅ 正常」，
+   把真故障盖掉了 —— **这一轮就是被它带偏两次**。
+
+**顺手排除的两个假嫌疑**（省下次时间）：dryRun 塞 50KB 给模型？不会，
+`extract.js:129` 内部已 `slice(0,12000)`。`minChars` 挡掉了？不会，默认 200。
+真正坑人的是 **`Get-ChildItem .Length` 是字节数、`full.length` 是字符数**
+（中文 3 字节/字）—— 一混就把"水位线正好在文件尾"看成"有 26271 字符待处理"。
+
+**修**：`PROBE_BUDGET_MS=2s`（预检超时按"查不动"放行 + 记 `probeTimeout`）、
+`drainStream()` 给整次模型调用加预算并在放弃时关流、把 `exec.signal` 一路传下去
+（「停止」终于点得动）、`EXTRACT_BUDGET_MS=100s` 总预算 + 剩余预算递减、
+`processed===0` 只写 `lastExtractSkippedAt`、读文件失败不再 `.catch(()=>'')`。
+**预算必须嵌套**：`PROBE(2s) ≤ MODEL_CALL(90s) ≤ EXTRACT(100s) < TOOL_TIMEOUT(120s)`。
+
+⚠️ 另核实一条：`dsh-session-checkpoint-policy` 会在 `llm/stream` / `tools/execute`
+前 `await ctx.sessions.flush(...)`，但**我们的模型调用没传 `sessionId`**，
+走 `return next()` 直接放行 —— **不是卡点**，别再来一遍。
+
+**下一步（要真机验收）**：重新启用 → 重启 → 调 `memfuse_extract dryRun=true`，
+**必须在 2 分钟内拿到结果**（成功，或一条说清"没推进 / 预算用完"的错误）。
+
+回归：plugin 四条（`drainStream` 到点放弃 + 关流、预算嵌套、模型流卡住时
+`runExtraction` 在预算内收尾、无新素材不刷 `lastExtractSuccess`）。
+
+**✅ 真机已验证（2026-10-17）**：`memfuse_extract dryRun=true` 正常返回，
+`zjpai/deepseek-flash` 抽出 6 条候选，`runtimeFaults` 仍为 `{}`。**挂死问题到此解决。**
+但这次验证又带出下一个缺陷 → 见 §0.12。
+
+### 0.12 捕获间歇性停摆，抽取没原料（缺陷 30）
+
+缺陷 29 修好后 `memfuse_extract` 真机验证通过，但**启动抽取一直报"无新素材"** ——
+`sessions/2026-10-17.md` 的 mtime 停在 14:22:45，而 **14:22–15:07 插件是启用的**、
+对话也没停，45 分钟一个字节没长，而 status.md 写「健康 ✅」。
+本项目第 6 次踩"功能存在但从不生效"。
+
+⚠️ **诚实边界**：15:56:14 它**又自己写入了 1956 字节**（50149 → 52105）。
+所以是**间歇性**故障、**根因未确认**；这次修的是"断了必须能看见 + 多一个触发点"，
+不是根因。下次复现时 `captureFail` 会直接点名断在哪一环。
+
+**先证伪两个很像的猜测**（都查实了，别再回头）：① `extractExchange()` 直接跑真实会话事件，
+正确返回 `userText` + `assistantSeq` → 抽取器没问题；② `assistant/message` 正文下沉到
+`data.message.content`，插件**早就兼容**（真机 `data.content` 0 条 / `data.message` 1741 条）。
+
+真正的洞是**一串静默 return**：`captureTurn()` 里"没找到真人输入 / 没找到正文"直接返回，
+落盘失败只 `logger.warn`（desktop 上看不见）。所以断在哪一环，外部表现都一样：
+什么都不写、也什么都不说。
+
+**修**：① 三条静默路径全部进 `captureFail`（带 `via` 与事件条数，正常去重不记）；
+② **加第二捕获触发点** —— `agent/pre-step` 每轮必到（注入就靠它），在那里补一次捕获，
+与 `session/event` 共用 `lastCapturedSeq` 去重，最坏晚一轮、不会丢。
+
+⚠️ 顺带更正一个自己踩歪的判断：`.Length` 是**字节数**、`readFile(...,'utf8').length` 是
+**字符数**（中文 3 字节/字）。混用会把"水位线正好在文件尾"误读成"还有 26271 字符待处理"。
+
+**下一步（要真机验收）**：重启后聊一轮 → `sessions/<今天>.md` 的 mtime 必须持续更新、
+`status.md` 的「已捕获轮次」必须增长；若有 `captureFail`，它的原文会直接指出断在哪一环。
+
+✅ **已验收（16:05）**：捕获恢复（52105 → 67562 字节、已捕获轮次 82 → 89），
+启动抽取真跑成（`最近成功 16:04:12`、写入 6 条、总数 129 → 136）。
+
+### 0.12b 第二触发点带来的新 bug：同一提问被记两遍、回复各是半截（缺陷 30b）
+
+加完 pre-step 触发点，真机立刻出现重复块：同一条「我重启了…」被记两次，`[DSH]` 各是半截。
+原因：`pre-step` 在一轮的**每个 step 之前**都会触发，而 `captureTurn()` 拿"最后一条有正文的
+assistant 消息"当轮次边界 —— 一轮没跑完就把中间那条当结论写下去；`lastCapturedSeq` 只能
+去重同一个 seq，救不了"每步一个 seq"。
+
+修：① `extractExchange(events, { beforeTurn })` 跳过 `data.turn === beforeTurn` 的消息，
+pre-step 传 `payload.turn`；② **调换扫描顺序** —— 先找 assistant 正文、再往前配对同轮 user
+（原来先找 user，assistant 被过滤后会配错轮，是静默的数据错配）。一轮只落一块：
+`turn/end` 立刻写，或下一次 pre-step 补写，靠 `assistantSeq` 去重。
+
+⚠️ **这条要重启才生效**，之前那版还在跑，现场可能仍有重复块。
+
+回归：plugin 六条（新增"半截回答不许落盘 + 同一轮重复派发不重复写"）。
+
+### 0.12c 还是重复：插件被重载会叠监听器（缺陷 30c）
+
+30b 修完重启，真机上同一提问仍被写 8 次以上。线索：**重复只出现在我反复改 lib/index.js
+的那段时间**，每改一次重复数涨一档。判断是插件被宿主**重载**、apply() 跑了多次、
+session/event 监听器叠了多份，同一个 turn/end 被投递 N 次各写一遍；重启后内存去重归零，
+跨进程也拦不住。
+
+修法必须**幂等**：每块写一个不可见标记 `<!-- cap:<sessionId>:<seq> -->`，追加前先读当天文件、
+发现同标记就跳过。标记必须带 sessionId —— 不同会话出现一模一样的问答是正常的，
+只按文本去重会误杀（现有 F1 用例"换个 session id 不算同轮"正好抓到了）。
+
+另更正 30b 的第一版修法：用 `{beforeTurn: payload.turn}` 过滤**完全没生效** ——
+`agent/pre-step` 的 payload 是 `{messages, ...position, signal}`，**根本没有 agent**，
+取不到 session。改成：session 从 session/event 存进 `lastSession`；
+判"这一轮收尾没"只看**事件流**（assistant 消息之后必须出现过 turn/end）。
+
+回归：plugin 九条（30 / 30b / 30c 各 1~3 条）。**要重启才生效。**
+
+**下一步**：重启后聊两轮 → 检查当天捕获文件里同一条提问**只出现一次**。
+
+
 ### 0.9 缺陷 26 没修干净：同一个 404 又回来了（缺陷 27）
 
 用户**又**重启了一次，底部**还是**那一行 404。0.8 的修法给了"3 次 / 7 秒"的预算 ——
@@ -220,7 +372,7 @@ preview 新增 1 条（预览页里把整条第二阶段走一遍）。
 | **H7 技能建议（Block E）** | 够格时主动在注入里提示，**零 LLM** |
 | `dismiss` action | 用户"不用"后该组不再提示；**簇长大 key 变 → 重新提一次** |
 | `skill.suggest` / `skillSuggestMax` | 配置 + 设置页开关已加（`suggest` 已补 `.volatile()`，见缺陷 17） |
-| 测试 | **116 项全绿**（plugin 59 / client 29 / 预览 5 / smoke 23） |
+| 测试 | **132 项全绿**（plugin 75 / client 29 / 预览 5 / smoke 23） |
 | **真机冒烟** | 用探针走宿主 `systemPrompt.assemble()` 抓到真实组装块，且 Block E 的 dismiss 语义已验证 |
 | 夹具工具 | `.memfuse-smoke/`，**路径运行时生成**，跨机器可跑 |
 | spec.md | §H7 / §H8 已写（含四个静默缺陷、预览页、防回归写法） |
@@ -228,7 +380,7 @@ preview 新增 1 条（预览页里把整条第二阶段走一遍）。
 命令：
 
 ```powershell
-npm test          # 116 项（假 ctx，不需要宿主、不需要模型）
+npm test          # 132 项（假 ctx，不需要宿主、不需要模型）
 npm run smoke     # 真宿主冒烟（需要 dsh 在 PATH，不需要模型）
 npm run preview   # 打开候选卡片的离线预览页
 ```
@@ -416,3 +568,59 @@ npm run smoke      # 真宿主；探针会抓组装块
 #                        {root:'conversation.chat.turnTail'})
 #   的 occupants 里应出现 memfuse 的 key
 ```
+
+### 0.12d 清理重复块，然后被水位线反咬一口（缺陷 31）
+
+方案 A 清理：`sessions/2026-10-17.md` 41 块 → 19 块（删 13 个重复块 + 9 个"内联引用的伪块"），
+两份备份留在同目录。清理后文件从 84765 字节缩到 29672 字符。
+
+立刻踩到新问题：`state.json` 的水位线是 **35340 > 29672**，`full.slice(already)` 恒空 →
+抽取又变成"无新素材"永久停摆。而且**插件会把它内存里的 state 回写覆盖**，
+所以手工改 state.json 根本改不住 —— 必须在代码里自愈。
+
+修：水位越界时夹到文件尾 + 记 `extractWatermark` 故障（不静默）；新素材照常抽。
+回归 1 条。**要重启生效。**
+
+**下一步**：重启后确认 `status.md` 的「运行期故障」出现一条 `extractWatermark`（说明自愈生效），
+然后聊两轮，确认同一条提问在捕获文件里只出现一次、且带 `<!-- cap:... -->` 标记。
+
+### 0.12e 重启验收：捕获活着，但子代理会话把兜底捕获抢走了（缺陷 33 / 33b / 33c）
+
+重启后先蹦出一条新告警：
+
+> 会话捕获失败（捕获跳过：本轮没找到真人输入（via=ownEvents()，事件 35 条））
+
+事件条数每一步都在涨（35 → 64 → 70 → 86 → 94 → 129），而**主会话当时有 11190 条事件**。
+拿真实会话日志比对：129 正是这个回合里那个 subagent 会话的事件数 —— 兜底捕获抓错人了。
+
+根因：`agent/pre-step` 的 payload 里没有 session，所以 30c 用的是一个**全局** `lastSession`
+记"最后一个发事件的会话"。任何会话的事件都能覆盖它，子代理一开跑就把目标抢走；而子代理会话的
+`user/message` 全是运行时注入（没有 `source.kind === 'user'`），于是每步报一次"没找到真人输入"，
+真正该兜底的主会话反而一次也没补上。
+
+同一轮还查出第二个问题：`turn/end` 不看收尾原因。宿主的 `TurnEndReason` 有
+`completed / aborted / blocked / error / max-tokens / interrupted / forked`，上一版一律捕获 ——
+16:33 那块记的就是一个 **400 "model is unavailable"** 的报错回合。
+
+修：
+1. **按会话分别记账**（`captureSessions`，上限 32）；有 `ctx.get('sessions')` 时再用宿主服务补一遍，
+   拿不到就只用事件流攒的表（可选依赖，不能强求）。
+2. **子代理会话跳过且不留痕**：`session.header.origin === 'subagent'` 不是人机对话。
+3. **只捕获正常收尾的轮次**：`error/aborted/interrupted/forked/blocked` 不记也不重试
+   （失败的是这一轮本身，用户已经看见，不算捕获故障）。判据用**黑名单**（fail-open）：
+   以后宿主多出没见过的 kind，宁可多记一轮也不能让捕获静默停摆。
+4. `captureTurn` 分三档：会话里从来没有真人输入 → 静默；有真人输入但本轮还没收尾 → 静默
+   （`quietNoExchange`）；有真人输入、轮次也收尾了却配不出问答 → 才记 `captureFail`。
+   故障文案不再放事件条数（每步都在变，注入块的告警会跟着抖）。
+5. `requireTurnEnd` 现在要求那条 `turn/end` 是正常收尾。
+
+回归：plugin 75 项（新增缺陷 33 / 33b / 33c / 33d 四条）。
+
+**验收时顺便确认的两件事**（都是误会，记录以免下次重复怀疑）：
+- 16:24 → 16:33 之间捕获文件没长，不是捕获停了：第 49/50 轮是 `方案A` / `重启了`（各 3 字，
+  低于 `minPromptLength` 该跳过），第 52 轮是模型 400 报错打断的回合；
+- `session/event` 触发点是活的：16:33 那块的写入时刻与 `turn/end`(seq 11170) 的事件时刻同一秒。
+
+**下一步**：重启后聊两轮 → 注入块顶部不该再出现那条告警；`status.md` 的「运行期故障」应为空。
+`status.md` 的 `代码版本:` 现在是 `2026-10-17-capture-multisession`（这一行由代码写死，
+是判断"宿主到底加载了哪个模块"的唯一可靠信号；旧值是 `2026-10-15-session-events-fix`）。
