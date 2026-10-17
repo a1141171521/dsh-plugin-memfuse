@@ -2267,7 +2267,8 @@ test('缺陷 28：每个工具都要声明 timeoutMs（否则卡住时宿主会�
 
 test('缺陷 28：启动抽取不在 ready 的关键路径上（llm 不返回也不许拖住工具）', async (t) => {
   const root = path.join(os.tmpdir(), `memfuse-plugin-28-${Date.now()}`);
-  t.after(() => fsp.rm(root, { recursive: true, force: true }));
+  // 清理要带重试：启动抽取落定后会补写一次 status.md，可能跟这里的 rm 撞车（ENOTEMPTY）
+  t.after(() => fsp.rm(root, { recursive: true, force: true, maxRetries: 10, retryDelay: 25 }));
   // 一个**永不产出**的模型流：以前它会让 ready 永久 pending
   const neverLlm = {
     stream() {
@@ -2808,4 +2809,43 @@ test('缺陷 33d：上一轮报错之后的新一轮，兜底捕获不许被"省
   assert.ok(!text.includes('model is unavailable'), '报错的上一轮仍不许进库');
   assert.equal(api.health().ok, true, '这条路径不该产生 captureFail');
   console.log('  ✅ 报错轮次之后：兜底照常工作，且不会把失败轮次记进去');
+});
+
+test('缺陷 34：启动抽取落定后要补写 status.md（派生视图不能停在上一轮）', async (t) => {
+  const root = path.join(os.tmpdir(), 'memfuse-status-order-' + Date.now());
+  t.after(() => fsp.rm(root, { recursive: true, force: true }));
+  await fsp.mkdir(path.join(root, 'sessions'), { recursive: true });
+  await fsp.writeFile(path.join(root, 'sessions', '2026-10-17.md'), 'x' + '内容。'.repeat(120), 'utf8');
+
+  const llm = fakeLlm(
+    JSON.stringify([
+      { kind: 'fact', title: '启动顺序测试条目', summary: 's', body: 'b', anchor: 'a', durability: 'durable', confidence: 0.9, evidence: 'explicit' },
+    ]),
+  );
+  const h = fakeCtx({ llm });
+  const api = mod.apply(h.ctx, {
+    root,
+    git: false,
+    verbose: false,
+    extract: { enabled: true, provider: 'p', model: 'm', autoRunOnStart: true },
+  });
+  await api.ready;
+  // 启动抽取是 fire-and-forget，但 `apply()` 把句柄交出来了 —— await 它能等到
+  // "抽取跑完 + status.md 补写"都落定。**不要用 setImmediate 轮询去猜**：
+  // `waitForLlm` 用的是 setTimeout，轮询推进不了真实时间，用例会时过时不过。
+  assert.ok(api.startupExtraction, 'apply() 必须交出启动抽取的句柄（可测性）');
+  await api.startupExtraction;
+
+  const stateFile = path.join(root, '.memory', 'state.json');
+  const statusFile = path.join(root, '.memory', 'status.md');
+  const st = JSON.parse(await fsp.readFile(stateFile, 'utf8'));
+  assert.ok(st.lastExtractSuccess, '启动抽取应当真的跑一次并写下 lastExtractSuccess');
+
+  const statusText = await fsp.readFile(statusFile, 'utf8');
+  assert.match(
+    statusText,
+    new RegExp(`最近成功: ${st.lastExtractSuccess}`),
+    'status.md 的「最近成功」必须与 state.json 一致，否则人看到的像"抽取没跑"',
+  );
+  console.log('  ✅ 启动抽取落定 → 补写 status.md，派生视图与真源一致');
 });
