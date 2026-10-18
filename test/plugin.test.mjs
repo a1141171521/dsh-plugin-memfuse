@@ -724,7 +724,7 @@ test('空正文：推理型模型吃光 maxTokens → 加倍重试一次；两�
     const h = fakeCtx({ llm });
     const api = mod.apply(h.ctx, {
       root, git: false, verbose: false,
-      extract: { enabled: true, provider: 'p', model: 'm', autoRunOnStart: false, minChars: 10 },
+      extract: { enabled: true, followConversation: false, provider: 'p', model: 'm', autoRunOnStart: false, minChars: 10 },
     });
     await api.ready;
     await fsp.mkdir(path.join(root, 'sessions'), { recursive: true });
@@ -842,7 +842,7 @@ test('F2 抽取：fake 模型 → 候选 → 准入 → 偏好加成 → 进队�
   });
   const api = mod.apply(h.ctx, {
     root, git: false, verbose: false,
-    extract: { enabled: true, provider: 'fake', model: 'fake', autoRunOnStart: false },
+    extract: { enabled: true, followConversation: false, provider: 'fake', model: 'fake', autoRunOnStart: false },
   });
   await api.ready;
 
@@ -876,7 +876,7 @@ test('F2 水位线：同一段内容不会被重复抽取', async (t) => {
     { kind: 'fact', title: '部署脚本在 scripts/deploy.sh', summary: '部署入口。', body: '部署走 scripts/deploy.sh。', anchor: '要部署时', durability: 'durable', confidence: 0.9, evidence: 'implicit' },
   ]));
   const h = fakeCtx({ llm });
-  const api = mod.apply(h.ctx, { root, git: false, verbose: false, extract: { enabled: true, provider: 'p', model: 'm', autoRunOnStart: false } });
+  const api = mod.apply(h.ctx, { root, git: false, verbose: false, extract: { enabled: true, followConversation: false, provider: 'p', model: 'm', autoRunOnStart: false } });
   await api.ready;
   await fsp.writeFile(path.join(root, 'sessions', '2026-10-15.md'), `x${'内容。'.repeat(120)}`, 'utf8');
 
@@ -894,7 +894,7 @@ test('F2 失败可见：模型报错 → lastExtractError → Block D 告警（�
   const root = path.join(os.tmpdir(), `memfuse-extfail-${Date.now()}`);
   t.after(() => fsp.rm(root, { recursive: true, force: true }));
   const h = fakeCtx({ llm: fakeLlm('', { fail: '503 model unavailable' }) });
-  const api = mod.apply(h.ctx, { root, git: false, verbose: false, extract: { enabled: true, provider: 'p', model: 'm', autoRunOnStart: false } });
+  const api = mod.apply(h.ctx, { root, git: false, verbose: false, extract: { enabled: true, followConversation: false, provider: 'p', model: 'm', autoRunOnStart: false } });
   await api.ready;
   await fsp.writeFile(path.join(root, 'sessions', '2026-10-15.md'), `x${'内容。'.repeat(120)}`, 'utf8');
 
@@ -921,7 +921,7 @@ test('E6 approve / reject：采纳写进记忆，丢弃只删队列项', async (
       { kind: 'fact', title: '部署脚本在 scripts/deploy.sh', summary: '部署入口。', body: '部署走 scripts/deploy.sh。', anchor: '要部署时', durability: 'durable', confidence: 0.9, evidence: 'implicit' },
     ])),
   });
-  const api = mod.apply(h.ctx, { root, git: false, verbose: false, extract: { enabled: true, provider: 'p', model: 'm', autoRunOnStart: false } });
+  const api = mod.apply(h.ctx, { root, git: false, verbose: false, extract: { enabled: true, followConversation: false, provider: 'p', model: 'm', autoRunOnStart: false } });
   await api.ready;
   await fsp.writeFile(path.join(root, 'sessions', '2026-10-15.md'), `x${'内容。'.repeat(120)}`, 'utf8');
   await api.runExtraction({});
@@ -950,14 +950,15 @@ test('E6 approve / reject：采纳写进记忆，丢弃只删队列项', async (
   console.log('  ✅ approve 写进记忆 / reject 只删队列项，两者都写 usage 留痕');
 });
 
-test('F2 没开开关 / 开了没选模型：明确报原因，不报错也不静默', async (t) => {
+test('F2 关掉开关 / 开了没选模型：明确报原因，不报错也不静默', async (t) => {
   const root = path.join(os.tmpdir(), `memfuse-nocfg-${Date.now()}`);
   t.after(() => fsp.rm(root, { recursive: true, force: true }));
   const h = fakeCtx();
-  const api = mod.apply(h.ctx, { root, git: false, verbose: false, extract: { autoRunOnStart: false } });
+  // ⚠️ 显式关掉（默认是**开**的，见 F2b）
+  const api = mod.apply(h.ctx, { root, git: false, verbose: false, extract: { enabled: false, autoRunOnStart: false } });
   await api.ready;
 
-  // 默认：总开关关着 → 说清是"没开启"，而且算 disabled（不是故障）
+  // 关掉：说清是"没开启"，而且算 disabled（不是故障）
   const res = await api.runExtraction({});
   assert.equal(res.ok, false);
   assert.equal(res.disabled, true, '开关没开 = disabled，不该被当成故障');
@@ -968,6 +969,47 @@ test('F2 没开开关 / 开了没选模型：明确报原因，不报错也不�
   const added = JSON.parse(await write.execute({ mode: 'add', title: '照常可写', summary: 's', body: 'b' }));
   assert.equal(added.ok, true, '没开抽取不该影响手写记忆');
   console.log('  ✅ 开关没开：抽取明确报原因（不算故障），手写记忆照常工作');
+});
+
+test('F2b 默认值：不开任何配置也「会学」（enabled + 跟随对话模型默认开）', async (t) => {
+  const root = path.join(os.tmpdir(), `memfuse-default-on-${Date.now()}`);
+  t.after(() => fsp.rm(root, { recursive: true, force: true }));
+  const llm = fakeLlm('[]');
+  llm.listProviders = async () => [{ id: 'p1', name: 'P1' }];
+  llm.listModels = async () => [{ id: 'm1' }];
+  const h = fakeCtx({
+    llm,
+    services: { agentDefaultModel: { currentSelection: () => ({ provider: 'p1', model: 'm1' }) } },
+  });
+  const api = mod.apply(h.ctx, { root, git: false, verbose: false, extract: { autoRunOnStart: false, minChars: 10 } });
+  await api.ready;
+  await fsp.mkdir(path.join(root, 'sessions'), { recursive: true });
+  await fsp.writeFile(
+    path.join(root, 'sessions', '2026-10-17.md'),
+    `[User]: 以后统一用 pnpm\n${'补充内容。'.repeat(40)}\n`,
+    'utf8',
+  );
+
+  const res = await api.runExtraction({});
+  assert.equal(res.ok, true, `默认应当直接可跑（不用先配模型），实际 ${JSON.stringify(res)}`);
+  assert.equal(llm.calls.at(-1).provider, 'p1');
+  assert.equal(llm.calls.at(-1).model, 'm1', '默认跟随对话主模型');
+  const state = JSON.parse(await fsp.readFile(path.join(root, '.memory', 'state.json'), 'utf8'));
+  assert.equal(state.extractEnabled, true, '默认开启要落进 state（status.md 那行读的就是它）');
+  assert.equal(state.extractSource, '对话主模型');
+  console.log('  ✅ 默认值：enabled + followConversation 都开 —— 装好就能学，不用先挑模型');
+});
+
+test('F2c 默认值只有一处真源：schema 与 DEFAULT_CONFIG 必须一致', async () => {
+  // 两套默认值漂移的后果：设置页显示「开」，实际跑「关」—— 用户看到的和发生的不一样，
+  // 而且零报错（本项目最怕的那一类）。所以这里逐项钉死。
+  const { Config } = await import('../lib/config.js');
+  const schema = Config.dict.extract.dict;
+  assert.equal(schema.enabled.meta.default, true, 'schema 里总开关默认必须是 true（设置页读它）');
+  assert.equal(schema.followConversation.meta.default, true, 'schema 里跟随默认必须是 true');
+  assert.equal(mod.DEFAULT_CONFIG.extract.enabled, true, 'DEFAULT_CONFIG 里总开关默认必须是 true（运行期读它）');
+  assert.equal(mod.DEFAULT_CONFIG.extract.followConversation, true, 'DEFAULT_CONFIG 里跟随默认必须是 true');
+  console.log('  ✅ schema 与 DEFAULT_CONFIG 的默认值一致（都是「开」）');
 });
 
 // ───────────────────────── 阶段 3 第二批：技能提炼（H）─────────────────────────
@@ -1083,7 +1125,7 @@ test('H2/H3/H5 提炼 → 待确认 → approve 装进技能库 + derived-into �
   });
   const api = mod.apply(h.ctx, {
     root, git: false, verbose: false,
-    extract: { enabled: true, provider: 'p', model: 'm', autoRunOnStart: false },
+    extract: { enabled: true, followConversation: false, provider: 'p', model: 'm', autoRunOnStart: false },
     skill: { dir: skillDir, minScore: 3, minSessions: 2 },
   });
   await api.ready;
@@ -1142,13 +1184,13 @@ test('缺陷 25：界面那条路（提炼 → 草稿预览 → 装/丢）与工
   });
   const api = mod.apply(h.ctx, {
     root, git: false, verbose: false,
-    extract: { enabled: true, provider: 'p', model: 'm', autoRunOnStart: false },
+    extract: { enabled: true, followConversation: false, provider: 'p', model: 'm', autoRunOnStart: false },
     skill: { dir: skillDir, minScore: 3, minSessions: 2 },
   });
   await api.ready;
   const { store, state } = await api.ready;
   const cfg = {
-    extract: { enabled: true, provider: 'p', model: 'm' },
+    extract: { enabled: true, followConversation: false, provider: 'p', model: 'm' },
     skill: { dir: skillDir, maxBytes: 65536, minScore: 3, minSessions: 2, enabled: true, suggest: true },
   };
   const logger = { warn: () => {}, log: () => {} };
@@ -1394,7 +1436,7 @@ test('缺陷 1 回归：llm 是可选依赖 —— 宿主不给它，插件照�
   const h = fakeCtx(); // 不传 llm
   const api = mod.apply(h.ctx, {
     root, git: false, verbose: false,
-    extract: { enabled: true, provider: 'fake', model: 'fake', autoRunOnStart: false },
+    extract: { enabled: true, followConversation: false, provider: 'fake', model: 'fake', autoRunOnStart: false },
   });
   await api.ready;
 
@@ -1426,7 +1468,7 @@ test('缺陷 1 回归：llm 是可选依赖 —— 宿主不给它，插件照�
   });
   const api2 = mod.apply(h2.ctx, {
     root: root2, git: false, verbose: false,
-    extract: { enabled: true, provider: 'fake', model: 'fake', autoRunOnStart: false },
+    extract: { enabled: true, followConversation: false, provider: 'fake', model: 'fake', autoRunOnStart: false },
   });
   await api2.ready;
   await fsp.mkdir(path.join(root2, 'sessions'), { recursive: true });
@@ -1524,7 +1566,7 @@ test('缺陷 6 回归：模型失败编码在 finish.reason 里，不能被伪�
   const h = fakeCtx({ llm: fakeLlm('', { finishError: '400: 模型 deepseek-x 的价格未配置' }) });
   const api = mod.apply(h.ctx, {
     root, git: false, verbose: false,
-    extract: { enabled: true, provider: 'fake', model: 'fake', autoRunOnStart: false, minChars: 10 },
+    extract: { enabled: true, followConversation: false, provider: 'fake', model: 'fake', autoRunOnStart: false, minChars: 10 },
   });
   await api.ready;
   await fsp.mkdir(path.join(root, 'sessions'), { recursive: true });
@@ -1664,7 +1706,7 @@ test('抽取降级：模型不可用时按 onUnavailable 决定「停」还是�
     const api = mod.apply(h.ctx, {
       root, git: false, verbose: false,
       // 降级那几条路径都以「开关已开」为前提（开关本身由上面那条测试覆盖）
-      extract: { enabled: true, autoRunOnStart: false, minChars: 10, ...extractCfg },
+      extract: { enabled: true, followConversation: false, autoRunOnStart: false, minChars: 10, ...extractCfg },
     });
     await api.ready;
     await fsp.mkdir(path.join(root, 'sessions'), { recursive: true });
@@ -1737,7 +1779,7 @@ test('Remote 通道：手写描述符合法 + 服务绑定正确 + 七个方法�
   //    这里把规则**照抄**成断言；换宿主版本时要回去重读那些函数，别让测试变成自证。
   const wireName = /^[A-Za-z0-9_$.-]+$/;
   const descriptors = remoteMod.remoteDescriptors();
-  assert.equal(descriptors.length, 7);
+  assert.equal(descriptors.length, 8);
   // 端点清单（探针与 status.md 都读它）必须与描述符**一一对应** —— 少一个就是
   // "界面按钮打到不存在的端点上"，而那种失败只表现为"点了没反应"。
   assert.deepEqual(
@@ -1862,7 +1904,7 @@ test('Remote 通道：手写描述符合法 + 服务绑定正确 + 七个方法�
   console.log('  ✅ Remote：描述符合法 + 绑定正确 + seen/dismiss/提炼待办都能落盘');
 });
 
-test('抽取四形态：默认关闭 / 开关开了但没选模型 / 跟随对话模型 / 显式挑选', async (t) => {
+test('抽取四形态：默认开启（跟随对话模型）/ 显式关掉 / 开了但没选模型 / 显式挑选', async (t) => {
   const llm = fakeLlm('[]');
   llm.listProviders = async () => [{ id: 'real-p', name: 'Real' }];
   llm.listModels = async () => [{ id: 'real-m' }, { id: 'real-m2' }];
@@ -1889,11 +1931,21 @@ test('抽取四形态：默认关闭 / 开关开了但没选模型 / 跟随对�
     return api;
   };
 
-  // ① **默认**：总开关关着 → 抽取不跑，而且**不算故障**（不写 lastExtractError）
-  const a = await mk({});
+  // ⓪ **默认**（不配 extract.enabled / followConversation）：开着 + 跟随对话模型 → 真的会学。
+  //    2026-10-17 改的默认值：原来默认关，结果"装好了却永远不学"。
+  const z = await mk({}, { agentDefaultModel: { currentSelection: () => ({ provider: 'real-p', model: 'real-m2' }) } });
+  const r0 = await z.runExtraction({});
+  assert.equal(r0.ok, true, `默认应当开着并跟随对话模型，实际 ${JSON.stringify(r0)}`);
+  assert.equal(llm.calls.at(-1).provider, 'real-p');
+  assert.equal(llm.calls.at(-1).model, 'real-m2', '默认跟随 = 用对话框里选的那个模型');
+  const st0 = JSON.parse(await fsp.readFile(path.join(z.store.root.root, '.memory', 'state.json'), 'utf8'));
+  assert.equal(st0.extractEnabled, true, '默认值必须落成「已开启」（status.md 那行读的就是它）');
+
+  // ① **显式关掉**：抽取不跑，而且**不算故障**（不写 lastExtractError）
+  const a = await mk({ enabled: false });
   const r1 = await a.runExtraction({});
   assert.equal(r1.ok, false);
-  assert.equal(r1.disabled, true, '默认关闭要标成 disabled（不是故障）');
+  assert.equal(r1.disabled, true, '开关关掉要标成 disabled（不是故障）');
   assert.match(String(r1.reason), /自动抽取没开启/, `文案要说清是开关没开：${r1.reason}`);
   const st1 = JSON.parse(await fsp.readFile(path.join(a.store.root.root, '.memory', 'state.json'), 'utf8'));
   assert.equal(st1.lastExtractError ?? null, null, '开关没开是用户选择，不该记成错误（否则 Block D 会一直喊）');
@@ -1905,7 +1957,7 @@ test('抽取四形态：默认关闭 / 开关开了但没选模型 / 跟随对�
   assert.match(h1.reason, /总开关没开/, `实际 ${h1.reason}`);
 
   // ② 开关开了但**既没挑模型也没勾跟随** → 这是真故障（用户明明开了），要报出来
-  const b = await mk({ enabled: true });
+  const b = await mk({ enabled: true, followConversation: false });
   const r2 = await b.runExtraction({});
   assert.equal(r2.ok, false);
   assert.equal(r2.targetError, true, '开了开关却没有可用模型 = 故障（进 Block D）');
@@ -1941,7 +1993,7 @@ test('抽取四形态：默认关闭 / 开关开了但没选模型 / 跟随对�
 
   // ⑤ 开关 + 显式挑选：写进配置的那对 provider/model
   llm.calls.length = 0;
-  const e = await mk({ enabled: true, provider: 'real-p', model: 'real-m' });
+  const e = await mk({ enabled: true, followConversation: false, provider: 'real-p', model: 'real-m' });
   const r5 = await e.runExtraction({});
   assert.equal(r5.ok, true);
   assert.equal(llm.calls[0].provider, 'real-p');
@@ -2027,7 +2079,7 @@ test('H7 技能建议：够格就出现在注入里，且不调模型', async (t
   });
   const api = mod.apply(h.ctx, {
     root, git: false, verbose: false,
-    extract: { enabled: true, provider: 'p', model: 'm', autoRunOnStart: false },
+    extract: { enabled: true, followConversation: false, provider: 'p', model: 'm', autoRunOnStart: false },
   });
   await api.ready;
 
@@ -2357,7 +2409,7 @@ test('缺陷 29：模型流卡住时 runExtraction 必须到点返回，不许�
     root,
     git: false,
     verbose: false,
-    extract: { enabled: true, provider: 'p', model: 'm', autoRunOnStart: false },
+    extract: { enabled: true, followConversation: false, provider: 'p', model: 'm', autoRunOnStart: false },
   });
   await api.ready;
   await fsp.writeFile(path.join(root, 'sessions', '2026-10-17.md'), `x${'内容。'.repeat(120)}`, 'utf8');
@@ -2384,7 +2436,7 @@ test('缺陷 29：没有新素材时不许写"成功"（以前会把真故障盖
     root,
     git: false,
     verbose: false,
-    extract: { enabled: true, provider: 'p', model: 'm', autoRunOnStart: false },
+    extract: { enabled: true, followConversation: false, provider: 'p', model: 'm', autoRunOnStart: false },
   });
   await api.ready;
   await fsp.writeFile(path.join(root, 'sessions', '2026-10-17.md'), `x${'内容。'.repeat(120)}`, 'utf8');
@@ -2412,7 +2464,7 @@ test('缺陷 30：捕获不能只押在 session/event 上，pre-step 也要兜�
   const root = path.join(os.tmpdir(), 'memfuse-capture-' + Date.now());
   t.after(() => fsp.rm(root, { recursive: true, force: true }));
   const h = fakeCtx();
-  const api = mod.apply(h.ctx, { root, git: false, verbose: false, capture: { enabled: true } });
+  const api = mod.apply(h.ctx, { root, git: false, verbose: false, extract: { enabled: false }, capture: { enabled: true } });
   await api.ready;
 
   const session = {
@@ -2461,7 +2513,7 @@ test('缺陷 30b：半截回答不许落盘（靠事件流里的 turn/end 判定
   const root = path.join(os.tmpdir(), 'memfuse-capture2-' + Date.now());
   t.after(() => fsp.rm(root, { recursive: true, force: true }));
   const h = fakeCtx();
-  const api = mod.apply(h.ctx, { root, git: false, verbose: false, capture: { enabled: true } });
+  const api = mod.apply(h.ctx, { root, git: false, verbose: false, extract: { enabled: false }, capture: { enabled: true } });
   await api.ready;
 
   // 第 1 轮已收尾（后面有 turn/end）；第 2 轮**进行中**（没有 turn/end）
@@ -2513,7 +2565,7 @@ test('缺陷 30c：插件被重载 / 进程重启都不许重复记同一轮', a
   // 起一个"插件实例"：投递 turn/end，再走 pre-step 兜底。
   async function bootAndCapture() {
     const h = fakeCtx();
-    const api = mod.apply(h.ctx, { root, git: false, verbose: false, capture: { enabled: true } });
+    const api = mod.apply(h.ctx, { root, git: false, verbose: false, extract: { enabled: false }, capture: { enabled: true } });
     await api.ready;
     for (const fn of h.handlers.get('session/event') || []) await fn(session, session.events[2]);
     for (const fn of h.handlers.get('session/event') || []) await fn(session, { type: 'step/end', seq: 9 });
@@ -2575,7 +2627,7 @@ test('缺陷 31：水位线越界（捕获文件被清理过）不许让抽取�
   const h = fakeCtx({ llm });
   const api = mod.apply(h.ctx, {
     root, git: false, verbose: false,
-    extract: { enabled: true, provider: 'p', model: 'm', autoRunOnStart: false },
+    extract: { enabled: true, followConversation: false, provider: 'p', model: 'm', autoRunOnStart: false },
   });
   await api.ready;
 
@@ -2599,7 +2651,7 @@ test('缺陷 32：用户只说了几个字 → 正常跳过，不许记成故障
   const root = path.join(os.tmpdir(), 'memfuse-short-' + Date.now());
   t.after(() => fsp.rm(root, { recursive: true, force: true }));
   const h = fakeCtx();
-  const api = mod.apply(h.ctx, { root, git: false, verbose: false, capture: { enabled: true } });
+  const api = mod.apply(h.ctx, { root, git: false, verbose: false, extract: { enabled: false }, capture: { enabled: true } });
   await api.ready;
 
   // 真机现场：用户那句就是「重启了」（3 个字），低于 minPromptLength(10)
@@ -2659,7 +2711,7 @@ test('缺陷 33：子代理会话不许冒充主会话（否则每步报一条�
   const root = path.join(os.tmpdir(), 'memfuse-subagent-' + Date.now());
   t.after(() => fsp.rm(root, { recursive: true, force: true }));
   const h = fakeCtx();
-  const api = mod.apply(h.ctx, { root, git: false, verbose: false, capture: { enabled: true } });
+  const api = mod.apply(h.ctx, { root, git: false, verbose: false, extract: { enabled: false }, capture: { enabled: true } });
   await api.ready;
 
   // 主会话：真人提问 + 完整回答 + 正常收尾
@@ -2703,7 +2755,7 @@ test('缺陷 33b：报错 / 被中断的轮次不许写进记忆（半截回答�
   const root = path.join(os.tmpdir(), 'memfuse-turnfail-' + Date.now());
   t.after(() => fsp.rm(root, { recursive: true, force: true }));
   const h = fakeCtx();
-  const api = mod.apply(h.ctx, { root, git: false, verbose: false, capture: { enabled: true } });
+  const api = mod.apply(h.ctx, { root, git: false, verbose: false, extract: { enabled: false }, capture: { enabled: true } });
   await api.ready;
 
   // 真机现场：turn/end 的 reason 是 { kind: 'error', error: {...} }
@@ -2746,7 +2798,7 @@ test('缺陷 33c：pre-step 落在「本轮还没收尾」上不算故障（以�
   const root = path.join(os.tmpdir(), 'memfuse-midturn-' + Date.now());
   t.after(() => fsp.rm(root, { recursive: true, force: true }));
   const h = fakeCtx();
-  const api = mod.apply(h.ctx, { root, git: false, verbose: false, capture: { enabled: true } });
+  const api = mod.apply(h.ctx, { root, git: false, verbose: false, extract: { enabled: false }, capture: { enabled: true } });
   await api.ready;
 
   // 这一轮**进行中**：真人提问 + 半截回答，还没有 turn/end
@@ -2775,7 +2827,7 @@ test('缺陷 33d：上一轮报错之后的新一轮，兜底捕获不许被"省
   const root = path.join(os.tmpdir(), 'memfuse-afterfail-' + Date.now());
   t.after(() => fsp.rm(root, { recursive: true, force: true }));
   const h = fakeCtx();
-  const api = mod.apply(h.ctx, { root, git: false, verbose: false, capture: { enabled: true } });
+  const api = mod.apply(h.ctx, { root, git: false, verbose: false, extract: { enabled: false }, capture: { enabled: true } });
   await api.ready;
 
   const session = {
@@ -2827,7 +2879,7 @@ test('缺陷 34：启动抽取落定后要补写 status.md（派生视图不能�
     root,
     git: false,
     verbose: false,
-    extract: { enabled: true, provider: 'p', model: 'm', autoRunOnStart: true },
+    extract: { enabled: true, followConversation: false, provider: 'p', model: 'm', autoRunOnStart: true },
   });
   await api.ready;
   // 启动抽取是 fire-and-forget，但 `apply()` 把句柄交出来了 —— await 它能等到
@@ -2860,7 +2912,7 @@ test('缺陷 34b：抽取成功之后不许再挂着更早的「无新素材，�
     root,
     git: false,
     verbose: false,
-    extract: { enabled: true, provider: 'p', model: 'm', autoRunOnStart: false },
+    extract: { enabled: true, followConversation: false, provider: 'p', model: 'm', autoRunOnStart: false },
   });
   await api.ready;
 
@@ -2894,4 +2946,105 @@ test('缺陷 34b：抽取成功之后不许再挂着更早的「无新素材，�
   assert.match(s, /最近成功: 2026-01-03/, '最近成功要跟上');
   assert.ok(!/最近一次: 2026-01-02/.test(s), '成功之后不许再写更早的跳过，否则读起来自相矛盾');
   console.log('  ✅ 只写"更晚的那次"：跳过在成功之前就不显示');
+});
+
+// ───────────────────────── 检查更新（2026-10-18）─────────────────────────
+
+const updateMod = await import('../lib/update.js');
+
+/**
+ * 造一个假的 `exec`：按 `git <sub> <args...>` 分派。
+ * 被测代码里的 argv 是 `['-C', dir, ...args]`，这里只看第 2 项起。
+ */
+function fakeGit(responses) {
+  const calls = [];
+  const exec = (cmd, argv, options, cb) => {
+    const key = argv.slice(2).join(' ');
+    calls.push({ cmd, key, options });
+    const respond = responses[key];
+    if (respond === undefined) {
+      cb(new Error(`unexpected git: ${key}`), '', '');
+      return;
+    }
+    const out = respond();
+    if (out instanceof Error) cb(out, '', out.message);
+    else cb(null, out, '');
+  };
+  return { exec, calls };
+}
+
+const GIT_OK = {
+  'rev-parse --is-inside-work-tree': () => 'true',
+  'rev-parse --abbrev-ref HEAD': () => 'main',
+  'rev-parse --short HEAD': () => 'abc1234def',
+  'remote get-url origin': () => 'https://github.com/a1141171521/dsh-plugin-memfuse.git',
+  'fetch --quiet origin main': () => '',
+  'rev-list --count HEAD..origin/main': () => '0',
+  'show origin/main:package.json': () => JSON.stringify({ version: '0.1.0' }),
+};
+
+test('U1 检查更新：已是最新 / 有新版本，都给出可读结果', async () => {
+  const a = await updateMod.checkUpdate({ exec: fakeGit(GIT_OK).exec, timeoutMs: 1000 });
+  assert.equal(a.supported, true);
+  assert.equal(a.behind, 0);
+  assert.equal(a.head, 'abc1234def');
+  assert.match(updateMod.describeUpdate(a), /已是最新/);
+
+  const newer = {
+    ...GIT_OK,
+    'rev-list --count HEAD..origin/main': () => '3',
+    'show origin/main:package.json': () => JSON.stringify({ version: '0.2.0' }),
+  };
+  const b = await updateMod.checkUpdate({ exec: fakeGit(newer).exec, timeoutMs: 1000 });
+  assert.equal(b.behind, 3);
+  assert.equal(b.latest, '0.2.0');
+  assert.match(updateMod.describeUpdate(b), /新版本.*0\.2\.0.*落后 3 次提交/);
+  console.log('  ✅ 已是最新 / 有新版本 两种结果都能说清（含提交数与版本）');
+});
+
+test('U2 检查更新：不是 git 检出 / 连不上 GitHub / 超时，都要如实报、不许装成"已是最新"', async () => {
+  // ① 不是 git 检出（npm 压缩包装的）
+  const notRepo = fakeGit({
+    'rev-parse --is-inside-work-tree': () => new Error('fatal: not a git repository'),
+  });
+  const a = await updateMod.checkUpdate({ exec: notRepo.exec, timeoutMs: 1000 });
+  assert.equal(a.supported, false);
+  assert.match(a.error, /不是 git 检出/);
+  assert.match(updateMod.describeUpdate(a), /不是 git 检出/, 'describeUpdate 也要说这句，不能写"已是最新"');
+
+  // ② fetch 失败（网络/代理）：supported 仍是 true —— 功能不该整个消失
+  const offline = fakeGit({
+    ...GIT_OK,
+    'fetch --quiet origin main': () => new Error('Recv failure: Connection was reset'),
+  });
+  const b = await updateMod.checkUpdate({ exec: offline.exec, timeoutMs: 1000 });
+  assert.equal(b.supported, true);
+  assert.match(b.error, /连不上 GitHub.*Connection was reset/, '原始报错不许吞');
+  assert.match(updateMod.describeUpdate(b), /Connection was reset/);
+
+  // ③ 超时：execFile 会以 killed=true 回调，文案要说"超时"而不是一段空字符串
+  const timedOut = fakeGit({
+    ...GIT_OK,
+    'fetch --quiet origin main': () => Object.assign(new Error(''), { killed: true }),
+  });
+  const c = await updateMod.checkUpdate({ exec: timedOut.exec, timeoutMs: 50 });
+  assert.equal(c.supported, true);
+  assert.match(c.error, /超时/);
+  console.log('  ✅ 三种失败都如实报（不是 git / 断网 / 超时），原文不吞');
+});
+
+test('U3 检查更新：每次 git 调用都带超时，且比的是 origin/<当前分支>', async () => {
+  const fake = fakeGit(GIT_OK);
+  await updateMod.checkUpdate({ exec: fake.exec, timeoutMs: 1234 });
+  assert.ok(fake.calls.length >= 5, '至少要查：是否 git 检出 / 分支 / HEAD / 远端 / fetch');
+  for (const call of fake.calls) {
+    assert.equal(call.cmd, 'git');
+    assert.equal(call.options.timeout, 1234, '每条 git 都要有超时（网络卡住不能永转圈）');
+    assert.equal(call.options.windowsHide, true);
+  }
+  assert.ok(
+    fake.calls.some((c) => c.key === 'rev-list --count HEAD..origin/main'),
+    '比较的是 origin/<当前分支>，不是硬编码 main',
+  );
+  console.log('  ✅ 每条 git 调用都带 timeout，比较对象是 origin/<branch>');
 });

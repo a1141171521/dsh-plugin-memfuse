@@ -14,7 +14,7 @@
  *      （这条正是真机上"卡片永远不出现"的元凶，留在这里当活体回归。）
  *
  * 唯一的假：宿主那一侧（`list / markSeen / dismiss / requestDistill / distill / approve /
- * reject` 七个端点）是内存里的假数据（`distill` 还假了一个"模型写 SKILL.md"的固定产物），
+ * reject / checkUpdate` 八个端点）是内存里的假数据（`distill` 还假了一个"模型写 SKILL.md"的固定产物），
  * 日志面板会把每次调用如实列出来。
  */
 
@@ -24,6 +24,7 @@ const INITIAL_GROUPS = [
     key: 'm_ui_9f2a',
     seedTitle: 'DSH 插件设置页四条件',
     members: 2,
+    memberTitles: ['Config 字段要标 .volatile()', '配置页槽位是 plugins.row.config'],
     score: 7,
     useWhen: '写 DSH 插件的配置页时召回',
     reasons: ['跨 2 个会话被召回', '含步骤性内容', '用户反复纠正过'],
@@ -33,6 +34,7 @@ const INITIAL_GROUPS = [
     key: 'm_smoke_3c71',
     seedTitle: '冒烟夹具用 junction 挂进 profile，删目录即净',
     members: 3,
+    memberTitles: ['junction 指向仓库，改文件即生效', 'headless 夹具用完就删', '真机验收换个进程'],
     score: 6,
     useWhen: '要在真机上验证 DSH 插件改动时召回',
     reasons: ['跨 3 个会话被召回', '含步骤性内容'],
@@ -42,6 +44,7 @@ const INITIAL_GROUPS = [
     key: 'm_card_5b90',
     seedTitle: '候选卡片的位置与显隐规则',
     members: 4,
+    memberTitles: ['turnTail 按回合渲染', '只长在最后一个回合', 'props.turn 是对象', '卡片钉住 sessionId:turn'],
     score: 5,
     useWhen: '改回合尾卡片的呈现方式时召回',
     reasons: ['跨 2 个会话被召回', '含步骤性内容'],
@@ -173,7 +176,7 @@ export function startPreview({ window, document, bundle, target, onLog, onState 
       '',
     ].join('\n');
 
-  // ── 假宿主：七个端点，语义与 lib/index.js 里的实现一致 ────────────────
+  // ── 假宿主：八个端点，语义与 lib/index.js 里的实现一致 ────────────────
   const host = {
     list: async () => {
       // 与真宿主同口径：只看**没看过、也没在待提炼**的组，且最多给 `skill.suggestMax` 组
@@ -197,6 +200,30 @@ export function startPreview({ window, document, bundle, target, onLog, onState 
           dismissed: dismissed.size,
           pendingDistill: [...pending],
           pendingSkills: [...drafts.values()],
+          // 页脚用（真宿主从 package.json 读）
+          version: '0.1.0',
+          repoUrl: 'https://github.com/a1141171521/dsh-plugin-memfuse',
+        },
+      };
+    },
+    /**
+     * 检查更新（假的）：真宿主会跑 `git fetch` + `rev-list`（只读，几秒）。
+     * 预览页返回固定结果，点一下就能看到那一行文案。
+     */
+    checkUpdate: async () => {
+      log('checkUpdate() → 真宿主跑 git fetch/rev-list（只读，不动工作区）；预览页返回固定结果');
+      return {
+        ok: true,
+        value: {
+          supported: true,
+          current: '0.1.0',
+          latest: '0.1.0',
+          behind: 0,
+          branch: 'main',
+          remote: 'https://github.com/a1141171521/dsh-plugin-memfuse.git',
+          url: 'https://github.com/a1141171521/dsh-plugin-memfuse',
+          head: 'abc1234',
+          checkedAt: new Date().toISOString(),
         },
       };
     },

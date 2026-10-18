@@ -117,7 +117,7 @@ lib/
 ├── store.js      18KB  489 行  存储层：frontmatter 往返 + 原子写 + drift guard + 锁
 ├── policy.js     14KB  357 行  策略层（纯函数）：打分 / 准入 / 生命周期 / 反馈 / 升级
 ├── distill.js    13KB  335 行  技能提炼：候选打分 + 标签聚类 + 提炼提示词
-├── remote.js     13KB  294 行  界面数据通道：手写 Typert 贡献，7 个端点
+├── remote.js     13KB  294 行  界面数据通道：手写 Typert 贡献，8 个端点
 ├── config.js     11KB  178 行  宿主半边 Config schema（设置页的字段定义）
 ├── skill.js       9KB  242 行  SKILL.md 格式 I/O + 四个静默坑的对策 + approve/reject
 ├── recall.js      9KB  229 行  本地检索：CJK bigram + BM25 + excerpt

@@ -11,7 +11,7 @@
 | 3 | `docs/spec.md` | **唯一权威**的功能清单 + 技术线 + 各阶段实施记录（含真机发现的缺陷） |
 | 4 | `README.md` | 对外说明（**部分已过时**，以 spec.md 为准） |
 
-**先跑 `npm test`**（应看到 **77 + 29 + 5 + 23 = 134 项全绿**）确认环境正常，再动手。
+**先跑 `npm test`**（应看到 **82 + 32 + 5 + 23 = 142 项全绿**）确认环境正常，再动手。
 想直接看候选卡片长什么样：`npm run preview`（离线预览页，不用重启、不用先有候选）。
 
 ## 这是什么
@@ -25,16 +25,18 @@ DSH 的长期记忆插件。纯文本 Markdown 存储、本地检索。
   推送前扫一遍：**不带凭据**；本机用户名 / 绝对路径改占位符（仓库是 public）。
 - **已装进 desktop + web 两个 profile**（都是**符号链接/junction 指向本仓库**，改文件即生效，
   只差重启让客户端重新加载 bundle），真机跑通。
-- 测试 **134 项全绿**（plugin 77 + client 29 + 预览 5 + smoke 23）；真机功能 40/40、补测 29/29、真实会话闭环、真实模型往返全通。
+- 测试 **142 项全绿**（plugin 82 + client 32 + 预览 5 + smoke 23）；真机功能 40/40、补测 29/29、真实会话闭环、真实模型往返全通。
 - **候选卡片的离线预览页**：`npm run preview`（起本地静态服务再打开
   `docs/preview/turn-tail-card.html` —— **别直接双击**：模块脚本在 `file://` 下会被 CORS 拒）。
   它加载**真实的 `lib/client.js`**（同 bundle / 同 CSS / 同字典），宿主那侧是假数据；
   侧栏有宿主状态、远程调用日志、下一轮 Block E 示意 + 四个场景按钮。
   `test/preview.test.mjs` 用迷你 DOM 兜底。**想知道卡片长什么样，先看这个，别先重启。**
 - **H8 界面数据通道**（2026-10-15/16）：`lib/remote.js` 手写 Typert 贡献
-  （**不需要代码生成器、不需要 zod**），**七个端点**
-  `memfuse/list|dismiss|markSeen|requestDistill|distill|approve|reject`
-  （后三个是缺陷 25 补的：界面点「提炼成技能」当场写 SKILL.md → 草稿预览 → 装/丢）；
+  （**不需要代码生成器、不需要 zod**），**八个端点**
+  `memfuse/list|dismiss|markSeen|requestDistill|distill|approve|reject|checkUpdate`
+  （前四个是读 + 记账；`distill`/`approve`/`reject` 是缺陷 25 补的：界面点「提炼成技能」
+  当场写 SKILL.md → 草稿预览 → 装/丢；`checkUpdate` 是 2026-10-18 加的只读诊断，
+  设置页页脚的「检查更新」用它）；
   候选在**回合尾部**出卡片（`conversation.chat.turnTail`，id `dsh-memfuse#suggestions`）。
   「渲染即记 seen」= 不一直提示；「不用」= 永不提；簇长大 → key 变 → 再提一次。
   ⚠️ **四个坑**：① 宿主贡献读 **`invocations`**、客户端读 **`descriptors`**（写错宿主**静默收下**，
@@ -60,6 +62,13 @@ DSH 的长期记忆插件。纯文本 Markdown 存储、本地检索。
   草稿的**真源是磁盘**（`pending-skills/`，`list` 每次都带回来），所以它**不**需要"钉住"；
   提炼失败要**如实显示 + 退化成 `requestDistill` 待办**（下一轮 Block E 让对话模型去补）。
   真机探针：**7 个端点可路由**（缺陷 25 之后从 4 个涨到 7 个）、服务 `memfuseRemote` 已 provide。
+  ⚠️ **卡片文案与按钮**（2026-10-18，真机反馈"太难懂 / 按钮换行"）：
+  每行必须说清三件事 —— **里面有什么**（`memberTitles`，宿主早就返回了）、
+  **什么时候用得上**（`useWhen` = 记忆的 anchor）、**对我有什么好处**（`suggestWhy`）。
+  ❌ 别再写「N 条记忆 · X 分」：分数对用户没有意义。
+  ❌ 按钮文案要短（`提炼成技能` / `不用`）；CSS 里按钮必须 `white-space:nowrap` +
+  `flex:0 0 auto`，外面允许 `flex-wrap` —— 换行要换**整块按钮**，不是按钮里的字。
+  视觉基线见 `docs/preview/turn-tail-card.html`（headless 截图可核对）。
 - **H7 技能建议**（2026-10-15 追加）：够格时在注入里出 **Block E**（**零 LLM**，只给簇语义不给技能正文），
   用户点头才 `distill`。`dismiss` 后该组不再出现；**簇长大 → key 变 → 重新提一次**。
   真机已用探针（宿主自己的 `systemPrompt.assemble()`）抓到真实组装块验证。
@@ -257,13 +266,21 @@ DSH 的长期记忆插件。纯文本 Markdown 存储、本地检索。
     修：只在这次跳过**晚于** `lastExtractSuccess` 时才写（ISO 字符串可直接比大小）。
     回归 1 条。**要重启生效。** 见 spec 缺陷 34b
 - **设置页**：✅ 两个半边都齐了。宿主半边 `lib/config.js`（`Config status: schema`）+
-  浏览器半边 `lib/client.js`（注册**两处**：`plugins.bundle.config` key = 包名、
-  `plugins.row.config` key = `dsh-memfuse#dsh-memfuse`）。
-  ⚠️ 「设置 → 内置插件」只是**只读清单**，那个页面**不渲染任何表单**；
-- **抽取的四种状态**（按用户要求重做）：**总开关 `extract.enabled` 默认关**
+  浏览器半边 `lib/client.js`（注册**三处**：`settings.section` id = `dsh-memfuse`、
+  `plugins.bundle.config` key = 包名、`plugins.row.config` key = `dsh-memfuse#dsh-memfuse`；
+  **三处共用同一个 `MemfuseConfigCardView`**）。
+  ⚠️ **主入口是设置页左侧导航的「记忆」**（2026-10-17 加）—— 插件页那两处是二级目录，
+  用户找不到。⚠️ 「设置 → 内置插件」只是**只读清单**，那个页面**不渲染任何表单**；
+  **页脚**（2026-10-18）：`v0.1.0` + 「检查更新」+「去 GitHub 点个赞 ⭐」。
+  版本号/仓库地址由 `list` 带回（宿主读 package.json；**客户端别硬编码**）；
+  「检查更新」走 `memfuse/checkUpdate`（`lib/update.js`：`git fetch` + `rev-list`，
+  只更新远端引用、**不动工作区**，每条 git 都带超时）；点赞按钮是普通外链，
+  **插件不碰用户的 GitHub 凭据**（别假装能替人点星）。
+- **抽取的四种状态**（2026-10-17 默认值翻转）：**总开关 `extract.enabled` 默认开**
   （关着 = 不使用 LLM，且**不算故障**；关着的时候配了模型也不跑）／开了但没选模型
-  = **可见故障**／**跟随对话模型**（勾选项）／**显式挑选**（配置页下拉，数据源
-  `remote.session.modelCatalog()`，与对话框同源）。后两者互为降级目标。
+  = **可见故障**／**跟随对话模型**（勾选项，**也默认开** = 零配置就能学）／**显式挑选**
+  （配置页下拉，数据源 `remote.session.modelCatalog()`，与对话框同源）。后两者互为降级目标。
+  ⚠️ 跟随优先：勾了跟随时模型选择器那对只在 `onUnavailable: 'fallback'` 时生效。
 - **抽取降级**：`extract.onUnavailable = 'stop' | 'fallback'`。
 - **空正文会自证**：推理型模型常把 `maxTokens` 花在思考上（正文零个 `text-delta`、
   `finish=max-tokens`）。现在 `maxTokens=4000`，被截断**加倍重试一次**（8000），
@@ -279,15 +296,19 @@ DSH 的长期记忆插件。纯文本 Markdown 存储、本地检索。
    浏览器半边见 `lib/client.js` + `test/client.test.mjs`（离线断言注册/写回契约）
 
 **配置页怎么用**（客户端半边加完之后）：
-「**插件**」页 → 找到 `dsh-memfuse` 这张卡 → **点开它的包页，描述下方就直接是配置表单**
-（新加的 `plugins.bundle.config` 入口，不用点任何东西）。也可以点那一行的**标题** ——
-注册上了它会变成可点按钮（带 `›`，无障碍名「配置 dsh-memfuse」）→ 进详情页再看一遍。
-⚠️ 这一版**没有**单独写「配置」的按钮，**可点的标题就是入口**。
+**首选：设置页左侧导航 →「记忆」**（2026-10-17 加的一级入口，与「账号 / 通用 / 模型 / 插件 /
+Agent 预设」并列，order 25）。页面最上面是**记忆学习横幅**（三态：关着 / 开了没模型 / 已开启），
+一键就能修；下面是三组选项。
+备选（老路径，保留）：「**插件**」页 → `dsh-memfuse` 这张卡 → 点开包页，描述下方就是同一张表单；
+或者点那一行的**标题**（注册上了会变成可点按钮，带 `›`）。
 里面有：
-1. ☐ **开启自动抽取（用 LLM）** —— 总开关，**默认关**。关着 = 不使用 LLM，配了模型也不跑
-2. ☐ **跟随对话模型**（勾上就用对话框里选的那个，主模型换了它跟着换）
-3. **抽取用的模型**（下拉挑选，与对话框里的选择器同一个数据源）
-4. 模型不可用时（stop / fallback）、**降级模型**（可清除）、候选落盘方式（suggest / auto）
+1. ☑ **开启记忆学习（用 LLM 抽取）** —— 总开关，**默认开**。关掉 = 不使用 LLM，配了模型也不跑
+2. ☑ **跟随对话模型**（**默认开**：用对话框里选的那个，零配置即可学）
+3. **抽取用的模型**（下拉挑选，与对话框里的选择器同一个数据源）——
+   ⚠️ **跟随开着且策略是 stop 时这一项不显示**（用不到）；策略改成 fallback 时它会以
+   「降级模型（主模型不可用时）」的名字出现在「模型不可用时」组（`visibleFields()`）
+4. 模型不可用时（stop / fallback）、**降级模型**（可清除；**只在「不跟随 + fallback」时显示**）、
+   候选落盘方式（suggest / auto）
 
 **模型下拉现在是空的？** 它读宿主目录（`remote.session.modelCatalog()`），失败会把**原始报错**
 显示在提示里。历史坑见缺陷 14：远程调用借了提供方（ui-settings）的 ctx，而它的 inject 里
@@ -308,8 +329,9 @@ $dbin  = '<DSH_APP>\resources\app\dsh\node_modules\@deepseek-ai\dsh\lib\bin.js'
 ⚠️ **新增/修改了 client half（`lib/client.js` + `package.json` 的 `dsh.client`）之后必须再重启一次 desktop**：
 宿主在启动时扫描 `dsh.client` 声明并把它接进客户端模块表（增量扫描按**已知包**做，
 新声明要新一轮激活扫描），浏览器侧也要重新拉那份 bundle。判据：重启后
-`cordis_inspect_query(platform=client, provider=Slots, listSubTree, {root:'plugins.bundle.config'})`
-的 `occupants` 里应出现 `key: "dsh-memfuse"`，且
+`cordis_inspect_query(platform=client, provider=Slots, listSubTree, {root:'settings.section'})`
+的 `occupants` 里应出现 `{registrant:'dsh-memfuse', id:'dsh-memfuse', order:25}`（设置页「记忆」页），
+`{root:'plugins.bundle.config'}` 里应出现 `key: "dsh-memfuse"`，且
 `{root:'plugins.row.config'}` 里应出现 `key: "dsh-memfuse#dsh-memfuse"`；
 候选卡片还要看 `{root:'conversation.chat.turnTail'}` 里有没有 `id: "dsh-memfuse#suggestions"`。
 **卡片有没有真的渲染过**，看 `~/.dsh/memory/.memory/state.json` 里有没有 `skillSeen` 键
@@ -334,8 +356,9 @@ $dbin  = '<DSH_APP>\resources\app\dsh\node_modules\@deepseek-ai\dsh\lib\bin.js'
    （`@deepseek-ai/cordis`、`@deepseek-ai/schemastery`，official 插件同样依赖它们）。
 2. **真源永远是纯文本 Markdown** —— `index.md` / `status.md` / `usage.jsonl` 都是派生视图，删掉必须仍能工作。
 3. **关键路径零 LLM** —— 读/写/注入/检索不需要模型。
-   **「不使用 LLM」是一等公民**：总开关 `extract.enabled` **默认关**，关着就不跑抽取
-   （其余照常），而且**关闭不算故障**（不写 `lastExtractError`，健康度报"总开关没开"）。
+   **「不使用 LLM」是一等公民**：总开关 `extract.enabled` **默认开**（2026-10-17 翻转；
+   开着才会「学习」），关着就不跑抽取（其余照常），而且**关闭不算故障**
+   （不写 `lastExtractError`，健康度报"总开关没开"）。
    开关开着却没选到模型 = **故障**（必须报出来，不能写「✅ 正常」）。
 4. **不许静默失败** —— 包括"**功能存在但从不生效**"（本项目已踩到 5 次，全是真机抓的）。
    运行期故障统一记进 `state.runtimeFaults` → Block D + status.md。

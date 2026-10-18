@@ -113,11 +113,13 @@ async function bootPreview() {
 test('预览页：真卡片在迷你 DOM 里渲染得出来，文字与插值都对', async () => {
   const { target } = await bootPreview();
   const text = collectText(target);
-  assert.match(text, /记忆里出现了可固化成技能的簇/, '卡片标题');
+  assert.match(text, /这组记忆可以变成一条技能/, '卡片标题要说人话（不是"簇"）');
   assert.match(text, /DSH 插件设置页四条件/, '第一组候选的种子标题');
-  assert.match(text, /2 条记忆 · 7 分/, '成员数/分数要插值成文字（说明真字典没被写坏）');
-  assert.match(text, /写 DSH 插件的配置页时召回/, 'useWhen 要出来');
-  console.log('  ✅ 渲染：标题 + 种子 +「2 条记忆 · 7 分」+ 作用');
+  assert.match(text, /包含的同类记忆（2 条）/, '成员数要插值成文字（说明真字典没被写坏）');
+  assert.match(text, /Config 字段要标 \.volatile\(\)/, '成员标题要出来 —— 用户得知道这技能里有什么');
+  assert.match(text, /什么时候用得上：写 DSH 插件的配置页时召回/, 'useWhen 要说清适用场景');
+  assert.match(text, /把它变成技能后：以后遇到同类情况/, '要回答"对我有什么帮助"');
+  console.log('  ✅ 渲染：标题 + 种子 + 成员 + 适用场景 + 好处');
 });
 
 test('预览页：装配链是 $mount → ctx.inject(["remote.memfuse", …])', async () => {
@@ -136,11 +138,11 @@ test('预览页：装配链是 $mount → ctx.inject(["remote.memfuse", …])', 
   );
   assert.equal(walk(target).filter((node) => node.tagName === 'BUTTON').length, 2, '只显示 1 组 → 两个按钮');
   // 没显示出来的那几组要**说出来**（别装作不存在）
-  assert.match(collectText(target), /另有 2 组同类候选/, '一行说明还剩几组、去哪儿看');
+  assert.match(collectText(target), /另外还有 2 组同类候选，想看就告诉我/, '一行说明还剩几组、怎么看');
   console.log('  ✅ 装配顺序与注入链正确，且渲染即记 seen（只显示 1 组 + 说明还剩几组）');
 });
 
-test('预览页：点「提炼成技能」→ 草稿预览（提示词 + 作用）→ 装进技能库', async () => {
+test('预览页：点「提炼成技能」→ 先看写出来的技能 → 收下', async () => {
   const { logs, target } = await bootPreview();
   const buttons = walk(target).filter((node) => node.tagName === 'BUTTON');
 
@@ -151,32 +153,33 @@ test('预览页：点「提炼成技能」→ 草稿预览（提示词 + 作用�
     '点「提炼成技能」要打到宿主的 distill —— 缺陷 25 之前这里只记一条待办，界面什么都不显示',
   );
 
-  // 第二阶段：技能名 + 作用 + **SKILL.md 原文** + 两个按钮，全都要看得见
+  // 第二阶段：说人话的标题 + 技能名 + 作用 + **完整内容** + 两个按钮，全都要看得见
   const draftText = collectText(target);
-  assert.match(draftText, /技能草稿/, '要说清这是"装进去之后会注入的提示词"');
-  assert.match(draftText, /## 什么时候用/, 'SKILL.md 正文要真的渲染出来');
-  assert.match(draftText, /装进技能库会写到：/, '要告诉用户会落到哪儿');
-  const approve = walk(target).find((node) => node.tagName === 'BUTTON' && collectText(node) === '装进技能库');
-  assert.ok(approve, '草稿上必须有「装进技能库」按钮');
+  assert.match(draftText, /刚写好的技能/, '标题要说人话（不写"草稿/提示词/技能库"这些术语）');
+  assert.match(draftText, /它以后就照着下面这段内容做事/, '原文前面要有一句人话说明');
+  assert.match(draftText, /## 什么时候用/, '技能正文要真的渲染出来');
+  assert.match(draftText, /收下后存在：/, '要告诉用户会落到哪儿');
+  const approve = walk(target).find((node) => node.tagName === 'BUTTON' && collectText(node) === '收下这条技能');
+  assert.ok(approve, '草稿上必须有「收下这条技能」按钮');
   assert.ok(
-    walk(target).some((node) => node.tagName === 'BUTTON' && collectText(node) === '丢掉'),
-    '草稿上必须有「丢掉」按钮',
+    walk(target).some((node) => node.tagName === 'BUTTON' && collectText(node) === '不要了'),
+    '草稿上必须有「不要了」按钮',
   );
 
   approve.click();
   await new Promise((resolve) => setImmediate(resolve));
-  assert.ok(logs.some((line) => line.startsWith('approve(')), '点「装进技能库」要打到宿主的 approve');
-  assert.match(collectText(target), /已装进技能库/, '装完要有一句结果说明（否则又是"点了没反应"）');
-  console.log('  ✅ 提炼 → 草稿预览 → 装进技能库：整条第二阶段在预览页里走得通');
+  assert.ok(logs.some((line) => line.startsWith('approve(')), '点「收下这条技能」要打到宿主的 approve');
+  assert.match(collectText(target), /收下了：/, '收完要有一句结果说明（否则又是"点了没反应"）');
+  console.log('  ✅ 提炼 → 先看内容 → 收下：整条第二阶段在预览页里走得通');
 });
 
-test('预览页：「不用（别再提）」打到宿主的 dismiss', async () => {
+test('预览页：「不用」打到宿主的 dismiss', async () => {
   const { logs, target } = await bootPreview();
   const buttons = walk(target).filter((node) => node.tagName === 'BUTTON');
 
-  buttons.find((node) => collectText(node) === '不用（别再提）').click();
+  buttons.find((node) => collectText(node) === '不用').click();
   await new Promise((resolve) => setImmediate(resolve));
-  assert.ok(logs.some((line) => line.startsWith('dismiss(')), '点「不用（别再提）」要打到宿主的 dismiss');
+  assert.ok(logs.some((line) => line.startsWith('dismiss(')), '点「不用」要打到宿主的 dismiss');
   console.log('  ✅ 「不用」按钮的远程调用对');
 });
 
@@ -200,7 +203,7 @@ test('预览页：不点也会消失（seen），簇长大才会重新出现', a
   await new Promise((resolve) => setTimeout(resolve, 1600));
   preview.render();
   await new Promise((resolve) => setImmediate(resolve));
-  assert.match(collectText(target), /4 条记忆/, '簇长大之后要重新提一次');
+  assert.match(collectText(target), /（4 条）/, '簇长大之后要重新提一次');
   assert.ok(
     logs.some((line) => line.includes('场景：')),
     '场景动作要留日志',

@@ -5,6 +5,93 @@
 
 ---
 
+## 0.0c 2026-10-18：设置页页脚 —— 检查更新 + GitHub 点赞（已完成）
+
+用户原话：「同时我想加上检测 github 是否有新版本更新，以及再加个按钮，给当前项目的 github 点赞。」
+
+| # | 改动 | 位置 |
+|---|---|---|
+| 1 | `checkUpdate` 端点（第 8 个）：`git fetch` + `rev-list`，只读、每条 git 带超时、单飞 | `lib/update.js`（新）+ `lib/remote.js` + `lib/index.js` |
+| 2 | 页脚：`v0.1.0` · [检查更新] · [去 GitHub 点个赞 ⭐]；状态行如实报 | `lib/client.js` |
+| 3 | `list` 带回 `version` / `repoUrl`（宿主读 package.json） | `lib/index.js` |
+
+**验证**：142 项全绿（plugin 82 / client 32 / 预览 5 / smoke 23）。
+真机 `checkUpdate()` 约 3 秒返回 `behind: 0, head: '57937a4'`。
+
+⚠️ 两个边界，别改回去：
+1. **fetch 会更新 `.git` 里的远端引用**（不动工作区）—— 这是有意的，也是"检查更新"能工作的前提；
+2. **点赞只是外链**：插件不读 GitHub token、不代点星。
+
+**下一步（没做）**：一键更新（`git pull --ff-only`）—— 用户这次只要"检查"；
+要做的话照 `dsh-multi-agent-gateway` 的 `core/updater.ts`，注意「更新后必须重启 DSH」。
+
+---
+
+## 0.0b 2026-10-18：候选卡片文案重做 + 按钮换行修掉（已完成，待真机确认）
+
+用户原话：「现在提炼技能的卡片描述太难懂了，用户根本不知道能提炼的技能内容是什么，
+提炼了此技能对自己有什么帮助。同时卡片样式有点丑。提炼和拒绝的按钮描述都换行了。」
+第二轮补充：「弹出提炼技能框的时候，要对文字内容进行优化，表现的更口语化，不要用太专业的术语。」
+
+| # | 改动 | 判据 |
+|---|---|---|
+| 1 | 每行说清「里面有什么 / 何时用 / 有什么好处」 | 宿主 `list` 早就返回 `memberTitles`，**界面从来没渲染** → 现在渲染（含 `…` 收尾） |
+| 2 | 去掉「N 条记忆 · X 分」 | 分数对用户没有意义；现在只有成员标题、`useWhen`、`suggestWhy` |
+| 3 | 按钮不再换行 | `white-space:nowrap` + `flex:0 0 auto`；`不用（别再提）` → `不用` |
+| 4 | 样式分层 | 种子 14px/600；「好处」独立浅色块；主按钮 brand 描边、次要 ghost；padding 12/14 |
+| 5 | **第二阶段（草稿面板）也说人话** | 「技能草稿/提示词/技能库」→「刚写好的技能 / 收下这条技能 / 不要了」；原文前加一句「它以后就照着下面这段内容做事」 |
+
+**验证**：142 项全绿；`npm run preview` + headless Edge 截图核对（宽 880 / 窄 430，
+按钮都不换行；深色主题下卡片底/字色正常；**第二阶段单独截图过**）。
+
+⚠️ **截图抓到两个坑**：
+
+1. 预览页 `--dsw-alias-settings-card-fill: var(--dsw-alias-bg-layer-2)` —— 深色主题只覆盖
+   `layer-2`，而自定义属性里的 `var()` 在**声明元素**上就解析完了 → 卡片永远白底。
+   现在每个主题里直接给值。
+2. 草稿面板复用 `.dsh-memfuse-card-main`（横排用的 `flex:1 1 240px`）→ 竖向布局里
+   `flex-basis` 落在纵轴上，名字和正文之间凭空 240px 空白。
+   修：`.dsh-memfuse-card-draft .dsh-memfuse-card-main{flex:0 0 auto}`。
+
+**下一步（没做）**：真机看观感；如果还嫌长，可以把 `suggestWhy` 收成一行短句。
+
+---
+
+## 0.0 2026-10-17：设置页一级入口「记忆」+ 默认开启学习（已完成，待重启验收）
+
+用户原话：「现在的设置页是在插件的设置页中。我想把他加到 settingpage 中，同时优化选项，
+默认开启 LLM 抽取。提示用户开启 LLM 抽取才能记忆学习。」
+
+**改了三件事**：
+
+| # | 改动 | 位置 |
+|---|---|---|
+| 1 | 注册 `settings.section`（id `dsh-memfuse`、order 25、label thunk）→ 设置页左侧导航独立一页「记忆」 | `lib/client.js` `apply()` |
+| 2 | 默认值翻转：`extract.enabled` 与 `extract.followConversation` 都 **`true`**（schema 与 DEFAULT_CONFIG 同步） | `lib/config.js`、`lib/index.js` |
+| 3 | 设置页顶部**记忆学习横幅**（三态 + 一键开启/跟随）+ 选项分三组 | `lib/client.js` |
+
+**⚠️ 要重启 desktop**（client half 是启动时读进 bundle 的）。验收判据：
+
+```
+cordis_inspect_query(client, Slots, listSubTree, {root:'settings.section'})
+→ occupants 里应有 {registrant:'dsh-memfuse', id:'dsh-memfuse', order:25}
+```
+
+设置页左侧应出现「记忆」；进去应看到「记忆学习已开启 · 跟随对话模型」。
+如果显示「已开启，但还没有可用的模型」→ 说明宿主没给 `agentDefaultModel`
+（那就一键「跟随对话模型」或挑一个模型）。
+
+**测试**：142 项全绿（plugin 82 / client 32 / 预览 5 / smoke 23）。新增四条：
+`F2b 默认值`（不配任何 extract 也真的会学）、`F2c 默认值真源`、`横幅三态`、
+`模型选择器显隐`（跟随+stop 全藏 / 跟随+fallback 只留降级 / 不跟随按策略）。
+
+**下一步（没做，等用户反馈）**：
+- 真机看「记忆」页的实际观感（分组标题、横幅颜色在亮/暗两套主题下是否都可读）。
+- 若用户希望**挑模型就等于不跟随**，可以给 `pickModel()` 加一条 `followConversation=false`
+  的草稿（当前是"跟随优先"语义，未改；但选择器已按语义显隐，见 spec ④）。
+
+---
+
 ## 0.1 2026-10-16：重启后真机验收 —— 卡片没出现，查出两个静默失败（已修）
 
 用户重启 desktop 后问"现在是以什么形式弹出来的卡片？"。查下去发现：卡片**注册上了**

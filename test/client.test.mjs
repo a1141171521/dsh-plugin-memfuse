@@ -50,7 +50,7 @@ function makeStore(initial) {
  *
  * 关键在于它不是一个宽容的替身：模板必须是字符串，`{name}` 插值，
  * 而传进来一个**函数**会在 `template.replace` 上当场炸。
- * 真机就是这么炸的 —— 字典里写成 `suggestMeta: ({members}) => …`，
+ * 真机就是这么炸的 —— 字典里写成 `suggestMembers: ({count}) => …`，
  * 卡片每次渲染都抛 `template.replace is not a function`，
  * 表现是"卡片永远不出现、零报错"。替身一宽容，这条回归就永远抓不到。
  */
@@ -128,6 +128,8 @@ async function loadClientHalf({
   listImpl = null,
   /** 覆盖 `distill` 的实现（缺陷 25：提炼成技能那条路）。 */
   distillImpl = null,
+  /** 覆盖 `checkUpdate` 的实现（检查更新那条路）。 */
+  updateImpl = null,
   /** 宿主是否接受写入（false = 模拟"非 volatile 字段被拒"）。 */
   mutateOk = true,
 } = {}) {
@@ -143,8 +145,16 @@ async function loadClientHalf({
   // 早先这里是静态的，于是"保存后再清除"那一步算不出任何 op —— 测试抓出来了。
   const suggestionsPayload = suggestions ?? {
     groups: [
-      { key: 'k1', seedTitle: '部署要走 scripts/deploy.sh', members: 3, score: 7, seen: false, useWhen: '部署时' },
-      { key: 'k2', seedTitle: '已经看过的簇', members: 2, score: 5, seen: true, useWhen: null },
+      {
+        key: 'k1',
+        seedTitle: '部署要走 scripts/deploy.sh',
+        members: 3,
+        memberTitles: ['部署入口在 scripts/deploy.sh', '部署前要先跑测试', '回滚用 git revert'],
+        score: 7,
+        seen: false,
+        useWhen: '部署时',
+      },
+      { key: 'k2', seedTitle: '已经看过的簇', members: 2, memberTitles: ['甲', '乙'], score: 5, seen: true, useWhen: null },
     ],
     // 宿主按 `skill.suggestMax`（默认 1）只给前几组，其余的用 restKeys 交回来
     restCount: 2,
@@ -233,6 +243,25 @@ async function loadClientHalf({
     reject: async (name) => {
       remoteCalls.push(['reject', name]);
       return { ok: true, value: { ok: true, name } };
+    },
+    // ── 2026-10-18：检查更新（只读）──
+    checkUpdate: async () => {
+      remoteCalls.push(['checkUpdate']);
+      if (updateImpl !== null) return updateImpl();
+      return {
+        ok: true,
+        value: {
+          supported: true,
+          current: '0.1.0',
+          latest: '0.1.0',
+          behind: 0,
+          branch: 'main',
+          remote: 'https://github.com/a1141171521/dsh-plugin-memfuse.git',
+          url: 'https://github.com/a1141171521/dsh-plugin-memfuse',
+          head: 'abc1234',
+          checkedAt: '2026-10-18T00:00:00.000Z',
+        },
+      };
     },
   };
 
@@ -401,6 +430,56 @@ function findButton(node, label) {
   return null;
 }
 
+/**
+ * 把假树里的**函数组件**就地渲染一层（React 会做，假树不会）。
+ *
+ * 为什么要这一步：`SettingsForm` 的 children 里放的是 `<LearningBanner …/>` 这个
+ * **元素**，横幅自己的 className 要等组件被调用后才出现。不展开就只能找到元素、
+ * 找不到横幅本体（第一版用例就是这么红的）。
+ */
+function renderNode(node) {
+  if (node === null || typeof node !== 'object') return node;
+  return typeof node.type === 'function' ? renderNode(node.type(node.props)) : node;
+}
+
+/** 在 jsx 假树里找一个横幅（按 className 认，递归）。 */
+function findBanner(node) {
+  const current = renderNode(node);
+  if (current === null || typeof current !== 'object') return null;
+  const className = current.props?.className;
+  if (typeof className === 'string' && className.includes('dsh-memfuse-banner')) return current;
+  const kids = current.props?.children;
+  for (const kid of Array.isArray(kids) ? kids : kids === undefined ? [] : [kids]) {
+    const hit = findBanner(kid);
+    if (hit !== null) return hit;
+  }
+  return null;
+}
+
+/** 把假树里的文本拼起来（断言"文案里说了什么"用）。`props.label` 也算 —— 勾选框的标签
+ *  是作为 prop 传给 `Checkbox` 的，不在 children 里。 */
+function textOfTree(node) {
+  if (node === null || node === undefined) return '';
+  if (typeof node === 'string') return node;
+  if (typeof node !== 'object') return '';
+  const current = renderNode(node);
+  if (typeof current === 'string') return current;
+  const label = typeof current.props?.label === 'string' ? current.props.label : '';
+  const kids = current.props?.children;
+  const childText = (Array.isArray(kids) ? kids : kids === undefined ? [] : [kids]).map(textOfTree).join(' ');
+  return label === '' ? childText : `${label} ${childText}`;
+}
+
+/** 收集假树里所有 `<select>` 的 id（用来断言"哪个模型选择器出现了"）。 */
+function selectIds(node, out = []) {
+  const current = renderNode(node);
+  if (current === null || typeof current !== 'object') return out;
+  if (current.type === 'select' && typeof current.props?.id === 'string') out.push(current.props.id);
+  const kids = current.props?.children;
+  for (const kid of Array.isArray(kids) ? kids : kids === undefined ? [] : [kids]) selectIds(kid, out);
+  return out;
+}
+
 /** 选出候选卡片那条注册，并把 slot 系统会传的 props 拼出来。 */
 function cardProps(handle) {
   const reg = handle.registrations.find((row) => row.options.name === 'conversation.chat.turnTail');
@@ -443,18 +522,33 @@ test('client half：bundle id 与包名一致，并声明必需服务', async ()
   console.log('  ✅ bundle id = 包名；inject 含 configForms 与 remote.session');
 });
 
-test('client half：三处入口都注册好（包页表单 + 行标题可点 + 回合尾候选卡）', async () => {
+test('client half：四处入口都注册好（设置页一级页 + 包页表单 + 行标题可点 + 回合尾候选卡）', async () => {
   const h = await loadClientHalf();
   h.exports.apply(h.ctx);
   // 候选卡要等 `$mount` 落地之后才注册（它依赖 remote.memfuse 命名空间）
   await settle();
   const { registrations } = h;
 
-  assert.equal(registrations.length, 3, `应注册三处（包页 + 行 + 候选卡），实际 ${registrations.length}`);
+  assert.equal(
+    registrations.length,
+    4,
+    `应注册四处（设置页 + 包页 + 行 + 候选卡），实际 ${registrations.length}`,
+  );
 
+  const section = registrations.find((r) => r.options.name === 'settings.section');
   const bundle = registrations.find((r) => r.options.name === 'plugins.bundle.config');
   const row = registrations.find((r) => r.options.name === 'plugins.row.config');
   const card = registrations.find((r) => r.options.name === 'conversation.chat.turnTail');
+
+  // ① 一级设置页（2026-10-17 新增：用户要求「加到 settingpage 中」）
+  assert.ok(section, '必须注册 settings.section —— 否则设置页左侧导航里没有「记忆」这一页');
+  assert.equal(section.options.id, 'dsh-memfuse', 'id 用自己的包名（复用官方 id 会顶掉人家那一页）');
+  assert.equal(section.options.order, 25, 'order 25：排在 Agent 预设(20) 之后、其它第三方页(35/40) 之前');
+  assert.equal(section.options.label(), '记忆', 'label 用 thunk，切语言时槽位重投影即可');
+  assert.equal(section.options.locale, 'settings.memfuse');
+  assert.equal(typeof section.options.inject, 'function', '设置页也要 inject（hooks + 动作）');
+  assert.equal(typeof section.Component, 'function', '必须给一个组件');
+
   assert.ok(bundle, '必须注册 plugins.bundle.config —— 包页上直接渲染表单，用户不用点任何东西');
   assert.equal(bundle.options.key, 'dsh-memfuse', 'bundle 槽的 key = **包名**');
   assert.ok(row, '必须注册 plugins.row.config —— 行标题才会变成可点入口');
@@ -463,14 +557,17 @@ test('client half：三处入口都注册好（包页表单 + 行标题可点 + 
   assert.equal(card.options.id, 'dsh-memfuse#suggestions', 'list 槽按 id 占位（别复用官方 id，会顶掉人家的格子）');
   assert.equal(card.options.order, 10);
 
-  for (const reg of [bundle, row]) {
+  for (const reg of [section, bundle, row]) {
     assert.equal(typeof reg.options.inject, 'function', 'slot entry 要给 inject（hooks + 动作）');
     assert.equal(typeof reg.Component, 'function', '必须给一个组件');
     assert.equal(reg.options.locale, 'settings.memfuse');
   }
+  // 三处入口渲染的是**同一个组件**（草稿/保存只有一份实现）
+  assert.equal(section.Component, bundle.Component, '设置页与包页必须共用同一个组件');
+  assert.equal(row.Component, bundle.Component, '行详情与包页必须共用同一个组件');
   assert.equal(typeof card.options.inject, 'function', '候选卡也要 inject（数据源 + 两个动作）');
   assert.equal(typeof card.Component, 'function');
-  console.log('  ✅ 注册 plugins.bundle.config + plugins.row.config + conversation.chat.turnTail');
+  console.log('  ✅ 注册 settings.section + plugins.bundle.config + plugins.row.config + conversation.chat.turnTail');
 });
 
 test('client half：客户端描述符与宿主**逐字段一致**（防两侧漂移）', async () => {
@@ -529,8 +626,8 @@ test('client half：卡片数据源必须走**注入过 remote.memfuse 的子 ct
   assert.equal(h.mounted.length, 1, '必须把自己那份贡献挂到 Remote 上（否则 remote.memfuse 不存在）');
   assert.equal(h.mounted[0].package, 'dsh-memfuse');
   assert.equal(h.mounted[0].face, 'client');
-  // 七个端点：读候选 / 表态 四个 + 缺陷 25 的 distill·approve·reject 三个
-  assert.equal(h.mounted[0].descriptors.length, 7);
+  // 八个端点：读候选 / 表态 四个 + 缺陷 25 的 distill·approve·reject 三个 + 检查更新一个
+  assert.equal(h.mounted[0].descriptors.length, 8);
   assert.ok(
     h.remoteCalls.some((call) => call[0] === 'list'),
     '挂上之后要真的拉一次候选 —— 不拉的话卡片永远是空的',
@@ -687,7 +784,15 @@ test('client half：刷新回来是空的，卡片也不许把自己撤掉（缺
     error: null,
     errorVisible: null,
   });
-  const group = (key, title, score) => ({ key, seedTitle: title, members: 3, score, seen: false, useWhen: '甲' });
+  const group = (key, title, score) => ({
+    key,
+    seedTitle: title,
+    members: 3,
+    memberTitles: ['甲', '乙', '丙'],
+    score,
+    seen: false,
+    useWhen: '甲',
+  });
   const render = (turn, sessionId = 'pin-s1') =>
     reg.Component({
       ...props,
@@ -708,7 +813,7 @@ test('client half：刷新回来是空的，卡片也不许把自己撤掉（缺
   const refreshed = render(9);
   assert.ok(refreshed, '⚠️ 刷新回来是空的时，卡片不能把自己撤掉（真机就是"一闪而过"）');
   assert.match(JSON.stringify(refreshed), /簇 A/, '内容要还是那一组');
-  assert.match(JSON.stringify(refreshed), /另有 2 组/, '「另有 N 组」那行也得留住');
+  assert.match(JSON.stringify(refreshed), /另外还有 2 组同类候选/, '「另有 N 组」那行也得留住');
 
   // 钉住的键里有 turn / sessionId —— 别的回合、别的对话都不许蹭这张卡
   assert.equal(render(10), null, '别的回合不许复用（否则就是"每个回合都来一张"）');
@@ -756,10 +861,19 @@ test('client half：卡片用**真字典**渲染得出来（函数型文案会�
   const rendered = reg.Component(props);
   assert.ok(rendered, '有候选时必须渲染出卡片');
   const text = JSON.stringify(rendered);
-  assert.match(text, /记忆里出现了可固化成技能的簇/);
-  assert.match(text, /3 条记忆 · 7 分/, `成员数/分数要插值成文字，实际 ${text}`);
-  assert.match(text, /部署时/, 'useWhen 要显示出来（用户据此判断要不要提炼）');
-  console.log('  ✅ 真字典渲染：标题 +「3 条记忆 · 7 分」+ 作用 都在');
+  assert.match(text, /这组记忆可以变成一条技能/);
+  assert.match(text, /包含的同类记忆（3 条）/, `成员数要插值成文字，实际 ${text}`);
+  assert.match(text, /部署前要先跑测试/, '成员标题要显示出来（用户得知道这技能里有什么）');
+  assert.match(text, /什么时候用得上：部署时/, 'useWhen 要显示出来（用户据此判断要不要提炼）');
+  assert.match(text, /把它变成技能后/, '要回答"对我有什么帮助"');
+  // 按钮：文字必须短到不换行（真机反馈「提炼和拒绝的按钮描述都换行了」）
+  const distillBtn = findButton(rendered, '提炼成技能');
+  assert.ok(distillBtn, '卡片上必须有「提炼成技能」');
+  assert.equal(distillBtn.props['data-variant'], 'primary', '主按钮要能看出是主按钮');
+  const dismissBtn = findButton(rendered, '不用');
+  assert.ok(dismissBtn, '拒绝按钮的文案就是「不用」（原来的「不用（别再提）」太长，窄一点就换行）');
+  assert.ok(!JSON.stringify(rendered).includes('（别再提）'), '别再退回长按钮文案');
+  console.log('  ✅ 真字典渲染：标题 + 成员 + 适用场景 + 好处 + 两个短按钮 都在');
 });
 
 test('client half：候选卡片——渲染即记 seen，两个按钮打到 Remote 上', async () => {
@@ -786,7 +900,7 @@ test('client half：候选卡片——渲染即记 seen，两个按钮打到 Rem
   assert.deepEqual(seenCall?.[1], ['k1', 'k8', 'k9'], '显示过的 + 没显示的组都要报给宿主');
   assert.equal(snapshot.restCount, 2, '还有几组没显示 —— 卡片要写出来');
   const cardText = JSON.stringify(reg.Component(props));
-  assert.match(cardText, /另有 2 组同类候选/, '没显示的那些要说明去处（别装作不存在）');
+  assert.match(cardText, /另外还有 2 组同类候选，想看就告诉我/, '没显示的那些要说明去处（别装作不存在）');
 
   // 「不用」→ dismiss(key)
   await face.dismiss('k1');
@@ -834,12 +948,13 @@ test('缺陷 25：点「提炼成技能」必须给出**第二阶段**（草稿�
   assert.match(draftText, /ui-skill/, '技能名要显示');
   assert.match(draftText, /界面点「提炼成技能」时用/, '「这个技能干什么用的」要显示（description）');
   assert.match(draftText, /## 步骤/, 'SKILL.md 正文（提示词本体）要显示出来 —— 用户要看的就是这个');
-  assert.match(draftText, /装进技能库/);
-  assert.match(draftText, /丢掉/);
-  assert.ok(findButton(withDraft, props.t('draftApprove')), '「装进技能库」按钮必须在');
-  assert.ok(findButton(withDraft, props.t('draftReject')), '「丢掉」按钮必须在');
+  assert.match(draftText, /刚写好的技能/, '标题要说人话（别写"草稿/提示词"这类术语）');
+  assert.match(draftText, /收下这条技能/, '按钮要口语化');
+  assert.match(draftText, /不要了/, '拒绝按钮也要口语化');
+  assert.ok(findButton(withDraft, props.t('draftApprove')), '「收下这条技能」按钮必须在');
+  assert.ok(findButton(withDraft, props.t('draftReject')), '「不要了」按钮必须在');
 
-  // ③ 点「装进技能库」→ 打到宿主 approve，草稿从卡片上消失，并留一句结果说明
+  // ③ 点「收下这条技能」→ 打到宿主 approve，草稿从卡片上消失，并留一句结果说明
   const approveButton = findButton(withDraft, props.t('draftApprove'));
   await approveButton.props.onClick();
   await settle();
@@ -848,10 +963,10 @@ test('缺陷 25：点「提炼成技能」必须给出**第二阶段**（草稿�
     ['approve', 'ui-skill'],
     '必须打到宿主的 approve 端点',
   );
-  assert.equal(face.hooks.memfuseSuggestions.getSnapshot().drafts.length, 0, '装完草稿就从卡片上撤掉');
+  assert.equal(face.hooks.memfuseSuggestions.getSnapshot().drafts.length, 0, '收下后草稿就从卡片上撤掉');
   const afterApprove = reg.Component(props);
-  assert.match(JSON.stringify(afterApprove), /已装进技能库：ui-skill/, '装完要有一句结果说明（否则又是"点了没反应"）');
-  console.log('  ✅ 提炼 → 草稿预览（提示词 + 作用）→ 装进技能库 / 丢掉，四个端点都打到');
+  assert.match(JSON.stringify(afterApprove), /收下了：ui-skill/, '收完要有一句结果说明（否则又是"点了没反应"）');
+  console.log('  ✅ 提炼 → 先看内容（说人话）→ 收下 / 不要了，四个端点都打到');
 });
 
 test('缺陷 25：提炼失败（没开抽取 / 没模型）要如实说出来，并把这一组记成待办兜底', async () => {
@@ -919,7 +1034,7 @@ test('缺陷 25：草稿的真源在宿主（刷新页面后草稿还在）', as
   await rejectButton.props.onClick();
   await settle();
   assert.deepEqual(h.remoteCalls.find((c) => c[0] === 'reject'), ['reject', 'old-draft']);
-  console.log('  ✅ 草稿从宿主读（刷新后仍在）；「丢掉」打到 reject');
+  console.log('  ✅ 草稿从宿主读（刷新后仍在）；「不要了」打到 reject');
 });
 
 test('缺陷 26：第一次 list 失败之后要自己重试 —— 那行 404 不许一直挂在回合尾部', async () => {
@@ -1047,6 +1162,14 @@ test('client half：summary 给一行说明，page 渲染得出来', async () =>
   const page = Component(props);
   assert.ok(page, 'page 视图必须渲染出东西');
 
+  // 页面结构：三组标题 + 七个字段（组标题漏了 = 又退回"一列平铺开关"）
+  const pageText = textOfTree(page);
+  for (const group of ['记忆学习（LLM 抽取）', '模型不可用时', '学到的记忆与技能']) {
+    assert.ok(pageText.includes(group), `分组标题「${group}」必须渲染出来`);
+  }
+  assert.ok(pageText.includes('开启记忆学习（用 LLM 抽取）'), '总开关的标签要在页面上');
+  assert.ok(pageText.includes('抽取用的模型'), '模型选择器要在页面上');
+
   // 投影里每个字段都在（下拉、勾选、分段控件各自读自己的那份）
   const snapshot = face.hooks.memfuseConfig.getSnapshot();
   assert.deepEqual(
@@ -1055,11 +1178,141 @@ test('client half：summary 给一行说明，page 渲染得出来', async () =>
     '字段顺序 = 页面顺序：总开关 → 跟随 → 模型 → 不可用时 → 降级 → 落盘方式 → 技能建议',
   );
   assert.equal(snapshot.fields.model.value, 'zjpaiguo\u0000deepseek-flash', '选择器要显示当前 provider#model');
-  assert.equal(snapshot.fields.follow.checked, false, '默认不勾选「跟随对话模型」');
+  assert.equal(snapshot.fields.follow.checked, false, '快照里没写过 = 不勾（宿主合并默认值后才变 true）');
   assert.equal(snapshot.fields.mode.text, '', '没配过就是空（回落默认值）');
   // 技能建议**不属于抽取**：它零 LLM，与"用不用模型"无关，不该跟着总开关联动
   assert.ok(snapshot.fields.skillSuggest, '技能建议开关必须在表单里');
   console.log('  ✅ summary/page 都渲染；字段投影齐全（默认不勾跟随、默认不选模型）');
+});
+
+test('client half：设置页顶部横幅三态 —— 关着要说清「不会学习」，且一键就能修好', async () => {
+  // ① 关着 → off 横幅 + 一键开启
+  const off = await mount({ value: { extract: { enabled: false } } });
+  const offBanner = findBanner(off.Component(off.props));
+  assert.ok(offBanner, '关着时必须有关闭横幅 —— 否则现象只是"记忆好像没长"，设置页看上去还一切正常');
+  assert.equal(offBanner.props['data-tone'], 'off');
+  assert.match(textOfTree(offBanner), /不会从对话里学新记忆/, '标题必须点名「不会学习」');
+  const enable = findButton(offBanner, '开启记忆学习');
+  assert.ok(enable, '横幅里要有一键开启按钮');
+  enable.props.onClick();
+  await settle();
+  assert.deepEqual(
+    off.writes[0].ops,
+    [{ op: 'set', path: ['extract', 'enabled'], value: true }],
+    '一键开启必须真的写 extract.enabled=true（布尔真值，不是字符串）',
+  );
+
+  // ② 开着、但没模型也没勾跟随 → partial 横幅 + 一键「跟随对话模型」
+  //    这一档在宿主侧是**真故障**（每轮注入都会报），界面必须提前说。
+  const partial = await mount({ value: { extract: { enabled: true } } });
+  const partialBanner = findBanner(partial.Component(partial.props));
+  assert.equal(partialBanner.props['data-tone'], 'partial');
+  assert.match(textOfTree(partialBanner), /还没有可用的模型/);
+  const follow = findButton(partialBanner, '跟随对话模型');
+  assert.ok(follow, '缺模型时一键「跟随对话模型」是最省事的修法');
+  follow.props.onClick();
+  await settle();
+  assert.deepEqual(partial.writes[0].ops, [
+    { op: 'set', path: ['extract', 'followConversation'], value: true },
+  ]);
+
+  // ③ 开着且跟随 → ready 横幅（说清模型来源与落盘方式，别让人再猜）
+  const ready = await mount({ value: { extract: { enabled: true, followConversation: true } } });
+  const readyBanner = findBanner(ready.Component(ready.props));
+  assert.equal(readyBanner.props['data-tone'], 'ready');
+  const readyText = textOfTree(readyBanner);
+  assert.match(readyText, /已开启/, '就绪态也要有一行，不能只剩开关');
+  assert.match(readyText, /跟随对话模型/, '要写出模型来源（跟随 / 显式）');
+  assert.match(readyText, /先确认/, '要写出新记忆怎么落盘（suggest / auto）');
+  console.log('  ✅ 横幅三态：关着提示+一键开启；没模型提示+一键跟随；就绪说明来源与落盘方式');
+});
+
+test('client half：模型选择器按「跟随 / 策略」显隐（跟随开着时不该摆两个用不上的下拉）', async () => {
+  const MODEL = 'plugin-config-dsh-memfuse-model';
+  const FALLBACK = 'plugin-config-dsh-memfuse-fallback';
+
+  // ① 跟随 ON + stop（默认组合）：两个选择器都不生效 → 全藏
+  const a = await mount({ value: { extract: { enabled: true, followConversation: true } } });
+  assert.deepEqual(selectIds(a.Component(a.props)), [], '跟随 + stop：主选择器与独立降级模型都用不上，必须藏起来');
+
+  // ② 跟随 ON + fallback：只出现**一个** —— 主选择器就是降级目标，改名并挪到「模型不可用时」
+  const b = await mount({
+    value: { extract: { enabled: true, followConversation: true, onUnavailable: 'fallback' } },
+  });
+  assert.deepEqual(selectIds(b.Component(b.props)), [MODEL], '跟随 + fallback：只该有一个选择器（它是降级目标）');
+  assert.match(
+    textOfTree(b.Component(b.props)),
+    /降级模型（主模型不可用时）/,
+    '跟随模式下它要改名 —— 否则用户以为在挑主模型',
+  );
+
+  // ③ 跟随 OFF + stop：主选择器在；独立降级模型在 stop 下永远用不到 → 藏
+  const c = await mount({ value: { extract: { enabled: true, followConversation: false } } });
+  assert.deepEqual(selectIds(c.Component(c.props)), [MODEL], '不跟随 + stop：只显示主模型');
+
+  // ④ 跟随 OFF + fallback：两个都要能配
+  const d = await mount({
+    value: { extract: { enabled: true, followConversation: false, onUnavailable: 'fallback' } },
+  });
+  assert.deepEqual(
+    selectIds(d.Component(d.props)),
+    [MODEL, FALLBACK],
+    '不跟随 + fallback：主模型与独立降级模型都要显示',
+  );
+  console.log('  ✅ 模型选择器按状态显隐：跟随+stop 全藏；跟随+fallback 只留降级；不跟随按策略显示');
+});
+
+test('client half：设置页页脚 —— 版本 / 检查更新 / GitHub 点赞', async () => {
+  const h = await loadClientHalf({
+    value: {},
+    suggestions: {
+      groups: [],
+      restCount: 0,
+      restKeys: [],
+      seen: 0,
+      dismissed: 0,
+      pendingDistill: [],
+      pendingSkills: [],
+      version: '0.1.0',
+      repoUrl: 'https://github.com/a1141171521/dsh-plugin-memfuse',
+    },
+  });
+  h.exports.apply(h.ctx);
+  await settle();
+
+  const reg = h.registrations.find((row) => row.options.name === 'settings.section');
+  assert.ok(reg, '设置页必须注册');
+  const face = reg.options.inject();
+  const props = {
+    t: h.t,
+    view: 'page',
+    ...face,
+    useMemfuseConfig: (selector) => selector(face.hooks.memfuseConfig.getSnapshot()),
+  };
+  const page = reg.Component(props);
+  const text = textOfTree(page);
+  assert.match(text, /v0\.1\.0/, '版本号要显示（宿主从 package.json 读回来）');
+  assert.match(text, /还没检查过/, '没点之前要说清"没查过"，别装成"已是最新"');
+  assert.match(text, /去 GitHub 点个赞/, '点赞按钮要在');
+  const raw = JSON.stringify(page);
+  assert.ok(
+    raw.includes('"href":"https://github.com/a1141171521/dsh-plugin-memfuse"'),
+    '点赞按钮必须是指向仓库的链接（不是假装能替用户点星）',
+  );
+  assert.ok(raw.includes('"target":"_blank"'), '要在新标签页打开');
+
+  // 点「检查更新」→ 打到宿主的 checkUpdate（必须走声明过 remote.memfuse 的子 ctx）
+  const button = findButton(page, '检查更新');
+  assert.ok(button, '必须有「检查更新」按钮');
+  button.props.onClick();
+  await settle();
+  assert.ok(
+    h.remoteCalls.some((call) => call[0] === 'checkUpdate'),
+    '点「检查更新」要打到宿主的 checkUpdate 端点',
+  );
+  const after = textOfTree(reg.Component(props));
+  assert.match(after, /已是最新（v0\.1\.0 · abc1234）/, '查到"已是最新"要如实显示版本与提交号');
+  console.log('  ✅ 页脚：版本 + 检查更新（真的打到宿主）+ GitHub 点赞链接');
 });
 
 test('client half：选模型 = 一次写 provider + model 两个 op（嵌套路径）', async () => {
