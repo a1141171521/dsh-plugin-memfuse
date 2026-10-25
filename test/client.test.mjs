@@ -130,6 +130,8 @@ async function loadClientHalf({
   distillImpl = null,
   /** 覆盖 `checkUpdate` 的实现（检查更新那条路）。 */
   updateImpl = null,
+  /** 覆盖 `applyUpdate` 的实现（安装更新那条路）。 */
+  installImpl = null,
   /** 宿主是否接受写入（false = 模拟"非 volatile 字段被拒"）。 */
   mutateOk = true,
 } = {}) {
@@ -260,6 +262,27 @@ async function loadClientHalf({
           url: 'https://github.com/a1141171521/dsh-plugin-memfuse',
           head: 'abc1234',
           checkedAt: '2026-10-18T00:00:00.000Z',
+        },
+      };
+    },
+    // ── 2026-10-18 追加：安装更新（宿主跑 git pull --ff-only）──
+    applyUpdate: async () => {
+      remoteCalls.push(['applyUpdate']);
+      if (installImpl !== null) return installImpl();
+      return {
+        ok: true,
+        value: {
+          ok: true,
+          supported: true,
+          changed: true,
+          from: '0.1.0',
+          to: '0.2.0',
+          head: 'def5678',
+          branch: 'main',
+          remote: 'https://github.com/a1141171521/dsh-plugin-memfuse.git',
+          url: 'https://github.com/a1141171521/dsh-plugin-memfuse',
+          restartRequired: true,
+          updatedAt: '2026-10-18T00:00:00.000Z',
         },
       };
     },
@@ -626,8 +649,8 @@ test('client half：卡片数据源必须走**注入过 remote.memfuse 的子 ct
   assert.equal(h.mounted.length, 1, '必须把自己那份贡献挂到 Remote 上（否则 remote.memfuse 不存在）');
   assert.equal(h.mounted[0].package, 'dsh-memfuse');
   assert.equal(h.mounted[0].face, 'client');
-  // 八个端点：读候选 / 表态 四个 + 缺陷 25 的 distill·approve·reject 三个 + 检查更新一个
-  assert.equal(h.mounted[0].descriptors.length, 8);
+  // 九个端点：读候选 / 表态 四个 + 缺陷 25 的 distill·approve·reject 三个 + 检查更新一个 + 安装更新一个
+  assert.equal(h.mounted[0].descriptors.length, 9);
   assert.ok(
     h.remoteCalls.some((call) => call[0] === 'list'),
     '挂上之后要真的拉一次候选 —— 不拉的话卡片永远是空的',
@@ -1312,7 +1335,162 @@ test('client half：设置页页脚 —— 版本 / 检查更新 / GitHub 点赞
   );
   const after = textOfTree(reg.Component(props));
   assert.match(after, /已是最新（v0\.1\.0 · abc1234）/, '查到"已是最新"要如实显示版本与提交号');
+  assert.equal(findButton(reg.Component(props), '安装更新'), null, '没有新版本时不该摆「安装更新」（点了只会吃一次同样的错）');
   console.log('  ✅ 页脚：版本 + 检查更新（真的打到宿主）+ GitHub 点赞链接');
+});
+
+/** 选出设置页那一级注册，并把 slot 系统会传的 props 拼出来（页脚/更新相关用例共用）。 */
+function sectionProps(handle) {
+  const reg = handle.registrations.find((row) => row.options.name === 'settings.section');
+  assert.ok(reg, '设置页必须注册');
+  const face = reg.options.inject();
+  const props = {
+    t: handle.t,
+    view: 'page',
+    ...face,
+    useMemfuseConfig: (selector) => selector(face.hooks.memfuseConfig.getSnapshot()),
+  };
+  return { reg, face, props };
+}
+
+/** 一条"查到新版本"的 checkUpdate 返回值（behind = 3）。 */
+const NEWER = {
+  supported: true,
+  current: '0.1.0',
+  latest: '0.2.0',
+  behind: 3,
+  branch: 'main',
+  remote: 'https://github.com/a1141171521/dsh-plugin-memfuse.git',
+  url: 'https://github.com/a1141171521/dsh-plugin-memfuse',
+  head: 'abc1234',
+  checkedAt: '2026-10-18T00:00:00.000Z',
+};
+
+/** 空候选 + 页脚所需的版本信息。 */
+const EMPTY_FEED = {
+  groups: [],
+  restCount: 0,
+  restKeys: [],
+  seen: 0,
+  dismissed: 0,
+  pendingDistill: [],
+  pendingSkills: [],
+  version: '0.1.0',
+  runningVersion: '0.1.0',
+  repoUrl: 'https://github.com/a1141171521/dsh-plugin-memfuse',
+};
+
+test('client half：查到新版本 → 出现「安装更新」→ 点它真的打到宿主，并明说"重启后生效"', async () => {
+  const h = await loadClientHalf({
+    value: {},
+    suggestions: EMPTY_FEED,
+    updateImpl: async () => ({ ok: true, value: NEWER }),
+  });
+  h.exports.apply(h.ctx);
+  await settle();
+  const { reg, props } = sectionProps(h);
+
+  // ① 没查过 → 不摆「安装更新」
+  assert.equal(
+    findButton(reg.Component(props), '安装更新'),
+    null,
+    '还没查到新版本就摆一个按钮，点了只会再吃一次同样的错',
+  );
+
+  // ② 查一下 → 出现按钮
+  findButton(reg.Component(props), '检查更新').props.onClick();
+  await settle();
+  const afterCheck = reg.Component(props);
+  assert.match(textOfTree(afterCheck), /落后 3 次提交/, '查到新版本要说清落后多少');
+  const install = findButton(afterCheck, '安装更新');
+  assert.ok(install, '查到新版本后必须出现「安装更新」按钮');
+
+  // ③ 点安装 → 打到宿主 applyUpdate
+  install.props.onClick();
+  await settle();
+  assert.ok(
+    h.remoteCalls.some((call) => call[0] === 'applyUpdate'),
+    '点「安装更新」要打到宿主的 applyUpdate 端点',
+  );
+
+  const afterInstall = reg.Component(props);
+  const text = textOfTree(afterInstall);
+  assert.match(text, /已更新到 v0\.2\.0/, '装完要说清更新到了哪个版本');
+  assert.match(text, /重启 DSH 后生效/, '没有热更新：必须明说"重启才生效"');
+  assert.ok(!/落后 3 次提交/.test(text), '装完之后不许还挂着"落后 N 次提交"（那是装之前的结论）');
+  assert.equal(findButton(afterInstall, '安装更新'), null, '装过了就把按钮收起来，剩下的只是重启');
+  // 页脚：磁盘 0.2.0 / 进程 0.1.0 → 必须标「重启后生效」
+  assert.match(text, /v0\.2\.0（重启后生效）/, '页脚版本号要跟着磁盘走，并标出"待重启"');
+  console.log('  ✅ 查到新版本 → 安装（真打到宿主）→ 明说"重启后生效"、按钮收起、页脚标"待重启"');
+});
+
+test('client half：落后但版本号没变 → 说「新提交」，不说「新版本」', async () => {
+  const h = await loadClientHalf({
+    value: {},
+    suggestions: EMPTY_FEED,
+    // 版本号没动，但确实落后 3 个提交（文档/测试类提交就是这样）
+    updateImpl: async () => ({ ok: true, value: { ...NEWER, latest: '0.1.0' } }),
+  });
+  h.exports.apply(h.ctx);
+  await settle();
+  const { reg, props } = sectionProps(h);
+
+  findButton(reg.Component(props), '检查更新').props.onClick();
+  await settle();
+  const text = textOfTree(reg.Component(props));
+  assert.match(text, /GitHub 上有新提交/, '版本号没动就别写"新版本"（否则用户以为版本号会变）');
+  assert.ok(!/新版本/.test(text), '同一行里不许同时出现"新版本"');
+  assert.ok(findButton(reg.Component(props), '安装更新'), '落后就该能装，跟版本号有没有变无关');
+  console.log('  ✅ 落后但版本号没变 → 「新提交」措辞，安装按钮照样出现');
+});
+
+test('client half：更新被拒（本地有未提交改动）→ 原始报错照原样显示，按钮留着可以改完再试', async () => {
+  const dirty = '本地有未提交的改动（M lib/index.js）—— 先提交或还原再更新，不会覆盖你的东西';
+  const h = await loadClientHalf({
+    value: {},
+    suggestions: EMPTY_FEED,
+    updateImpl: async () => ({ ok: true, value: NEWER }),
+    installImpl: async () => ({
+      ok: true,
+      value: { ok: false, supported: true, changed: false, from: '0.1.0', to: '0.1.0', dirtyCount: 1, error: dirty },
+    }),
+  });
+  h.exports.apply(h.ctx);
+  await settle();
+  const { reg, props } = sectionProps(h);
+
+  findButton(reg.Component(props), '检查更新').props.onClick();
+  await settle();
+  findButton(reg.Component(props), '安装更新').props.onClick();
+  await settle();
+
+  const text = textOfTree(reg.Component(props));
+  assert.match(text, /更新没成功：本地有未提交的改动/, '拒绝理由要显示出来');
+  assert.match(text, /M lib\/index\.js/, '原始报错不许吞（连是哪个文件都要能看到）');
+  assert.ok(
+    findButton(reg.Component(props), '安装更新'),
+    '失败后按钮要留着 —— 用户提交完改动还能再试一次',
+  );
+  console.log('  ✅ 更新被拒时原样显示宿主理由，且按钮保留可重试');
+});
+
+test('client half：页脚版本 —— 磁盘与进程不一致时标「重启后生效」', async () => {
+  // 场景：用户已经在别处 `git pull` 过（或上次点了安装但还没重启）→
+  // 磁盘 0.2.0、进程里还是 0.1.0。只报磁盘版本就是"界面写着新版、跑的其实是旧版"。
+  const h = await loadClientHalf({ value: {}, suggestions: { ...EMPTY_FEED, version: '0.2.0' } });
+  h.exports.apply(h.ctx);
+  await settle();
+  const { reg, props } = sectionProps(h);
+  const text = textOfTree(reg.Component(props));
+  assert.match(text, /v0\.2\.0（重启后生效）/, '两个版本不同就必须说清"装了还没重启"');
+
+  // 重启之后两边一致 → 不该再挂着那句话
+  const h2 = await loadClientHalf({ value: {}, suggestions: EMPTY_FEED });
+  h2.exports.apply(h2.ctx);
+  await settle();
+  const second = sectionProps(h2);
+  assert.match(textOfTree(second.reg.Component(second.props)), /v0\.1\.0(?!（重启后生效）)/, '版本一致时不要乱标"待重启"');
+  console.log('  ✅ 页脚：磁盘/进程版本不一致 → 「（重启后生效）」；一致 → 只报版本号');
 });
 
 test('client half：选模型 = 一次写 provider + model 两个 op（嵌套路径）', async () => {

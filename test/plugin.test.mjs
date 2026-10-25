@@ -12,6 +12,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import os from 'node:os';
 import path from 'node:path';
+import fs from 'node:fs';
 import fsp from 'node:fs/promises';
 
 const mod = await import('../lib/index.js');
@@ -1779,7 +1780,7 @@ test('Remote 通道：手写描述符合法 + 服务绑定正确 + 七个方法�
   //    这里把规则**照抄**成断言；换宿主版本时要回去重读那些函数，别让测试变成自证。
   const wireName = /^[A-Za-z0-9_$.-]+$/;
   const descriptors = remoteMod.remoteDescriptors();
-  assert.equal(descriptors.length, 8);
+  assert.equal(descriptors.length, 9);
   // 端点清单（探针与 status.md 都读它）必须与描述符**一一对应** —— 少一个就是
   // "界面按钮打到不存在的端点上"，而那种失败只表现为"点了没反应"。
   assert.deepEqual(
@@ -3047,4 +3048,110 @@ test('U3 检查更新：每次 git 调用都带超时，且比的是 origin/<当
     '比较的是 origin/<当前分支>，不是硬编码 main',
   );
   console.log('  ✅ 每条 git 调用都带 timeout，比较对象是 origin/<branch>');
+});
+
+// ───────────────────────── 安装更新（2026-10-18 追加）─────────────────────────
+
+/** 造一个临时"仓库目录"：里面只有 package.json（git 是假的）。 */
+async function tempRepo(version) {
+  const dir = await fsp.mkdtemp(path.join(os.tmpdir(), 'memfuse-update-'));
+  await fsp.writeFile(path.join(dir, 'package.json'), JSON.stringify({ name: 'dsh-memfuse', version }));
+  return dir;
+}
+
+test('U4 安装更新：快进成功 → 版本/提交号都变，且明确要求重启', async () => {
+  const dir = await tempRepo('0.1.0');
+  let head = 'abc1234def';
+  const fake = fakeGit({
+    'rev-parse --is-inside-work-tree': () => 'true',
+    'rev-parse --abbrev-ref HEAD': () => 'main',
+    'rev-parse --short HEAD': () => head,
+    'remote get-url origin': () => 'https://github.com/a1141171521/dsh-plugin-memfuse.git',
+    'status --porcelain --untracked-files=no': () => '',
+    'pull --ff-only origin main': () => {
+      // 真 git 会在 pull 时更新工作区 —— 假 git 就把 package.json 也换掉
+      head = 'def5678abc';
+      fs.writeFileSync(path.join(dir, 'package.json'), JSON.stringify({ name: 'dsh-memfuse', version: '0.2.0' }));
+      return 'Updating abc1234..def5678\nFast-forward';
+    },
+  });
+  const r = await updateMod.applyUpdate({ dir, exec: fake.exec, timeoutMs: 1000 });
+
+  assert.equal(r.ok, true, '快进成功要报 ok');
+  assert.equal(r.changed, true);
+  assert.equal(r.from, '0.1.0');
+  assert.equal(r.to, '0.2.0', 'to 必须是 pull **之后**从磁盘读的版本（否则界面报旧版本）');
+  assert.equal(r.head, 'def5678abc');
+  assert.equal(r.restartRequired, true, '磁盘换了代码、进程里还是旧的 —— 必须要求重启');
+
+  const pull = fake.calls.find((c) => c.key.startsWith('pull '));
+  assert.ok(pull, '必须真的执行 git pull');
+  assert.ok(pull.key.includes('--ff-only'), '只许快进（绝不 rebase / 改历史）');
+  assert.ok(pull.options.timeout >= 30000, `git pull 要比只读命令给得宽，实际 ${pull.options.timeout}ms`);
+  for (const call of fake.calls) assert.equal(call.options.windowsHide, true);
+
+  await fsp.rm(dir, { recursive: true, force: true });
+  console.log('  ✅ 快进成功：版本/提交号都更新，restartRequired=true，pull 带 --ff-only 与更宽超时');
+});
+
+test('U5 安装更新：本地有未提交改动 → 拒绝，绝不覆盖用户的东西', async () => {
+  const fake = fakeGit({
+    ...GIT_OK,
+    'status --porcelain --untracked-files=no': () => ' M lib/index.js\n M lib/client.js',
+    'pull --ff-only origin main': () => '不应该被执行',
+  });
+  const r = await updateMod.applyUpdate({ exec: fake.exec, timeoutMs: 1000 });
+
+  assert.equal(r.ok, false);
+  assert.equal(r.changed, false);
+  assert.equal(r.restartRequired, false, '什么都没装，不该要求重启');
+  assert.match(r.error, /本地有未提交的改动/, '拒绝理由要说人话');
+  assert.match(r.error, /M lib\/index\.js/, '要说清是哪几个文件（用户才知道去提交什么）');
+  assert.equal(r.dirtyCount, 2);
+  assert.ok(
+    fake.calls.some((c) => c.key === 'status --porcelain --untracked-files=no'),
+    '只看已跟踪文件：未跟踪的是用户自己的东西，不该挡住更新',
+  );
+  assert.ok(
+    !fake.calls.some((c) => c.key.startsWith('pull ')),
+    '有本地改动时**绝不许**执行 pull（否则就是覆盖用户的代码）',
+  );
+  console.log('  ✅ 有本地改动 → 拒绝更新、不执行 pull、说清是哪几个文件');
+});
+
+test('U6 安装更新：pull 失败（不能快进 / 超时）→ 如实报错，不说"已更新"', async () => {
+  // ① 不能快进（本地有分叉的提交）
+  const diverged = fakeGit({
+    ...GIT_OK,
+    'status --porcelain --untracked-files=no': () => '',
+    'pull --ff-only origin main': () => new Error('fatal: Not possible to fast-forward, aborting.'),
+  });
+  const a = await updateMod.applyUpdate({ exec: diverged.exec, timeoutMs: 1000 });
+  assert.equal(a.ok, false);
+  assert.equal(a.changed, false);
+  assert.match(a.error, /Not possible to fast-forward/, '原始报错不许吞');
+  assert.match(a.error, /更新失败/, '要让人一眼看出是"更新"这一步失败');
+
+  // ② 超时：execFile 以 killed=true 回调（stderr 往往是空的）→ 文案必须说"超时"
+  const timedOut = fakeGit({
+    ...GIT_OK,
+    'status --porcelain --untracked-files=no': () => '',
+    'pull --ff-only origin main': () => Object.assign(new Error(''), { killed: true }),
+  });
+  const b = await updateMod.applyUpdate({ exec: timedOut.exec, timeoutMs: 1000, pullTimeoutMs: 77 });
+  assert.equal(b.ok, false);
+  assert.match(b.error, /超时（77ms）/, '超时要报出具体阈值，不能是一段空字符串');
+  console.log('  ✅ pull 失败/超时都如实报（原文 + 具体超时值），绝不谎报成功');
+});
+
+test('U7 安装更新：不是 git 检出 → supported:false，给重装建议，且不执行 pull', async () => {
+  const fake = fakeGit({ 'rev-parse --is-inside-work-tree': () => new Error('fatal: not a git repository') });
+  const r = await updateMod.applyUpdate({ exec: fake.exec, timeoutMs: 1000 });
+
+  assert.equal(r.supported, false);
+  assert.equal(r.ok, false);
+  assert.match(r.error, /不是 git 检出/);
+  assert.match(r.error, /dsh plugin add/, '要给一条能走通的路，不能只说"不行"');
+  assert.ok(!fake.calls.some((c) => c.key.startsWith('pull ')));
+  console.log('  ✅ 非 git 检出：不支持 + 给出重装建议，绝不执行 pull');
 });

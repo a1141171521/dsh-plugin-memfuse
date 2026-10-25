@@ -14,8 +14,8 @@
  *      （这条正是真机上"卡片永远不出现"的元凶，留在这里当活体回归。）
  *
  * 唯一的假：宿主那一侧（`list / markSeen / dismiss / requestDistill / distill / approve /
- * reject / checkUpdate` 八个端点）是内存里的假数据（`distill` 还假了一个"模型写 SKILL.md"的固定产物），
- * 日志面板会把每次调用如实列出来。
+ * reject / checkUpdate / applyUpdate` 九个端点）是内存里的假数据（`distill` 还假了一个
+ * "模型写 SKILL.md"的固定产物），日志面板会把每次调用如实列出来。
  */
 
 /** 演示用的候选（内容取自本项目真实场景，但数据是假的）。 */
@@ -202,6 +202,9 @@ export function startPreview({ window, document, bundle, target, onLog, onState 
           pendingSkills: [...drafts.values()],
           // 页脚用（真宿主从 package.json 读）
           version: '0.1.0',
+          // 「本进程在跑的版本」：真宿主在 import 那一刻读一次，之后不再变。
+          // 与 version 不同 = 装了更新还没重启（预览页固定相同，方便看正常态）。
+          runningVersion: '0.1.0',
           repoUrl: 'https://github.com/a1141171521/dsh-plugin-memfuse',
         },
       };
@@ -224,6 +227,30 @@ export function startPreview({ window, document, bundle, target, onLog, onState 
           url: 'https://github.com/a1141171521/dsh-plugin-memfuse',
           head: 'abc1234',
           checkedAt: new Date().toISOString(),
+        },
+      };
+    },
+    /**
+     * 安装更新（假的）：真宿主跑 `git pull --ff-only`（会改工作区，所以边界全在
+     * `lib/update.js` 里：非 git 检出 / 本地有改动 / 不能快进 —— 三种都拒绝）。
+     * 预览页不动任何文件，只返回一份"装好了、要重启"的结果。
+     */
+    applyUpdate: async () => {
+      log('applyUpdate() → 真宿主跑 git pull --ff-only；预览页不动文件，固定返回"已更新，需重启"');
+      return {
+        ok: true,
+        value: {
+          ok: true,
+          supported: true,
+          changed: true,
+          from: '0.1.0',
+          to: '0.2.0',
+          head: 'def5678',
+          branch: 'main',
+          remote: 'https://github.com/a1141171521/dsh-plugin-memfuse.git',
+          url: 'https://github.com/a1141171521/dsh-plugin-memfuse',
+          restartRequired: true,
+          updatedAt: new Date().toISOString(),
         },
       };
     },

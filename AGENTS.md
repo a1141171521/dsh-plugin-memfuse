@@ -11,7 +11,7 @@
 | 3 | `docs/spec.md` | **唯一权威**的功能清单 + 技术线 + 各阶段实施记录（含真机发现的缺陷） |
 | 4 | `README.md` | 对外说明（**部分已过时**，以 spec.md 为准） |
 
-**先跑 `npm test`**（应看到 **82 + 32 + 5 + 23 = 142 项全绿**）确认环境正常，再动手。
+**先跑 `npm test`**（应看到 **86 + 36 + 5 + 23 = 150 项全绿**）确认环境正常，再动手。
 想直接看候选卡片长什么样：`npm run preview`（离线预览页，不用重启、不用先有候选）。
 
 ## 这是什么
@@ -25,18 +25,19 @@ DSH 的长期记忆插件。纯文本 Markdown 存储、本地检索。
   推送前扫一遍：**不带凭据**；本机用户名 / 绝对路径改占位符（仓库是 public）。
 - **已装进 desktop + web 两个 profile**（都是**符号链接/junction 指向本仓库**，改文件即生效，
   只差重启让客户端重新加载 bundle），真机跑通。
-- 测试 **142 项全绿**（plugin 82 + client 32 + 预览 5 + smoke 23）；真机功能 40/40、补测 29/29、真实会话闭环、真实模型往返全通。
+- 测试 **150 项全绿**（plugin 86 + client 36 + 预览 5 + smoke 23）；真机功能 40/40、补测 29/29、真实会话闭环、真实模型往返全通。
 - **候选卡片的离线预览页**：`npm run preview`（起本地静态服务再打开
   `docs/preview/turn-tail-card.html` —— **别直接双击**：模块脚本在 `file://` 下会被 CORS 拒）。
   它加载**真实的 `lib/client.js`**（同 bundle / 同 CSS / 同字典），宿主那侧是假数据；
   侧栏有宿主状态、远程调用日志、下一轮 Block E 示意 + 四个场景按钮。
   `test/preview.test.mjs` 用迷你 DOM 兜底。**想知道卡片长什么样，先看这个，别先重启。**
 - **H8 界面数据通道**（2026-10-15/16）：`lib/remote.js` 手写 Typert 贡献
-  （**不需要代码生成器、不需要 zod**），**八个端点**
-  `memfuse/list|dismiss|markSeen|requestDistill|distill|approve|reject|checkUpdate`
+  （**不需要代码生成器、不需要 zod**），**九个端点**
+  `memfuse/list|dismiss|markSeen|requestDistill|distill|approve|reject|checkUpdate|applyUpdate`
   （前四个是读 + 记账；`distill`/`approve`/`reject` 是缺陷 25 补的：界面点「提炼成技能」
   当场写 SKILL.md → 草稿预览 → 装/丢；`checkUpdate` 是 2026-10-18 加的只读诊断，
-  设置页页脚的「检查更新」用它）；
+  `applyUpdate` 是同日追加的**安装**（`git pull --ff-only`，拉完要重启），
+  设置页页脚的「检查更新 / 安装更新」用它俩）；
   候选在**回合尾部**出卡片（`conversation.chat.turnTail`，id `dsh-memfuse#suggestions`）。
   「渲染即记 seen」= 不一直提示；「不用」= 永不提；簇长大 → key 变 → 再提一次。
   ⚠️ **四个坑**：① 宿主贡献读 **`invocations`**、客户端读 **`descriptors`**（写错宿主**静默收下**，
@@ -271,10 +272,16 @@ DSH 的长期记忆插件。纯文本 Markdown 存储、本地检索。
   **三处共用同一个 `MemfuseConfigCardView`**）。
   ⚠️ **主入口是设置页左侧导航的「记忆」**（2026-10-17 加）—— 插件页那两处是二级目录，
   用户找不到。⚠️ 「设置 → 内置插件」只是**只读清单**，那个页面**不渲染任何表单**；
-  **页脚**（2026-10-18）：`v0.1.0` + 「检查更新」+「去 GitHub 点个赞 ⭐」。
+  **页脚**（2026-10-18）：`v0.1.0` + 「检查更新」+「安装更新」（**只在查到新版本时出现**）
+  +「去 GitHub 点个赞 ⭐」。
   版本号/仓库地址由 `list` 带回（宿主读 package.json；**客户端别硬编码**）；
   「检查更新」走 `memfuse/checkUpdate`（`lib/update.js`：`git fetch` + `rev-list`，
-  只更新远端引用、**不动工作区**，每条 git 都带超时）；点赞按钮是普通外链，
+  只更新远端引用、**不动工作区**，每条 git 都带超时）；
+  「安装更新」走 `memfuse/applyUpdate`（`git pull --ff-only`，**三条边界**：不是 git 检出 /
+  本地有未提交改动 / 不能快进 —— 全部拒绝并原样报错）。
+  ⚠️ **没有热更新**：拉完只是磁盘换了代码，界面必须写「已更新到 vX —— 重启 DSH 后生效」；
+  页脚同时显示 `runningVersion`（进程启动时的版本），与磁盘版本不同就标「（重启后生效）」
+  —— 别把"装了"说成"用上了"（硬规则 4）。点赞按钮是普通外链，
   **插件不碰用户的 GitHub 凭据**（别假装能替人点星）。
 - **抽取的四种状态**（2026-10-17 默认值翻转）：**总开关 `extract.enabled` 默认开**
   （关着 = 不使用 LLM，且**不算故障**；关着的时候配了模型也不跑）／开了但没选模型

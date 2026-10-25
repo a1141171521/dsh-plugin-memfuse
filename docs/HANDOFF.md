@@ -112,13 +112,14 @@ npm test          # 应该看到 77 + 29 + 5 + 23 = 134 项全绿（全部零 LL
 
 ```
 lib/
-├── index.js     124KB 2783 行  宿主半边入口：6 个工具 + 注入接线 + 宿主探测 + 捕获 + 维护 + status.md（**待拆，见下**）
-├── client.js     83KB 1738 行  浏览器半边：设置页表单 + 回合尾候选卡片（**不拆文件，见下**）
+├── index.js    166KB 3629 行  宿主半边入口：6 个工具 + 注入接线 + 宿主探测 + 捕获 + 维护 + status.md（**待拆，见下**）
+├── client.js   125KB 2477 行  浏览器半边：设置页表单 + 回合尾候选卡片（**不拆文件，见下**）
 ├── store.js      18KB  489 行  存储层：frontmatter 往返 + 原子写 + drift guard + 锁
 ├── policy.js     14KB  357 行  策略层（纯函数）：打分 / 准入 / 生命周期 / 反馈 / 升级
 ├── distill.js    13KB  335 行  技能提炼：候选打分 + 标签聚类 + 提炼提示词
-├── remote.js     13KB  294 行  界面数据通道：手写 Typert 贡献，8 个端点
+├── remote.js     15KB  327 行  界面数据通道：手写 Typert 贡献，9 个端点
 ├── config.js     11KB  178 行  宿主半边 Config schema（设置页的字段定义）
+├── update.js     11KB  301 行  版本：checkUpdate（git fetch/rev-list，只读）+ applyUpdate（git pull --ff-only）
 ├── skill.js       9KB  242 行  SKILL.md 格式 I/O + 四个静默坑的对策 + approve/reject
 ├── recall.js      9KB  229 行  本地检索：CJK bigram + BM25 + excerpt
 ├── extract.js     9KB  216 行  记忆抽取：提示词 + 容错解析 + 准入 + 偏好加成

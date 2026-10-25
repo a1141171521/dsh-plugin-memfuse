@@ -2872,3 +2872,85 @@ op 是 `{op:'set', path:['extract','enabled'], value:true}`（字符串 `'true'`
 - 真机实测（本机）：`checkUpdate()` 约 **3 秒**返回
   `{supported:true, current:'0.1.0', latest:'0.1.0', behind:0, branch:'main', head:'57937a4'}`，
   `describeUpdate` → 「已是最新（0.1.0 · 57937a4）」。
+
+### 安装更新：查到新版本之后能直接装（2026-10-18 追加）
+
+用户原话：「我想要的是检查到新版本后，可安装新版本，然后提示用户重启生效即可，并不是实时生效。」
+
+#### ① 先说清"没有热更新"（这是设计的出发点）
+
+宿主半边是 Node ESM，**模块缓存按进程走**：磁盘换了代码，同进程内 `import()` 不会重读。
+本项目自己就有实测证据：改完默认值不重启，运行中的 `Config` schema 一直报旧默认值，
+直到 6 天后重启才变。所以：
+
+| 说法 | 事实 |
+|---|---|
+| 改 `lib/*.js` 不重启就生效 | ❌ |
+| 改 `lib/client.js` 后刷新页面 | ✅ 但那只换浏览器半边，救不了宿主 |
+| 点「安装更新」立刻用上新版 | ❌ 只把**磁盘**换成新版，重启才加载 |
+
+于是界面**一律**写「已更新到 vX —— 重启 DSH 后生效」，绝不写成"已经用上新版"
+（硬规则 4：功能存在但从不生效也算失败）。
+
+#### ② 宿主：`applyUpdate()`（`lib/update.js`）
+
+`git pull --ff-only`，**三条安全边界全在宿主**（不在界面里）：
+
+| 边界 | 做法 | 失败时 |
+|---|---|---|
+| 不是 git 检出 | `rev-parse --is-inside-work-tree` | `supported:false` + 「用 dsh plugin add 重装」 |
+| 本地有未提交改动 | `status --porcelain --untracked-files=no` | **拒绝**，列出前 3 个文件 + 「不会覆盖你的东西」 |
+| 本地有分叉提交 | `pull --ff-only`（绝不 rebase / 改历史） | 如实报 `fatal: Not possible to fast-forward` |
+
+- **只看已跟踪文件**：未跟踪文件是用户自己的东西，不该挡住更新（git 自己在真要覆盖时也会拒）。
+- `git pull` 的超时 **60s**（`PULL_TIMEOUT_MS`，比只读的 8s 宽），仍然有界。
+- `changed` 用**提交号**比（`headBefore !== headAfter`），不用版本号 —— 文档类提交不改版本。
+- `to` 在 pull **之后**从磁盘读 `package.json`；`restartRequired = changed`。
+- 单飞：`applyInFlight`；且先 `await` 在飞的 `checkUpdate`（两条都会写 `.git`，别交叉）。
+
+#### ③ 端点：第 9 个（`memfuse/applyUpdate`）
+
+`lib/remote.js` + 客户端镜像那份描述符同步加，无参数、`result` 是 `UpdateInstall`。
+`state.remoteChannel` 从 `{endpoints:8}` → `{endpoints:9}`（自校验少一个就会记 `remoteFail`）。
+
+#### ④ 客户端：两个状态分开，文案优先"安装"
+
+`this.update = {status, data, error, install}` —— `data` 是检查结果，`install` 是安装结果。
+**安装的结论比检查新**，所以 `updateTextOf` 先看 `install`：
+
+| 状态 | 文案 |
+|---|---|
+| `install.running` | 正在从 GitHub 拉取新版本…（要十几秒，别关这个页面） |
+| `install.done` + `changed` | 已更新到 v{to} —— 重启 DSH 后生效（新代码要重启才加载） |
+| `install.done` + `changed` 但版本号没动 | 已拉到最新代码（版本号还是 v{to}）—— 重启 DSH 后生效 |
+| `install.done` + `!changed` | 已经是最新的（v{to}），没有可更新的内容 |
+| `install.error` | 更新没成功：{宿主原文} |
+
+- 「安装更新」按钮**只在 `behind > 0` 且没有 `error`** 时出现（没查到就别摆按钮）；
+  装成功后收起（`canInstallUpdate`）。
+- 失败后按钮**保留**：用户提交完改动还能再试。
+- 装成功顺手把 `update.data` 改成"已是最新（behind 0）"，否则页脚还挂着「落后 N 次提交」。
+- 再点一次「检查更新」**不会**抹掉「已更新，待重启」（`checkUpdate` 用 `{...this.update}` 保留 `install`）。
+
+#### ⑤ 页脚版本号：磁盘 vs 进程（`runningVersion`）
+
+`list` 同时返回两个版本：`version`（磁盘，安装后立刻变）与 `runningVersion`
+（宿主在 **import 那一刻**读一次，`BOOT_VERSION`，之后永不变）。
+
+- 两者不同 → 页脚写 `v0.2.0（重启后生效）`；
+- 相同 → 只写 `v0.1.0`。
+
+为什么必须有：只报磁盘版本会出现"界面写着 v0.2.0、跑的其实是 0.1.0"——本项目最忌讳的状态。
+它还是**免记账**的：不用把"待重启"写进 state.json，重启后两边自然一致，标记自动消失。
+
+#### 验证
+
+- 测试 **150 项全绿**（plugin 86 + client 36 + 预览 5 + smoke 23）。
+  新增 4 条宿主测试（`U4` 快进成功 / `U5` 本地有改动拒绝且不执行 pull / `U6` 不能快进+超时 /
+  `U7` 非 git 检出）+ 4 条客户端测试（查到新版→出现按钮→真打到 `applyUpdate`→明说重启生效 /
+  落后但版本号没变用「新提交」措辞 / 被拒时原样显示理由且按钮保留 / 页脚"待重启"标记）。
+- **真机探针**（真 git，两个一次性仓库，跑完即删）：
+  - 拒绝路径：在本仓库直接跑 `applyUpdate()` → `ok:false`，`dirtyCount:7`，列出
+    `M lib/client.js` 等 7 个文件，**没有执行 pull**；
+  - 成功路径：造"本地落后 1 个提交"的仓库 → `ok:true, changed:true, from:'0.1.0',
+    to:'0.2.0', head:'45cc0c2', restartRequired:true`；再跑一次 → `changed:false`。
