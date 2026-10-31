@@ -2648,6 +2648,145 @@ test('缺陷 31：水位线越界（捕获文件被清理过）不许让抽取�
   console.log('  ✅ 水位线越界：留痕 + 夹齐，不静默停摆，也不整篇重抽');
 });
 
+// ───────── 缺陷 35：长会话后半段被永久漏抽（2026-10-31，Qoder 对比时隔离复现）─────────
+//
+// 原来：只把前 maxInputChars 字送进模型，成功后却 `watermark = full.length` ——
+// 超出部分被标成"已抽"、从没进过模型，下次也不会再抽。extract.js 里还另写死了一个 12000。
+
+/** 记录每次送进模型的原文，按调用次序返回预设结果（字符串 = 正文，{fail} = 抛错）。 */
+function recordingLlm(results) {
+  const inputs = [];
+  let n = 0;
+  return {
+    inputs,
+    stream(options) {
+      const msgs = options && options.messages ? options.messages : [];
+      inputs.push(JSON.stringify(msgs));
+      const r = results[Math.min(n++, results.length - 1)];
+      if (r && r.fail) throw new Error(r.fail);
+      return (async function* gen() {
+        yield { type: 'text-delta', index: 0, text: r };
+        yield { type: 'finish', reason: 'stop' };
+      })();
+    },
+  };
+}
+
+const segCandidate = (title) =>
+  JSON.stringify([{ kind: 'fact', title, summary: 's', body: 'b', anchor: 'a', durability: 'durable', confidence: 0.9, evidence: 'explicit' }]);
+
+async function segFixture(t, tag, text, extract, llm) {
+  const root = path.join(os.tmpdir(), `memfuse-seg-${tag}-${Date.now()}`);
+  t.after(() => fsp.rm(root, { recursive: true, force: true }));
+  const h = fakeCtx({ llm });
+  const api = mod.apply(h.ctx, {
+    root, git: false, verbose: false,
+    extract: { enabled: true, followConversation: false, provider: 'p', model: 'm', autoRunOnStart: false, ...extract },
+  });
+  await api.ready;
+  const file = path.join(root, 'sessions', '2026-10-31.md');
+  await fsp.writeFile(file, text, 'utf8');
+  const readWm = async () =>
+    JSON.parse(await fsp.readFile(path.join(root, '.memory', 'state.json'), 'utf8')).extracted?.['2026-10-31.md'];
+  return { api, root, file, readWm };
+}
+
+test('缺陷 35：长会话按段抽完，尾部必须进过模型（不许被标成已抽却从没看过）', async (t) => {
+  const text = 'HEAD_MARK\n' + 'x'.repeat(23990) + '\nTAIL_MARK';
+  const llm = recordingLlm(['[]']);
+  const { api, readWm } = await segFixture(t, 'all', text, { maxInputChars: 12000 }, llm);
+
+  const res = await api.runExtraction({});
+  assert.equal(res.ok, true, JSON.stringify(res));
+  // 24010 字按 12000 切：第三段只剩 10 字（< minChars 200），并进第二段 → 共 2 次
+  assert.equal(llm.inputs.length, 2, `应调 2 次模型（短尾巴并进上一段），实际 ${llm.inputs.length}`);
+  assert.ok(llm.inputs.some((s) => s.includes('HEAD_MARK')), '开头必须进过模型');
+  assert.ok(llm.inputs.some((s) => s.includes('TAIL_MARK')), '结尾必须进过模型（这正是原来丢掉的部分）');
+  assert.equal(await readWm(), text.length, '全部抽完后水位线才到文件尾');
+
+  const again = await api.runExtraction({});
+  assert.equal(again.files, 0, '抽完之后不该重抽');
+  assert.equal(llm.inputs.length, 2, '不该再调模型');
+  console.log('  ✅ 长会话：分段全抽，短尾巴并进上一段，头尾都进过模型');
+});
+
+test('缺陷 35：maxInputChars 调大必须真生效（extract.js 不许再偷偷截到 12000）', async (t) => {
+  const text = 'A'.repeat(20000) + 'TAIL_MARK';
+  const llm = recordingLlm(['[]']);
+  const { api, readWm } = await segFixture(t, 'cap', text, { maxInputChars: 30000 }, llm);
+
+  await api.runExtraction({});
+  assert.equal(llm.inputs.length, 1, '一段就够，不该切开');
+  assert.ok(llm.inputs[0].includes('TAIL_MARK'), '上限 30000 时第 20000 字之后的内容必须送进模型');
+  assert.equal(await readWm(), text.length);
+
+  const ex = await import('../lib/extract.js');
+  let seen = '';
+  await ex.extractCandidates({ text: 'B'.repeat(15000) + 'C'.repeat(100), maxInputChars: 15000, callModel: async (s) => { seen = s; return '[]'; } });
+  assert.ok(seen.includes('B'.repeat(15000)), `extractCandidates 必须完整保留上限内的 15000 字`);
+  assert.ok(!seen.includes('C'), `超出上限的内容不该送进去`);
+  console.log('  ✅ 上限只有一个来源：调大即生效');
+});
+
+test('缺陷 35：第二段失败 → 水位线停在第一段末尾，下次只重抽失败的那段', async (t) => {
+  const text = 'S1_MARK' + 'a'.repeat(9993) + 'S2_MARK' + 'b'.repeat(9993);
+  const llm = recordingLlm([segCandidate('第一段条目'), { fail: '429 Too Many Requests' }, segCandidate('第二段条目')]);
+  const { api, readWm } = await segFixture(t, 'fail', text, { maxInputChars: 10000 }, llm);
+
+  const first = await api.runExtraction({});
+  assert.equal(first.ok, false, '第二段失败必须报出来');
+  assert.match(first.errors.join(' '), /429/);
+  assert.match(first.errors.join(' '), /\[10000-20000\]/, '错误里要说清是哪一段');
+  assert.equal(await readWm(), 10000, '水位线只能推进到成功的第一段末尾');
+  assert.equal(first.queued, 1, '第一段的候选照常入队');
+
+  const second = await api.runExtraction({ force: true }); // 绕过冷却强制运行
+  assert.equal(second.ok, true, JSON.stringify(second));
+  assert.equal(llm.inputs.length, 3);
+  assert.ok(llm.inputs[2].includes('S2_MARK') && !llm.inputs[2].includes('S1_MARK'), '重试只送第二段，不重抽第一段');
+  assert.equal(await readWm(), text.length);
+  const pending = await api.listPending();
+  assert.deepEqual(pending.map((p) => p.title).sort(), ['第一段条目', '第二段条目'], '两段各一条，不重复');
+  const second2 = pending.find((p) => p.title === '第二段条目');
+  assert.deepEqual(second2.sourceRange, { start: 10000, end: 20000 }, '候选要带出处（文件里的字符范围）');
+  console.log('  ✅ 中途失败：停在成功处、只重抽失败段、候选带 sourceRange');
+});
+
+test('缺陷 35：单轮段数有上限，剩下的下次接着抽；追加的新内容不丢', async (t) => {
+  const text = 'c'.repeat(5000);
+  const llm = recordingLlm(['[]']);
+  const { api, file, readWm } = await segFixture(t, 'limit', text, { maxInputChars: 1000, maxSegmentsPerFile: 2 }, llm);
+
+  await api.runExtraction({});
+  assert.equal(llm.inputs.length, 2, '一轮最多 2 段');
+  assert.equal(await readWm(), 2000, '水位线停在第 2 段末尾');
+
+  await api.runExtraction({});
+  assert.equal(await readWm(), 4000);
+
+  await fsp.appendFile(file, 'NEW_MARK' + 'd'.repeat(992), 'utf8');
+  await api.runExtraction({});
+  assert.equal(await readWm(), 6000, '原来剩下的 1000 字 + 追加的 1000 字都要抽到');
+  assert.ok(llm.inputs.some((s) => s.includes('NEW_MARK')), '追加内容必须进过模型');
+  console.log('  ✅ 段数上限：分轮接着抽，追加内容不丢');
+});
+
+test('缺陷 35：auto 模式候选写入失败 → 这一段不算处理完，下次重抽', async (t) => {
+  const text = 'W'.repeat(3000);
+  const llm = recordingLlm([segCandidate('会写失败的条目')]);
+  const { api, root, readWm } = await segFixture(t, 'wfail', text, { mode: 'auto', maxInputChars: 12000 }, llm);
+
+  // 让 memories/ 无法写入：用同名文件占位
+  await fsp.rm(path.join(root, 'memories'), { recursive: true, force: true });
+  await fsp.writeFile(path.join(root, 'memories'), 'not a dir', 'utf8');
+
+  const res = await api.runExtraction({});
+  assert.equal(res.ok, false, '写不进去必须报出来');
+  assert.match(res.errors.join(' '), /没写进去/);
+  assert.ok(!(await readWm()), `写失败时水位线不许推进，实际 ${await readWm()}`);
+  console.log('  ✅ 写入失败不推进水位线');
+});
+
 test('缺陷 32：用户只说了几个字 → 正常跳过，不许记成故障（假故障会淹掉真问题）', async (t) => {
   const root = path.join(os.tmpdir(), 'memfuse-short-' + Date.now());
   t.after(() => fsp.rm(root, { recursive: true, force: true }));

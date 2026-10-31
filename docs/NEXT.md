@@ -5,6 +5,35 @@
 
 ---
 
+## 0.0e 2026-10-31：长会话后半段被永久漏抽（缺陷 35，已修，待重启）
+
+来源：和 Qoder 国际版做记忆系统对比时，用隔离 fake LLM 复现（对比报告在本仓库**外**的
+`<REPO_DIR>/../.analysis/qoder-intl-20261031/report.md`，不进公开仓库）。
+
+| # | 改动 | 位置 |
+|---|---|---|
+| 1 | 抽取按段推进：每段成功才推进水位线到段尾；单轮最多 `maxSegmentsPerFile`（默认 4）段 | `lib/index.js` `runExtraction` |
+| 2 | 删掉 `extractCandidates` 里写死的 `slice(0, 12000)`，上限由调用方传 | `lib/extract.js` |
+| 3 | 候选写入/入队失败 → 不推进水位线 | `lib/index.js` |
+| 4 | 候选带 `sourceRange` | `lib/extract.js` `toPendingItems` |
+| 5 | 新配置项 `maxSegmentsPerFile`（schema 与 DEFAULT_CONFIG 同步） | `lib/config.js` / `lib/index.js` |
+
+**验证**：155 项全绿（plugin 91 / client 36 / 预览 5 / smoke 23），新增 5 条回归见 spec 缺陷 35。
+`代码版本: 2026-10-31-segmented-watermark` —— **重启 DSH 后**看 status.md 这一行确认新代码已加载。
+
+⚠️ **已有的水位线不会回退**：修复前已经被"误标成已抽"的那部分历史内容，不会自动重抽
+（为了不在 auto 模式下重复写入）。如果想补抽，用 `memfuse_extract` 指定 `file` 手动跑，
+或者手工把 `state.json` 里对应文件的 `extracted` 值改小。
+
+**下一步（没做）**：
+1. 抽取失败的**冷却与跳过**：429/超时记 `cooldownUntil`，到期前不再打模型；
+   模型拒绝 / 输出解析失败这类"内容本身的问题"，同一段连续失败 N 次后跳过并留痕
+   （现在同一段被稳定拒绝时，这个文件会一直卡住）；Block D 改成"暂停到几点 + 原因"。
+2. 召回改两阶段：先在短索引上打分，只读 top-N 正文。
+3. 记录 `projectKey`（先只记录，不迁目录）。
+
+---
+
 ## 0.0d 2026-10-18：安装更新（`git pull --ff-only`）+ "重启生效"提示（已完成）
 
 用户原话：「我想要的是检查到新版本后，可安装新版本，然后提示用户重启生效即可，并不是实时生效。」
