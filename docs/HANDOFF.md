@@ -112,9 +112,9 @@ npm test          # 应该看到 77 + 29 + 5 + 23 = 134 项全绿（全部零 LL
 
 ```
 lib/
-├── index.js    166KB 3629 行  宿主半边入口：6 个工具 + 注入接线 + 宿主探测 + 捕获 + 维护 + status.md（**待拆，见下**）
-├── client.js   125KB 2477 行  浏览器半边：设置页表单 + 回合尾候选卡片（**不拆文件，见下**）
-├── store.js      18KB  489 行  存储层：frontmatter 往返 + 原子写 + drift guard + 锁
+├── index.js    182KB 4010 行  宿主半边入口：6 个工具 + 注入接线 + 宿主探测 + 捕获 + 维护 + status.md（**待拆，见下**）
+├── client.js   131KB 2596 行  浏览器半边：设置页表单 + 回合尾候选卡片（**不拆文件，见下**）
+├── store.js      23KB  593 行  存储层：frontmatter 往返 + 原子写 + drift guard + 锁 + 三级作用域路由
 ├── policy.js     14KB  357 行  策略层（纯函数）：打分 / 准入 / 生命周期 / 反馈 / 升级
 ├── distill.js    13KB  335 行  技能提炼：候选打分 + 标签聚类 + 提炼提示词
 ├── remote.js     15KB  327 行  界面数据通道：手写 Typert 贡献，9 个端点
@@ -127,7 +127,7 @@ lib/
 ├── antiseptic.js  5KB  121 行  反腐烂：重复检测 + stale 计划（标记，不删除）
 ├── queue.js       3KB  105 行  待确认队列：一条一项一文件
 ├── guard.js       3KB   68 行  凭据扫描：scanThreat / redactThreats
-└── paths.js       1KB   42 行  路径布局（所有存储位置集中在这里）
+└── paths.js       2KB   63 行  路径布局（所有存储位置集中在这里；含 user/global 两个作用域根）
 ```
 
 **纯函数层**（`policy` / `recall` / `inject` / `antiseptic` / `distill` 的解析部分）

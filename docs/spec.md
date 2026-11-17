@@ -2718,8 +2718,21 @@ fire-and-forget，落定之后没有第二次写盘。手动调 `memfuse_extract
 第二段 429 → 水位线停在第一段末尾、下次只重抽第二段、候选带 `sourceRange` / 单轮段数上限 + 追加内容不丢 /
 auto 模式写入失败不推进水位线。原来的隔离复现脚本复跑：同一个 24024 字文件，模型调用 2 次，头尾都送进了模型。
 
-⚠️ **已知未覆盖**：抽取失败没有冷却（429/超时下次启动立刻重打），且同一段若被模型稳定拒绝，
-这个文件会一直卡在这一段。下一步单独修（见 `docs/NEXT.md` §0.0e）。
+⚠️ **曾经的缺口（2026-10-31 已补，commit `0339c4f`）**：抽取失败原先没有冷却与跳过，
+同一段被模型稳定拒绝时那个文件会一直卡住。现在的行为（`lib/config.js` 的
+`extract.skipAfterFailures` 默认 3 + `lib/index.js` 的冷却/熔断）：
+
+| 失败类型 | 冷却起点 | 退避 |
+|---|---|---|
+| `rate_limit`（429；per-model cooldown 那种 400 也归这类） | 10 分钟 | 同目标连续失败**指数翻倍**，封顶 2 小时 |
+| `transient`（超时 / 连接断） | 5 分钟 | 同上 |
+| `config`（模型 / 凭据配置错） | 30 分钟 | 同上，但**重启即失效**（`bootId` 变了就放行） |
+
+- 冷却**只绑同一个目标**（`provider/model`）：换模型立刻重试，不会因为旧模型的错被一起连坐；
+- 同一段连续失败 `skipAfterFailures` 次 → 跳过该段，记进 `state.skippedSegments`（status.md 列最近 10 个）；
+- **熔断**：连续跳过 3 段就停下来告警「当前抽取模型可能不适合这个任务（比如把会话当对话来聊、
+  或耗尽推理预算），建议换一个」，不再无限跳过；
+- `status.md` 会写「冷却: 暂停到 …（限流；连续失败 N 次）/ 原因: …」与「段失败计数: N 个段…」。
 
 ### 设置页一级入口「记忆」+ 默认开启学习（2026-10-17，用户要求）
 
@@ -2988,3 +3001,112 @@ op 是 `{op:'set', path:['extract','enabled'], value:true}`（字符串 `'true'`
     `M lib/client.js` 等 7 个文件，**没有执行 pull**；
   - 成功路径：造"本地落后 1 个提交"的仓库 → `ok:true, changed:true, from:'0.1.0',
     to:'0.2.0', head:'45cc0c2', restartRequired:true`；再跑一次 → `changed:false`。
+
+### 三级作用域 workspace / user / global（2026-11-01，含缺陷 36）
+
+#### ① 设计：作用域决定**落在哪个根**，不是只写进 frontmatter
+
+| 作用域 | 根目录 | 用途 |
+|---|---|---|
+| `workspace`（默认） | `<DSH_HOME>/memory`（或 `config.root`） | 只在当前工作区可见 |
+| `user` | `<DSH_HOME>/memfuse-user` | 跨工作区，跟人走 |
+| `global` | `<DSH_HOME>/memfuse-global` | 全局共享 |
+
+查询优先级 **workspace → user → global**：同一个 id 在多个根都出现时只认第一个
+（当前工作区写的那份应该压住同名的用户级/全局级记录）。
+
+#### ② 缺陷 36：上一版把「作用域」做成了纯标签（真机探针抓的）
+
+2026-10-31 那 4 个提交（`996dd15`…`383fc6e`）给 `memfuse_write` 加了 `scope` 参数、
+给 `paths.js` 加了两个根，但 **`write()` 没把 `scope` 传给 `filePath()`**：
+
+```
+user 写入    <HOME>\memory\memories\u1.md       ← 错：进了 workspace
+global 写入  <HOME>\memory\memories\g1.md       ← 错
+userRoot 里有文件?   false                       ← memfuse-user/ 永远是空的
+list → g1:workspace, u1:workspace, w1:workspace  ← 全被报成 workspace
+```
+
+于是「用户级跨工作区共享」**一次都没生效**，而 frontmatter 里明明写着 `scope: user` ——
+这是本项目最忌讳的那类失败：**功能存在但从不生效**（硬规则 4）。连带还有三条：
+
+- `read(id)` / `remove(id, kind)` 只查 workspace 根 → 真放到用户级的记录**读不到、删不掉**；
+- `init()` 无条件 mkdir 两个根 → **跑一次 `npm test` 就在真实 `~/.dsh` 里多两个空目录**
+  （本机实测：`memfuse-user` / `memfuse-global` 各 0 个文件）；
+- `rebuildIndex()` 把所有作用域的条目写进 **workspace 的 index.md** → 派生视图张冠李戴。
+
+#### ③ 修法
+
+| 位置 | 改动 |
+|---|---|
+| `store.write()` | `scope` 先过 `VALID_SCOPES`（非法回落 workspace），再 `filePath(id, kind, scope)`；frontmatter 里**写死生效值**（不再留 `null`） |
+| `store.read(id, kind, scope?)` | 按 `rootsFor(scope)` 依次找；返回的 `scope` **以目录为准**（文件被手工搬过时位置才是事实） |
+| `store.remove(id, kind, scope?)` | 同上，找到第一条就停 —— 「读到哪份就删哪份」，不连带删别的作用域的同名 id |
+| `store.ensureRoot(scope)` | 目录**按需创建**（只有 workspace 在 `init()` 里建）→ 没人用这两级就不在主目录里造空文件夹 |
+| `store.rebuildIndex()` | 每个根写**自己的** `index.md`（`renderIndex()` 提成纯函数，三个根共用一套格式） |
+| `paths.userMemoryRoot(home?)` / `globalMemoryRoot(home?)` | 父目录可注入；`MemoryStore` 用 `config.dshHome` 覆盖 → **测试不许碰真实 `~/.dsh`** |
+| `index.js` | 三处调用补上 `scope`：定时清理的 `remove`、`touchMemory` 的 `read`、`memfuse_write mode=delete` 的 `remove` |
+
+#### ④ 验证
+
+- 测试 **158 项全绿**（plugin 94 + client 36 + 预览 5 + smoke 23）。新增 3 条（`S1`–`S3`）：
+  - `S1` 三级落盘根 + `read`/`list`/`remove` 按作用域走 + **索引每个根一份**（workspace 索引不许混入
+    用户级/全局级条目）；
+  - `S2` 同名 id 落在两级：`list` 只出现一次、`workspace` 优先、删除只删一份、删完回落到下一级；
+  - `S3` 没写过 user/global 就不建目录（防「跑测试污染主目录」）+ 非法 scope 回落 workspace。
+- 真机探针（临时 `DSH_HOME`，跑完即删）修前/修后对比：
+
+```
+修前: user 写入 <HOME>\memory\memories\u1.md ; userRoot 里有文件? false ; list → 全是 workspace
+修后: user 写入 <HOME>\memfuse-user\memories\u1.md ; read(u1) → user ; list → u1:user, g1:global
+      remove(u1) → true，只删用户级那份
+```
+
+#### ⑤ 诚实边界
+
+- **已存在的错误数据不会自动搬家**：修复前用 `scope:'global'` 写的记录还躺在 workspace 根里，
+  只是从此被当作 workspace 记忆（照样能读能召回）。要真升级成全局级，把文件移到
+  `<DSH_HOME>/memfuse-global/memories/` 再重建索引即可（frontmatter 里本来就写着 scope）。
+- 用户级/全局级**没有** `sessions/`、`pending/`、`pending-skills/` —— 捕获与抽取只发生在
+  workspace，这两级是「人写进去的长期结论」，不是自动学习的产物。
+
+
+### 技能卡片展示记账（2026-11-17/18，缺陷 37）
+
+用户反馈：最近没有再弹出生成技能的卡片。
+
+#### 现场证据与判断
+
+- 当前客户端 Inspect 确认 conversation.chat.turnTail 已注册，dsh-memfuse#suggestions active；宿主 remoteChannel 有 9 个端点，runtimeFaults 为空。
+- memfuse_skill action=list 返回 4 组建议，待确认技能草稿为 0。四个 key 全部在 skillSeen，因此 selectUiSuggestions 过滤后没有待弹候选。
+- 有两组是在 2026-11-17 20:37:35（Asia/Shanghai）与另一张卡片同批记 seen；那张卡片约 6 秒后收到 dismiss。现有“每次最多一组，其余 restKeys 同批抑制”的约定可以解释这部分记录，不能把所有历史 seen 都推断成误标。
+- 抽取模型超时是另一条故障。技能建议判定为零 LLM，现有四组仍能列出，超时本身不解释已有候选被 UI 过滤。
+- 最新安装宿主仍使用 timeline.turnOrder，且 TurnLocation 形状与现有 turnIdOf 兼容；未发现这次属于槽位名称或回合类型变更。
+
+#### 隔离复现的缺陷
+
+1. 插件 apply 时无条件 load；load 发布快照后无条件 markSeen。只运行 apply、组件调用次数为 0，就出现 list → markSeen([k1,k8,k9])。加载成功被错当成了展示成功。
+2. 历史回合虽返回 null，touch 仍在末回合判断之前，照样加载并记 seen。
+3. 同回合已经固定候选 A 时，晚到 B 不会被 claim，却仍被 load 标记 seen；随后空刷新让 B 永久错过展示。
+4. feed 没有卸载清理，重试/迟到请求可能继续工作。修复时又通过独立审阅发现：模块级 pinnedCard 持有旧 feed 回调，卸载后同回合重建会复用已失效的 ref，需显式绑定 owner。
+
+#### 修复
+
+- load 只获取新数据，不再创建展示记录。只允许重试此前由可见卡片确认过的 pendingSeen。
+- 候选卡片领取固定批次的 rows、restKeys 后，由 DOM ref 与 IntersectionObserver 确认节点已连接、页面可见、存在正面积视口交集，再确认这一批。旧回调与解绑节点无效。
+- 缺少 IntersectionObserver 时使用视口几何检查，加 scroll/resize/visibilitychange 监听；解绑和卸载时全部释放。该降级路径不额外计算所有祖先的 overflow 裁剪，现代浏览器走原生 observer。
+- 已确认/待确认集合过滤延迟返回的旧 list；确认失败保留原始原因，退避重试同一批。新候选不会被旧卡片的异步回调误确认。
+- 同回合晚到的候选留在待领取快照中，下一回合再取；未展示前保持未读。
+- 历史回合不触发 touch；feed.dispose 清理重试与可见性监听、作废在飞结果；固定卡片和结果说明绑定 feed owner，重挂载可重新领取。
+- 同批 restKeys 抑制、用户 dismiss、草稿预览与安装流程保持原约定。
+
+#### 验证与边界
+
+- 新增 7 项客户端回归，覆盖启动/历史回合零误标、提交/离屏/隐藏页、进入视口一次确认、ref 解绑及无 IO 兜底、同回合晚到候选、确认在飞/失败重试、卸载迟到结果、同回合重挂载。
+- 首个回归修前明确失败（启动 markSeen 为 1，预期 0），修后通过。
+- 完整 npm test：**165 项通过**（plugin 94 + client 43 + preview 5 + smoke 23）；语法检查与 git diff --check 通过。
+- 独立代码及 UI/UX 审阅完成，主流程/样式/文案未变。现有离线预览适配 DOM ref 提交，仅作为回归夹具，不当成运行界面截图。
+- 运行中的客户端槽位已核实；Tabbit 打开本机 GUI 得到 HTTP 401 登录校验页，因此本次没有完成已登录桌面页的实际视觉验收。没有搜索登录令牌、修改 profile 或自动重启。
+- 旧 skillSeen 没有“真正展示/仅预取”的区分证据，故不自动清空；skillDismissed 和记忆内容保持原样。修复防止未来误标，旧四组不会因此自动重弹，仍可用 memfuse_skill action=list 查看或按用户要求提炼。
+- 插件安装目录已确认 junction 指向本仓库。让当前 desktop 加载此次客户端改动需重新加载客户端 bundle，按项目既有流程重启 DSH 验证；本轮尚未重启。
+- 子审阅在隔离环境跑到过一次既有捕获用例 30c 的时序失败，单例复跑通过；主代理修前全套 158、修后全套 165 均通过。该偶发现象与本次客户端改动的关联未证实。

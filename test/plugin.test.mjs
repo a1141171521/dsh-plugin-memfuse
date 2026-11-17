@@ -342,6 +342,105 @@ test('drift guard：手改坏的文件被拒绝重写并留下备份', async (t)
   console.log('  ✅ drift guard：拒绝重写 + 备份 + 原文件完好');
 });
 
+test('作用域 S1：user / global 真的写进各自的根，read / list / remove 都认得', async (t) => {
+  const home = path.join(os.tmpdir(), `memfuse-scope-${Date.now()}`);
+  t.after(() => fsp.rm(home, { recursive: true, force: true }));
+  // dshHome 必须注入：否则 user/global 两级会写到真实的 ~/.dsh 里
+  const store = new storeMod.MemoryStore({ root: path.join(home, 'memory'), git: false, dshHome: home }, { log() {}, warn() {} });
+  await store.init();
+
+  await store.write({ id: 'w1', kind: 'fact', scope: 'workspace', title: 'w', body: 'b' });
+  await store.write({ id: 'u1', kind: 'fact', scope: 'user', title: 'u', body: 'b' });
+  await store.write({ id: 'g1', kind: 'skill', scope: 'global', title: 'g', body: 'b' });
+
+  // ① 落盘位置 = 功能是否真的实现（上一版只把 scope 写进 frontmatter，文件全在 workspace）
+  assert.ok(fs.existsSync(path.join(home, 'memory', 'memories', 'w1.md')), 'workspace 落在默认根');
+  assert.ok(fs.existsSync(path.join(home, 'memfuse-user', 'memories', 'u1.md')), 'user 必须落在 memfuse-user');
+  assert.ok(fs.existsSync(path.join(home, 'memfuse-global', 'skills', 'g1.md')), 'global 的 skill 落在 memfuse-global/skills');
+  assert.ok(
+    !fs.existsSync(path.join(home, 'memory', 'memories', 'u1.md')),
+    'user 级记忆**不许**再落在 workspace 根（那就等于没有跨工作区共享）',
+  );
+
+  // ② 读回来要带上真实作用域
+  const u = await store.read('u1');
+  assert.equal(u.scope, 'user');
+  assert.ok(u._path.includes('memfuse-user'), `read 应读到用户级那份，实际 ${u._path}`);
+
+  // ③ list 按目录判作用域，三级都要出现
+  const scopes = Object.fromEntries((await store.list()).map((r) => [r.id, r.scope]));
+  assert.deepEqual(scopes, { w1: 'workspace', u1: 'user', g1: 'global' });
+  assert.deepEqual(
+    (await store.list({ scopes: ['workspace'] })).map((r) => r.id),
+    ['w1'],
+    'list 要支持只查某一级（注入/召回可以按需收窄）',
+  );
+
+  // ④ 索引也是每个根一份：workspace 的 index.md 不许列出用户级/全局级的条目
+  //    （否则派生视图会声称「这条记忆在这个工作区里」，而它其实不在）
+  await store.rebuildIndex();
+  const wsIndex = await fsp.readFile(path.join(home, 'memory', 'index.md'), 'utf8');
+  assert.ok(wsIndex.includes('w1'), 'workspace 索引要有 workspace 那条');
+  assert.ok(!wsIndex.includes('u1'), 'workspace 索引不许混入用户级条目');
+  assert.ok(!wsIndex.includes('g1'), 'workspace 索引不许混入全局级条目');
+  assert.ok(
+    (await fsp.readFile(path.join(home, 'memfuse-user', 'index.md'), 'utf8')).includes('u1'),
+    '用户级根要有自己的 index.md',
+  );
+  assert.ok(
+    (await fsp.readFile(path.join(home, 'memfuse-global', 'index.md'), 'utf8')).includes('g1'),
+    '全局级根要有自己的 index.md',
+  );
+
+  // ⑤ 删除要删对根
+  assert.equal(await store.remove('u1', 'fact', 'user'), true);
+  assert.ok(!fs.existsSync(path.join(home, 'memfuse-user', 'memories', 'u1.md')), '删的必须是用户级那份');
+  assert.equal(await store.read('u1'), null, '删干净之后读不到');
+  console.log('  ✅ S1 三级作用域：落盘根 / read / list / remove 全部按作用域走');
+});
+
+test('作用域 S2：同 id 落在两级时按 workspace→user→global 取第一条，删除也只删那一条', async (t) => {
+  const home = path.join(os.tmpdir(), `memfuse-scope-dup-${Date.now()}`);
+  t.after(() => fsp.rm(home, { recursive: true, force: true }));
+  const store = new storeMod.MemoryStore({ root: path.join(home, 'memory'), git: false, dshHome: home }, { log() {}, warn() {} });
+  await store.init();
+
+  const rec = (scope, title) => ({ id: 'dup', kind: 'fact', scope, title, body: `${scope}-body` });
+  await store.write(rec('workspace', '工作区那份'));
+  await store.write(rec('user', '用户级那份'));
+
+  const seen = (await store.list()).filter((r) => r.id === 'dup');
+  assert.equal(seen.length, 1, '同 id 只该出现一次（否则记忆条数会虚高）');
+  assert.equal(seen[0].scope, 'workspace', '优先级：workspace 压住 user');
+  assert.equal((await store.read('dup')).title, '工作区那份');
+
+  // 不带 scope 删除 = 删「read 会读到的那一份」
+  assert.equal(await store.remove('dup', 'fact'), true);
+  assert.ok(fs.existsSync(path.join(home, 'memfuse-user', 'memories', 'dup.md')), '别作用域里的同名记录不许被连带删掉');
+  const now = await store.read('dup');
+  assert.equal(now.scope, 'user', 'workspace 那份删掉后应回落到用户级');
+  assert.equal(now.title, '用户级那份');
+  console.log('  ✅ S2 同名 id：workspace 优先、删除只删一份、删完自动回落到下一级');
+});
+
+test('作用域 S3：没用到 user/global 时不在主目录里建空目录；非法 scope 回落 workspace', async (t) => {
+  const home = path.join(os.tmpdir(), `memfuse-scope-lazy-${Date.now()}`);
+  t.after(() => fsp.rm(home, { recursive: true, force: true }));
+  const store = new storeMod.MemoryStore({ root: path.join(home, 'memory'), git: false, dshHome: home }, { log() {}, warn() {} });
+  await store.init();
+
+  await store.write({ id: 'w1', kind: 'fact', scope: 'workspace', title: 'w', body: 'b' });
+  assert.ok(!fs.existsSync(path.join(home, 'memfuse-user')), '没写过用户级就不该建目录（跑测试会污染真实 ~/.dsh）');
+  assert.ok(!fs.existsSync(path.join(home, 'memfuse-global')), '没写过全局级就不该建目录');
+
+  // 非法 scope：当成 workspace，并且 frontmatter 要写死生效值（别留 null）
+  const p = await store.write({ id: 'x1', kind: 'fact', scope: 'galaxy', title: 'x', body: 'b' });
+  assert.ok(p.includes(path.join('memory', 'memories')), `非法 scope 应回落 workspace，实际 ${p}`);
+  const raw = await fsp.readFile(p, 'utf8');
+  assert.match(raw, /^scope: workspace$/m, 'frontmatter 里的 scope 必须是生效值，不能是空的');
+  console.log('  ✅ S3 目录按需创建；非法 scope 回落 workspace 且 frontmatter 不留空');
+});
+
 test('反馈生产端：memfuse_recall 累加 recalled 并弱续期', async (t) => {
   const root = path.join(os.tmpdir(), `memfuse-recall-${Date.now()}`);
   t.after(() => fsp.rm(root, { recursive: true, force: true }));

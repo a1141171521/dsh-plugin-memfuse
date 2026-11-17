@@ -299,7 +299,7 @@ npm run demo          # 看产出物（index.md / status.md）长什么样
 | 工具 | 说明 |
 |---|---|
 | `memfuse_recall` | 检索记忆。`level=l0/l1/l2` 控制详情层级（渐进披露），返回 JSON |
-| `memfuse_write` | **唯一写入路径**。`mode=add/replace/delete`，`P0` / 用户资产受保护 |
+| `memfuse_write` | **唯一写入路径**。`mode=add/replace/delete`，`P0` / 用户资产受保护；`scope=workspace`（默认，只在本工作区）/ `user`（跨工作区跟人走）/ `global`（全局共享）—— 三级各自存在独立目录里 |
 | `memfuse_status` | 看**真实管线健康**（而不是开关状态）：条数、优先级分布、最近成功/失败、待确认队列 |
 | `memfuse_extract` | 手动跑一轮抽取（默认不跑）。`dryRun` 只看不落盘 |
 | `memfuse_feedback` | 回报一条记忆本轮有没有用 —— **这是学习闭环唯一的学习信号** |

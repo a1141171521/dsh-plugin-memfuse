@@ -5,6 +5,55 @@
 
 ---
 
+## 0.0g 2026-11-17/18：技能卡片误记已展示（缺陷 37，已修，待重启验证）
+
+- 直接状态：现有四组候选都在 skillSeen，正常去重规则会隐藏它们；历史记录含同批 restKeys 抑制，保留不清空。
+- 确定 bug：仅 apply/load、零组件渲染就写 markSeen；同回合晚到新候选也会被未展示即记账。
+- 修复：读取不再新增展示记录；固定批次在真实 DOM 已连接、页面可见且进入视口后才确认；确认失败重试、晚到请求去重；卸载清 timer/observer；pin/note 绑定 feed owner。
+- 回归：新增 7 条，完整 **165 项通过（94 + 43 + 5 + 23）**；独立代码与 UI/UX 审阅完成。
+- live Slots active 已核实，junction 指向本仓库；Tabbit 访问 GUI 返回 401，已登录页面视觉验收待重启后完成。
+- 旧 seen/dismissed/记忆未重置，故现有四组不会自动重弹；仍可 action=list 查看。要恢复历史卡片展示应作为明确的数据修复操作，先备份再通过宿主操作，避免运行期状态覆盖。
+- **下一步**：重启 DSH 后在已登录页面验证新候选可见 → 一次记账，后台/离屏保持未读。没有自动重启或提交。
+- 详情见 spec 的“技能卡片展示记账（缺陷 37）”。
+
+---
+
+## 0.0f 2026-11-01：三级作用域修真（缺陷 36，已完成，待重启）
+
+来源：`git pull` 之后发现 2026-10-31 那 4 个提交（`996dd15`…`383fc6e`）给
+`memfuse_write` 加了 `scope` 参数，但**只写了 frontmatter、没换存储目录** ——
+`user` / `global` 两个根永远是空的，「跨工作区共享」一次都没生效，而 `list()` 按目录判作用域，
+于是全被报成 `workspace`。这些提交也没带任何测试与文档。
+
+| # | 改动 | 位置 |
+|---|---|---|
+| 1 | `write()` 用 `scope` 选根（非法回落 workspace），frontmatter 写死生效值 | `lib/store.js` |
+| 2 | `read()` / `remove()` 按 `workspace → user → global` 找，`scope` 以目录为准；删的时候找到第一份就停 | `lib/store.js` |
+| 3 | 新增 `rootsFor()` / `rootOfScope()` / `ensureRoot()`：目录**按需创建**，没用到就不建 | `lib/store.js` |
+| 4 | `rebuildIndex()` 每个根写自己的 `index.md`（`renderIndex()` 提成纯函数） | `lib/store.js` |
+| 5 | `userMemoryRoot(home?)` / `globalMemoryRoot(home?)` 父目录可注入；`MemoryStore` 用 `config.dshHome` | `lib/paths.js` + `lib/store.js` |
+| 6 | 三处调用补 `scope`（定时清理 / `touchMemory` / `memfuse_write mode=delete`） | `lib/index.js` |
+
+**验证**：158 项全绿（plugin 94 / client 36 / 预览 5 / smoke 23），新增 3 条 `S1`–`S3`
+（三级落盘根 + 索引分根 / 同名 id 优先级与只删一份 / 目录按需创建 + 非法 scope 回落）。
+真机探针（临时 `DSH_HOME`）：修前 3 条记录全落在 `memory/memories`、`memfuse-user` 为空、
+`list` 全报 workspace；修后各归其根，`read`/`list`/`remove` 都按作用域走。
+
+**要重启 DSH 生效。**
+
+⚠️ 三条别改回去：
+1. **`scope` 必须参与选目录** —— 只写进 frontmatter 就等于没实现（缺陷 36 的原样）；
+2. **目录按需建**：`init()` 里无条件 mkdir 会让 `npm test` 在真实 `~/.dsh` 里造空目录；
+3. **索引每个根一份**：把用户级/全局级条目写进 workspace 的 `index.md`，等于让派生视图撒谎。
+
+**下一步（没做）**：
+1. 作用域迁移工具：把修复前误写的 `scope: user|global` 记录搬到对应根（本机有 2 条，
+   `m_mvdxbrn7_lxkpb2`、`m_mvtp3pju_i1b6bn`，见 spec 缺陷 36 ⑤）。
+2. 抽取时判断「这条该进哪一级」—— 目前自动学习永远写 workspace，`user`/`global` 只能人手写。
+3. `memfuse_status` 分作用域报计数（现在只报总数）。
+
+---
+
 ## 0.0e 2026-10-31：长会话后半段被永久漏抽（缺陷 35，已修，待重启）
 
 来源：和 Qoder 国际版做记忆系统对比时，用隔离 fake LLM 复现（对比报告在本仓库**外**的

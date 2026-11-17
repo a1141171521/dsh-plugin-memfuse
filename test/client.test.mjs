@@ -126,6 +126,7 @@ async function loadClientHalf({
   suggestions = null,
   /** 覆盖 `list` 的实现（用来模拟宿主报错）。 */
   listImpl = null,
+  markSeenImpl = null,
   /** 覆盖 `distill` 的实现（缺陷 25：提炼成技能那条路）。 */
   distillImpl = null,
   /** 覆盖 `checkUpdate` 的实现（检查更新那条路）。 */
@@ -136,6 +137,7 @@ async function loadClientHalf({
   mutateOk = true,
 } = {}) {
   const registrations = [];
+  const disposers = [];
   const injected = [];
   const writes = [];
   const mounted = []; // 客户端 Remote 贡献
@@ -213,6 +215,7 @@ async function loadClientHalf({
     },
     markSeen: async (keys) => {
       remoteCalls.push(['markSeen', keys]);
+      if (markSeenImpl) return markSeenImpl(keys);
       return { ok: true, value: { ok: true } };
     },
     dismiss: async (key) => {
@@ -370,6 +373,7 @@ async function loadClientHalf({
     },
     effect: (fn) => {
       const disposer = fn();
+      if (typeof disposer === 'function') disposers.push(disposer);
       return typeof disposer === 'function' ? disposer : () => {};
     },
     slots: {
@@ -420,6 +424,7 @@ async function loadClientHalf({
     scope,
     mounted,
     remoteCalls,
+    dispose: async () => { for (const off of disposers.reverse()) await off(); },
     /** 真字典 + 真插值（不是 `t:key` 那种占位，见 makeTranslator 的注释）。 */
     t: (key, params) => translate('settings.memfuse', key, params),
   };
@@ -899,6 +904,162 @@ test('client half：卡片用**真字典**渲染得出来（函数型文案会�
   console.log('  ✅ 真字典渲染：标题 + 成员 + 适用场景 + 好处 + 两个短按钮 都在');
 });
 
+/** 只模拟浏览器提交/可见回执；渲染函数本身不代表 DOM 已提交。 */
+function attachCard(tree, { io = true, hidden = false, offscreen = false } = {}) {
+  const events = new Map();
+  const observers = [];
+  const add = (name, fn) => { if (!events.has(name)) events.set(name, new Set()); events.get(name).add(fn); };
+  const remove = (name, fn) => events.get(name)?.delete(fn);
+  const win = { innerWidth: 1000, innerHeight: 800, addEventListener: add, removeEventListener: remove };
+  if (io) win.IntersectionObserver = class {
+    constructor(callback) { this.callback = callback; this.disconnected = false; observers.push(this); }
+    observe(node) { this.node = node; }
+    disconnect() { this.disconnected = true; }
+  };
+  const doc = { defaultView: win, visibilityState: hidden ? 'hidden' : 'visible', addEventListener: add, removeEventListener: remove };
+  const node = { ownerDocument: doc, isConnected: true,
+    getBoundingClientRect: () => ({ width: 400, height: 120, left: 10, right: 410, top: offscreen ? 1000 : 10, bottom: offscreen ? 1120 : 130 }) };
+  tree.props.ref(node);
+  return {
+    doc, node, observers,
+    intersect(value = true) { for (const o of observers) o.callback([{target: node, isIntersecting: value, intersectionRatio: value ? 1 : 0}]); },
+    show() { doc.visibilityState = 'visible'; for (const fn of [...(events.get('visibilitychange') ?? [])]) fn(); },
+    scrollIntoView() { offscreen = false; for (const fn of [...(events.get('scroll') ?? [])]) fn(); },
+    detach() { node.isConnected = false; tree.props.ref(null); },
+    listenerCount() { return [...events.values()].reduce((n, set) => n + set.size, 0); },
+  };
+}
+let feedClock = Date.now();
+async function refreshFeed(face) {
+  const realNow = Date.now;
+  feedClock = Math.max(feedClock + 2000, realNow() + 2000);
+  Date.now = () => feedClock;
+  try { face.touch(); } finally { Date.now = realNow; }
+  await settle();
+}
+
+test('缺陷 37：提交、离屏、后台页都不算展示；可见后仅确认固定批次一次', async () => {
+  const h = await loadClientHalf(); h.exports.apply(h.ctx); await settle();
+  const { reg, props } = cardProps(h);
+  const tree = reg.Component(props);
+  assert.equal(h.remoteCalls.filter(c => c[0] === 'markSeen').length, 0);
+  const view = attachCard(tree, {hidden:true});
+  view.intersect(false); view.intersect(true); await settle();
+  assert.equal(h.remoteCalls.filter(c => c[0] === 'markSeen').length, 0);
+  view.show(); await settle();
+  assert.deepEqual(h.remoteCalls.filter(c => c[0] === 'markSeen'), [['markSeen',['k1','k8','k9']]]);
+  view.intersect(true); tree.props.ref(view.node); await settle();
+  assert.equal(h.remoteCalls.filter(c => c[0] === 'markSeen').length, 1);
+  assert.equal(view.listenerCount(), 0);
+  assert.ok(view.observers.every(o => o.disconnected));
+  view.detach(); await h.dispose();
+});
+
+test('缺陷 37：ref 解绑后迟到的可见回调无效；无 IO 时离屏仍不记账', async () => {
+  const h = await loadClientHalf(); h.exports.apply(h.ctx); await settle();
+  const { reg, props } = cardProps(h);
+  const tree = reg.Component(props);
+  const old = attachCard(tree); old.detach(); old.intersect(true); await settle();
+  assert.equal(h.remoteCalls.filter(c => c[0] === 'markSeen').length, 0);
+  assert.equal(old.listenerCount(), 0);
+  const fallback = attachCard(tree, {io:false, offscreen:true}); await settle();
+  assert.equal(h.remoteCalls.filter(c => c[0] === 'markSeen').length, 0);
+  fallback.scrollIntoView(); await settle();
+  assert.equal(h.remoteCalls.filter(c => c[0] === 'markSeen').length, 1);
+  assert.equal(fallback.listenerCount(), 0);
+  fallback.detach(); await h.dispose();
+});
+
+test('缺陷 37：同回合后到候选留给下一回合，旧卡片只确认自己的批次', async () => {
+  const payload = {groups:[{key:'A', seedTitle:'候选A', seen:false}], restKeys:['A-rest']};
+  const h = await loadClientHalf({listImpl:async()=>({ok:true,value:structuredClone(payload)})});
+  h.exports.apply(h.ctx); await settle();
+  const { reg, props, face } = cardProps(h);
+  const render = turn => reg.Component({...props, sessionId:'late-groups', turn,
+    useChat: select => select({timeline:{turnOrder:[turn]}})});
+  const first = render(1); const view = attachCard(first);
+  await settle();
+  payload.groups = [{key:'B', seedTitle:'候选B', seen:false}]; payload.restKeys = ['B-rest'];
+  await refreshFeed(face);
+  assert.match(textOfTree(render(1)), /候选A/);
+  assert.doesNotMatch(textOfTree(render(1)), /候选B/);
+  view.intersect(true); await settle();
+  assert.deepEqual(h.remoteCalls.filter(c=>c[0]==='markSeen'), [['markSeen',['A','A-rest']]]);
+  const next = render(2); assert.match(textOfTree(next), /候选B/);
+  const second = attachCard(next); second.intersect(true); await settle();
+  assert.deepEqual(h.remoteCalls.filter(c=>c[0]==='markSeen').map(c=>c[1]), [['A','A-rest'],['B','B-rest']]);
+  view.detach(); second.detach(); await h.dispose();
+});
+
+test('缺陷 37：展示记账在飞时旧 list 不重复投递；失败留原因且可重试', async () => {
+  let resolveAck; let attempts=0;
+  const h = await loadClientHalf({markSeenImpl: async () => {
+    attempts++;
+    if(attempts===1) await new Promise(resolve=>{resolveAck=resolve;});
+    if(attempts===1) throw new Error('seen write failed');
+    return {ok:true};
+  }});
+  h.exports.apply(h.ctx); await settle();
+  const {reg,props,face}=cardProps(h);
+  const tree=reg.Component({...props,turn:1,sessionId:'ack-race'});const view=attachCard(tree);
+  view.intersect(true);await settle();
+  await refreshFeed(face);
+  assert.equal(face.hooks.memfuseSuggestions.getSnapshot().visible.length,0);
+  resolveAck();await settle();
+  assert.match(face.hooks.memfuseSuggestions.getSnapshot().error,/seen write failed/);
+  await refreshFeed(face);await settle();
+  assert.equal(attempts,2);
+  assert.equal(face.hooks.memfuseSuggestions.getSnapshot().error,null);
+  assert.deepEqual(h.remoteCalls.filter(c=>c[0]==='markSeen').map(c=>c[1]), [['k1','k8','k9'],['k1','k8','k9']]);
+  view.detach();await h.dispose();
+});
+
+test('缺陷 37：卸载清理可见监听并忽略晚到 list', async () => {
+  let release;let count=0;
+  const h=await loadClientHalf({listImpl:async()=>{
+    if(++count>1) await new Promise(resolve=>{release=resolve;});
+    return {ok:true,value:{groups:[{key:'A',seedTitle:'卸载候选'}],restKeys:[]}};
+  }});
+  h.exports.apply(h.ctx);await settle();
+  const {reg,props,face}=cardProps(h);const view=attachCard(reg.Component(props));
+  await settle(); // 卡片 touch 启动的第二次 list 尚未返回。
+  await h.dispose();view.intersect(true);release?.();await settle();
+  assert.equal(view.listenerCount(),0);
+  assert.ok(view.observers.every(o=>o.disconnected));
+  assert.equal(h.remoteCalls.filter(c=>c[0]==='markSeen').length,0);
+  const before=h.remoteCalls.length;face.touch();face.wake();await settle();
+  assert.equal(h.remoteCalls.length,before);
+});
+
+test('缺陷 37：同一回合重新挂载插件后，卡片确认属于新 feed', async () => {
+  const h=await loadClientHalf();h.exports.apply(h.ctx);await settle();
+  const first=cardProps(h);const turn={turn:7,sessionId:'remount'};
+  const old=attachCard(first.reg.Component({...first.props,...turn}));
+  await h.dispose();h.registrations.length=0;
+  h.exports.apply(h.ctx);await settle();
+  const fresh=cardProps(h);
+  const view=attachCard(fresh.reg.Component({...fresh.props,...turn}));
+  old.intersect(true);await settle();
+  assert.equal(h.remoteCalls.filter(c=>c[0]==='markSeen').length,0);
+  view.intersect(true);await settle();
+  assert.equal(h.remoteCalls.filter(c=>c[0]==='markSeen').length,1);
+  view.detach();await h.dispose();
+});
+
+test('缺陷 37：只有加载或渲染历史回合时，不得把候选标为已展示', async () => {
+  const h = await loadClientHalf();
+  h.exports.apply(h.ctx);
+  await settle();
+  const { reg, props } = cardProps(h);
+  assert.equal(h.remoteCalls.filter((c) => c[0] === 'markSeen').length, 0,
+    '启动预取不代表用户看过卡片');
+  assert.equal(reg.Component({ ...props, turn: 1,
+    useChat: (select) => select({ timeline: { turnOrder: [1, 2] } }) }), null);
+  await settle();
+  assert.equal(h.remoteCalls.filter((c) => c[0] === 'markSeen').length, 0,
+    '历史回合返回 null 时也应保留未展示候选');
+});
+
 test('client half：候选卡片——渲染即记 seen，两个按钮打到 Remote 上', async () => {
   const h = await loadClientHalf();
   h.exports.apply(h.ctx);
@@ -908,20 +1069,22 @@ test('client half：候选卡片——渲染即记 seen，两个按钮打到 Rem
   // $mount 落地时已经拉过一次，所以第一次渲染就该有卡片
   const rendered = reg.Component(props);
   assert.ok(rendered, '有候选时要渲染出卡片');
+  const view = attachCard(rendered);
+  view.intersect(true);
   await settle();
 
   const snapshot = face.hooks.memfuseSuggestions.getSnapshot();
   assert.equal(snapshot.status, 'ready', `拉取应成功：${snapshot.error ?? ''}`);
   assert.deepEqual(
     snapshot.visible.map((g) => g.key),
-    ['k1'],
-    'seen 的那组不该出现在"还该出现"里（这就是「不能一直提示」）',
+    [],
+    '已领走并可见的候选不再向其他回合投递',
   );
   // 渲染即记 seen（用户什么都不用做）：**没显示出来的那几组也一起记**，
   // 否则下一轮又冒一行新的，等于换个方式刷屏（真机反馈"太多了，默认 1 组就可以"）
   const seenCall = h.remoteCalls.find((c) => c[0] === 'markSeen');
   assert.deepEqual(seenCall?.[1], ['k1', 'k8', 'k9'], '显示过的 + 没显示的组都要报给宿主');
-  assert.equal(snapshot.restCount, 2, '还有几组没显示 —— 卡片要写出来');
+  assert.equal(snapshot.restCount, 0, '领走后的共享队列清空，卡片固定保留同批说明');
   const cardText = JSON.stringify(reg.Component(props));
   assert.match(cardText, /另外还有 2 组同类候选，想看就告诉我/, '没显示的那些要说明去处（别装作不存在）');
 

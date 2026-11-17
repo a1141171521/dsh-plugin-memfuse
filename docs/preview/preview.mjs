@@ -82,7 +82,8 @@ function makeJsxRuntime(document) {
     const node = document.createElement(type);
     for (const [key, value] of Object.entries(props ?? {})) {
       if (key === 'children' || key === 'key' || value === undefined || value === null) continue;
-      if (key === 'className') node.className = value;
+      if (key === 'ref' && typeof value === 'function') node.__previewRef = value;
+      else if (key === 'className') node.className = value;
       else if (key === 'htmlFor') node.htmlFor = value;
       else if (/^on[A-Z]/.test(key) && typeof value === 'function') {
         node.addEventListener(key.slice(2).toLowerCase(), value);
@@ -355,9 +356,12 @@ export function startPreview({ window, document, bundle, target, onLog, onState 
    * 不这么模拟的话，预览会把"同一回合的刷新"当成"下一轮"，演示出来的语义正好是反的。
    */
   let turnSeq = 1;
+  let committedRef = null;
 
   const render = () => {
     if (tailEntry === null) return;
+    committedRef?.(null);
+    committedRef = null;
     const face = tailEntry.options.inject();
     const props = {
       t: (key, params) => translate(tailEntry.options.locale, key, params),
@@ -375,6 +379,8 @@ export function startPreview({ window, document, bundle, target, onLog, onState 
       return;
     }
     target.replaceChildren(node);
+    committedRef = node.__previewRef ?? null;
+    committedRef?.(node);
   };
 
   const scheduleRender = () => {

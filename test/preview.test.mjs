@@ -60,9 +60,15 @@ function makeNode(tag) {
       this.childNodes.push(child);
       return child;
     },
+    isConnected: false,
+    getBoundingClientRect: () => ({ width: 400, height: 200, top: 10, left: 10, bottom: 210, right: 410 }),
     replaceChildren(...children) {
+      for (const child of this.childNodes) child.isConnected = false;
       this.childNodes = [];
-      for (const child of children) if (child !== null && child !== undefined) this.appendChild(child);
+      for (const child of children) if (child !== null && child !== undefined) {
+        child.isConnected = true;
+        this.appendChild(child);
+      }
     },
     click() {
       for (const fn of this.listeners.click ?? []) fn({ target: this });
@@ -73,7 +79,11 @@ function makeNode(tag) {
 /** 建一个假浏览器环境 + 跑起来的预览。 */
 async function bootPreview() {
   const document = {
-    createElement: makeNode,
+    createElement: (tag) => Object.assign(makeNode(tag), { ownerDocument: document }),
+    defaultView: { innerWidth: 1000, innerHeight: 800, addEventListener() {}, removeEventListener() {} },
+    visibilityState: 'visible',
+    addEventListener() {},
+    removeEventListener() {},
     createTextNode: (text) => ({ nodeType: 3, textContent: String(text), childNodes: [] }),
     querySelector: () => null,
     head: makeNode('head'),

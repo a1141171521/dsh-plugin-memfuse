@@ -11,7 +11,7 @@
 | 3 | `docs/spec.md` | **唯一权威**的功能清单 + 技术线 + 各阶段实施记录（含真机发现的缺陷） |
 | 4 | `README.md` | 对外说明（**部分已过时**，以 spec.md 为准） |
 
-**先跑 `npm test`**（应看到 **91 + 36 + 5 + 23 = 155 项全绿**）确认环境正常，再动手。
+**先跑 `npm test`**（应看到 **94 + 43 + 5 + 23 = 165 项全绿**）确认环境正常，再动手。
 想直接看候选卡片长什么样：`npm run preview`（离线预览页，不用重启、不用先有候选）。
 
 ## 这是什么
@@ -25,7 +25,7 @@ DSH 的长期记忆插件。纯文本 Markdown 存储、本地检索。
   推送前扫一遍：**不带凭据**；本机用户名 / 绝对路径改占位符（仓库是 public）。
 - **已装进 desktop + web 两个 profile**（都是**符号链接/junction 指向本仓库**，改文件即生效，
   只差重启让客户端重新加载 bundle），真机跑通。
-- 测试 **155 项全绿**（plugin 91 + client 36 + 预览 5 + smoke 23）；真机功能 40/40、补测 29/29、真实会话闭环、真实模型往返全通。
+- 测试 **165 项全绿**（plugin 94 + client 43 + 预览 5 + smoke 23）；真机功能 40/40、补测 29/29、真实会话闭环、真实模型往返全通。
 - **候选卡片的离线预览页**：`npm run preview`（起本地静态服务再打开
   `docs/preview/turn-tail-card.html` —— **别直接双击**：模块脚本在 `file://` 下会被 CORS 拒）。
   它加载**真实的 `lib/client.js`**（同 bundle / 同 CSS / 同字典），宿主那侧是假数据；
@@ -73,7 +73,7 @@ DSH 的长期记忆插件。纯文本 Markdown 存储、本地检索。
 - **H7 技能建议**（2026-10-15 追加）：够格时在注入里出 **Block E**（**零 LLM**，只给簇语义不给技能正文），
   用户点头才 `distill`。`dismiss` 后该组不再出现；**簇长大 → key 变 → 重新提一次**。
   真机已用探针（宿主自己的 `systemPrompt.assemble()`）抓到真实组装块验证。
-- **真机累计发现 34 个缺陷，全部修复**。最隐蔽的十七个：
+- **真机/隔离复现累计 37 个缺陷，代码修复与回归完成；缺陷 37 待重启后视觉验收**。最隐蔽的十七个：
   - 缺陷 5：`agent/pre-step` 是 waterfall，不调 `next()` → **每轮对话崩**
   - 缺陷 11：`Config` 没放进 `export default` → **设置页静默消失、零报错**
   - 缺陷 12：**`session.events` 在宿主上不存在**（真名 `ownEvents()`）→ 兜底捕获整条路径
@@ -271,6 +271,18 @@ DSH 的长期记忆插件。纯文本 Markdown 存储、本地检索。
     修：按段推进（每段成功才推到段尾，单轮最多 `maxSegmentsPerFile` 段，短尾巴并进上一段）、
     上限只由调用方传、候选写失败不推进、候选带 `sourceRange`。回归 5 条。**要重启生效。**
     ⚠️ 修复前已被误标"已抽"的历史内容不会自动重抽。见 spec 缺陷 35
+  - 缺陷 36（2026-11-01，**把"作用域"做成了纯标签**）：`memfuse_write` 有 `scope` 参数、
+    `paths.js` 也有 user/global 两个根，但 `write()` **没把 scope 传给 `filePath()`** ——
+    两个根永远空着，文件全落在 workspace，而 `list()` 按目录判作用域 → 全报 `workspace`。
+    「跨工作区共享」一次都没生效，frontmatter 里却写着 `scope: user`。连带三条：`read`/`remove`
+    只查 workspace 根（真放进去也读不到、删不掉）、`init()` 无条件 mkdir 让 **`npm test` 在真实
+    `~/.dsh` 里造两个空目录**、`rebuildIndex()` 把用户级/全局级条目写进 workspace 的 `index.md`。
+    修：scope 参与选根（非法回落）+ `read`/`remove` 按 `workspace→user→global` 找 + 目录按需建
+    （`ensureRoot`）+ 索引每个根一份（`renderIndex`）+ 根目录可注入（`config.dshHome`，测试别碰真主目录）。
+    回归 3 条（`S1`–`S3`）。⚠️ 修复前误写的记录**不会自动搬家**（见 spec 缺陷 36 ⑤）。**要重启生效。**
+- **缺陷 37（2026-11-17/18）**：load 曾在零组件渲染时记 seen，同回合新候选也可能丢展示。
+  现改为卡片 DOM 可见后确认固定批次，历史回合不刷新，确认失败重试，卸载清理，pin 绑定 feed owner。
+  新增 7 条回归；旧 seen/dismissed 保留。当前四组均已 seen；详见 spec/NEXT。**待重启后视觉验证。**
 - **设置页**：✅ 两个半边都齐了。宿主半边 `lib/config.js`（`Config status: schema`）+
   浏览器半边 `lib/client.js`（注册**三处**：`settings.section` id = `dsh-memfuse`、
   `plugins.bundle.config` key = 包名、`plugins.row.config` key = `dsh-memfuse#dsh-memfuse`；
@@ -346,8 +358,9 @@ $dbin  = '<DSH_APP>\resources\app\dsh\node_modules\@deepseek-ai\dsh\lib\bin.js'
 `{root:'plugins.bundle.config'}` 里应出现 `key: "dsh-memfuse"`，且
 `{root:'plugins.row.config'}` 里应出现 `key: "dsh-memfuse#dsh-memfuse"`；
 候选卡片还要看 `{root:'conversation.chat.turnTail'}` 里有没有 `id: "dsh-memfuse#suggestions"`。
-**卡片有没有真的渲染过**，看 `~/.dsh/memory/.memory/state.json` 里有没有 `skillSeen` 键
-（`status.md` 的「界面已看过（skillSeen）」同理）—— 一直是 0 组 = 从来没成功拉到过数据。
+**展示证据（缺陷 37 更正）**：旧 `skillSeen` 可能来自启动预取，并不证明卡片真正展示。
+新代码只在卡片 DOM 已连接、页面可见且进入视口时确认固定批次；同批 restKeys 仍为抑制记录。
+记录为 0 也不等于没读到数据；排障需同时核对候选、去重、槽位与可见性。
 
 ## 占位符（公开仓库里不写本机绝对路径）
 
@@ -423,6 +436,10 @@ status.md 被重写），但那只换配置、不换模块。判据只有一个�
 ## 记忆系统（两条链路都在用）
 
 - **memfuse 自己的库**：`~/.dsh/memory`，工具 `memfuse_*`（desktop + web 都指向它）
+  - 三级作用域：`workspace` = `<DSH_HOME>/memory`（默认）／`user` = `<DSH_HOME>/memfuse-user`
+    （跨工作区跟人走）／`global` = `<DSH_HOME>/memfuse-global`。查询优先级
+    **workspace → user → global**；目录**按需创建**（没用到的级别不会在主目录里凭空出现）。
+    `memfuse_write` 的 `scope=user|global` 写进对应根，自动学习永远写 workspace。
 - **本地 Markdown 知识库（vault）**：`<VAULT>`，工具 `memory_*`（**desktop 已改用 memfuse，故这边只剩 web / 手动**）
 
 ```powershell
