@@ -15,6 +15,19 @@ import path from 'node:path';
 import fs from 'node:fs';
 import fsp from 'node:fs/promises';
 
+/**
+ * 测试进程统一隔离 DSH_HOME（必须放在 import('../lib/index.js') 之前）。
+ *
+ * 在 DSH 里跑 `npm test` 时会**继承真实的 DSH_HOME**（如 `~/.dsh`），而 `list()` /
+ * 注入 / 技能建议默认跨 workspace→user→global 查 —— 于是没显式注入 `dshHome` 的用例
+ * 会把本机真实的用户级记忆算进来。本机实测：面板用例数到 6 条（应为 5）、
+ * dismiss 用例忽略后还剩 1 组（应为 0）。作者机器上 `~/.dsh/memfuse-user` 是空的，
+ * 所以这个缺陷只在「已有 user 级记忆 + 从 DSH 里跑测试」时暴露。
+ *
+ * 每个进程一份临时根，用完即弃；写 user/global 的用例另有自己的 `dshHome`。
+ */
+process.env.DSH_HOME = path.join(os.tmpdir(), `memfuse-test-home-${process.pid}`);
+
 const mod = await import('../lib/index.js');
 const { healthOf } = mod;
 
@@ -538,7 +551,9 @@ test('注入生产端：注入过的记忆 injected 在下一轮被累加', asyn
   const root = path.join(os.tmpdir(), `memfuse-inj-${Date.now()}`);
   t.after(() => fsp.rm(root, { recursive: true, force: true }));
   const h = fakeCtx();
-  const api = mod.apply(h.ctx, { root, git: false, verbose: false });
+  // dshHome 必须一起隔离：list()/注入默认跨 workspace→user→global 查，
+  // 不注入就会读到本机真实的 ~/.dsh/memfuse-user（在 DSH 里跑测试时 DSH_HOME 被继承）。
+  const api = mod.apply(h.ctx, { root, git: false, verbose: false, dshHome: path.join(root, 'dsh-home') });
   await api.ready;
 
   const write = h.tools.find((d) => d.name === 'memfuse_write');
@@ -3538,7 +3553,7 @@ test('缺陷 38：待确认→采纳→技能建议→忽略的完整通道与�
     }
     return inject(names,cb);
   };
-  const api=mod.apply(h.ctx,{root,git:false,verbose:false,extract:{enabled:false,autoRunOnStart:false},lifecycle:{autoRunOnStart:false},skill:{dir:path.join(root,'installed-skills')}});
+  const api=mod.apply(h.ctx,{root,git:false,verbose:false,dshHome:path.join(root,'dsh-home'),extract:{enabled:false,autoRunOnStart:false},lifecycle:{autoRunOnStart:false},skill:{dir:path.join(root,'installed-skills')}});
   await api.ready;assert.ok(remote,'真实 apply 安装 Remote 实现');
   const {putPending}=await import('../lib/queue.js');
   const candidate={id:'queue-flow',kind:'experience',priority:'P1',title:'部署前按流程检查',body:'第一步检查分支，再检查构建结果。',summary:'部署检查流程',anchor:'部署时',tags:['deploy'],createdAt:'2026-11-21T00:00:00Z'};
@@ -3608,6 +3623,8 @@ test('记忆面板：能列出全部记忆、常驻顺序、以及挤不进常�
   const h = fakeCtx();
   const api = mod.apply(h.ctx, {
     root, git: false, verbose: false,
+    // 面板读的是跨作用域的 list()，不隔离 dshHome 会把本机真实用户级记忆算进来
+    dshHome: path.join(root, 'dsh-home'),
     extract: { enabled: false, autoRunOnStart: false },
     lifecycle: { autoRunOnStart: false },
     // 上限压到 2 条，才能在用例里造出溢出（默认 8 条要写 9 条记录，没必要）

@@ -3070,6 +3070,24 @@ list → g1:workspace, u1:workspace, w1:workspace  ← 全被报成 workspace
 - 用户级/全局级**没有** `sessions/`、`pending/`、`pending-skills/` —— 捕获与抽取只发生在
   workspace，这两级是「人写进去的长期结论」，不是自动学习的产物。
 
+#### ⑥ 测试隔离：在 DSH 里跑测试会读到真实用户级记忆（2026-11-24）
+
+现场：本机 `npm test` 有 3 项失败 —— 面板用例数到 6 条（应为 5）、注入归因多出一个 id、
+缺陷 38 通道用例读到 1 条（应为 0）。同一份代码在作者机器上 184 项全绿。
+
+根因**不是功能**，是**测试没隔离 `DSH_HOME`**：DSH 进程里 `DSH_HOME=~/.dsh`，`node --test`
+继承它；而 `list()` / 注入 / 技能建议默认跨 workspace→user→global 查 —— 没显式传
+`config.dshHome` 的用例就把本机真实的用户级记忆（`~/.dsh/memfuse-user`）也算进来了。
+作者机器上那一级恰好是空的，所以从没暴露；**只要机器上有一条 user 级记忆，从 DSH 里跑测试就会红**。
+
+修：
+- `test/plugin.test.mjs` 顶部（`await import('../lib/index.js')` **之前**）把
+  `process.env.DSH_HOME` 指到 `<tmp>/memfuse-test-home-<pid>`，整份套件一次性隔离；
+- 三条跨作用域断言（注入归因、缺陷 38 通道、记忆面板）**额外显式传 `dshHome`**，
+  保证单跑某条用例时也不碰真实库（`store`/`apply` 的默认根仍在 apply 时求值，越早设置越稳）。
+
+验证：`DSH_HOME` 仍指向真实 `~/.dsh` 的前提下**连跑 3 遍 184 项全绿**（107+49+5+23）。
+
 
 ### 技能卡片展示记账（2026-11-17/18，缺陷 37）
 
