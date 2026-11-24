@@ -437,6 +437,10 @@ export function startPreview({ window, document, bundle, target, onLog, onState 
 
   const require = (name) => {
     if (name === 'react/jsx-runtime') return { jsx, jsxs };
+    // 2026-11-24：设置页分栏用了一点组件内状态（`React.useState`）。
+    // 预览页没有 React 运行时，给个最小桩：保留初始值，setter 不触发重渲染
+    //（预览里要验的是"两栏都渲染出来了"，切 tab 不是它的职责）。
+    if (name === 'react') return { useState: (initial) => [initial, () => {}] };
     if (name === '@deepseek-ai/dsh-client-ui-primitives') {
       return { SettingsForm: 'SettingsForm', SettingsValueField: 'SettingsValueField', SegmentedControl: 'SegmentedControl', Checkbox: 'Checkbox' };
     }

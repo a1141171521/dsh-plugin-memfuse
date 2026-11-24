@@ -3236,6 +3236,87 @@ list → g1:workspace, u1:workspace, w1:workspace  ← 全被报成 workspace
 
 **要重启 DSH 生效**（新端点 + 新 client bundle）。
 
+### 设置页分栏：我的记忆 / 设置（2026-11-24）
+
+用户原话：「我的记忆和原有的设置，应该作为不同的 tab 可以进行切换，现在全部在一个页面中，
+要一直下拉才能找到记忆设置相关配置」。
+
+#### 改了什么
+
+- `MemfuseConfigCardView` 顶部加一条 tab 栏（`role="tablist"`），两栏：
+  **「我的记忆」**（`MemoryPanel`，**默认**）／**「设置」**（学习横幅 + 三组配置 + 状态行 + 页脚）。
+- 两栏**都渲染**、非当前栏 `hidden`：切回来时搜索词、筛选条件、未保存的草稿都还在，
+  面板数据也不会因为"这一栏没渲染过"而少拉一次。
+- 停留的页签记在**模块级** `lastTab`（不落盘）：页签切走再回来仍停在用户上次那一栏；
+  刷新页面回到默认的「我的记忆」。
+- 分栏只改**呈现**：十二个远程端点、宿主侧计算（`memory-view.js`）、保存链路一行没动。
+
+#### 三条实现约束
+
+| 约束 | 原因 |
+|---|---|
+| `React.useState` 需要 `require('react')` | 这个文件历来只 require `react/jsx-runtime`；平台种子模块里有 `react` 本体（官方 `dsh-client-ui-settings-plugins` 与第三方插件都直接 require）。**"拿不到 `useEffect`"是真的，但不等于连 `useState` 都没有** —— 这条曾经让我们用"渲染期幂等调用"绕开副作用，那是另一回事 |
+| 非当前栏用 `hidden`，**不是**"不渲染" | 不渲染会丢输入（搜索词、未保存的草稿），面板切回来还要重拉一次 |
+| 离线测试用 `initialTab` 接缝 | 假 DOM 没有 React 运行时（`useState` 是桩、setter 不触发重渲染），要验"设置栏那一态"只能靠 `props.initialTab: 'settings'`（与 `WRITABLE_PATHS` / `__retryConfig` 同类接缝） |
+
+#### 验证
+
+- 新增 1 条界面回归：两个 tab、`role/aria` 正确、默认停在「我的记忆」、另一栏 `hidden`、
+  切到设置栏后开关与页脚都在、记忆列表不再占位。
+- 全套 **185 项全绿**（plugin 107 + client 50 + 预览 5 + smoke 23）。
+- `docs/preview/preview.mjs` 的 require 桩补了 `react`，预览页照常渲染（预览 5 项照旧）。
+
+**要重启 DSH 生效**（client bundle 变了）。
+
+### 技能卡片频弹 + 提炼看不到内容（2026-11-24，缺陷 40/41）
+
+用户反馈两件事：
+
+1. 「切换对话，频繁出现提炼技能的卡片」
+2. 「点提炼后，并没有办法查看具体的技能内容是什么」
+
+#### 缺陷 41：卡片是**队列式**的，切会话就领走下一组
+
+现场：`state.skillSeen` 已有 **139 个 key**（`eligibleGroups 93 / seenGroups 79 / dismissed 12 / pending 2`）。
+每看一次卡片只记一组，于是 90 多组够格记忆被一组一组"领"出来。
+
+根因：`list()` 把**全部未看过**的组交给 `selectUiSuggestions`，而 `turnTail` 是按回合渲染的 ——
+切到任何一个老会话，它的最后一回合重新挂载 → 再领一组 → 又来一张卡。用户根本没有新记忆，
+卡片却源源不断。_这不是"重启后状态丢了"，是设计把"未看过"当成了"待办队列"。_
+
+修：`lib/suggestion-status.js` 新增 `freshSuggestions()` —— **只有上次确认之后确实出现新内容的组才算新**：
+
+- 水位 = `state.skillSeen` 里最晚的时间戳（从没确认过 → `null`，此时全部算新，首装仍能看到建议）；
+- 组的时间 = 组成员里最新的 `updated || created`；
+- 组时间 ≤ 水位 → 不再主动弹（仍然在 `eligibleGroups` 里，`memfuse_skill action=list` 能看到）。
+
+`list` 端点改用 `fresh`（不再用 `suggestions`），`diagnostics.freshGroups` 同步改成同一口径 ——
+否则会出现 `status.md` 说"有 N 组等待提醒"、卡片却一张都不弹的自相矛盾。
+
+#### 缺陷 40：提炼用错了系统提示词，模型根本不知道自己在提炼
+
+现场：`state.lastSkillError` = 「模型输出无法解析为 JSON 对象（前 200 字：**已读入这 6 条记忆，
+未见具体任务指令**。先按主题归档…）」；`distillRequestsAt` 里两次点击都退化成待办。
+
+根因：`makeModelCaller()` 把 `system` **写死成 `EXTRACT_SYSTEM`**（"你是记忆抽取器…输出 JSON 数组"），
+提炼只是把技能簇文本当 user 消息塞进去 —— 模型收到的是错误的角色说明，自然回一段人话。
+`distill.js` 里那份 `DISTILL_SYSTEM` **从来没被引用过**（死代码，`grep DISTILL_SYSTEM` 只有定义）。
+
+修：
+
+- `makeModelCaller` 支持 `opts.system`（默认仍是 `EXTRACT_SYSTEM`）；
+- `distillCluster` 显式传 `{ system: DISTILL_SYSTEM }`；
+- 兜底：模型还是没按 JSON 返回时，**用它的原文**生成草稿（`salvaged: true`），
+  界面写明「这是模型原文，不是按格式提炼的步骤」，装/丢仍由用户决定 —— 至少让人看得到内容。
+
+#### 验证
+
+- 新增 3 条回归：`freshSuggestions` 水位语义（看过之后老组不再弹、新记忆进来才重新提）／
+  提炼调用必须带 `DISTILL_SYSTEM`（不是 `EXTRACT_SYSTEM`）／模型不按格式返回时原文兜底成草稿。
+- 全套 **188 项全绿**（plugin 110 + client 50 + 预览 5 + smoke 23）。
+
+**要重启 DSH 生效**（宿主半边与 client bundle 都变了）。
+
 ### 技能建议筛选与空状态（2026-11-21，缺陷 38）
 
 用户反馈：提交 a47589e 后，使用中仍未出现可转为技能的卡片。

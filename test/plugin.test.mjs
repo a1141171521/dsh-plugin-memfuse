@@ -3963,3 +3963,96 @@ test('记忆面板：溢出常驻块的 P0 仍会从相关召回进来（所以�
 
   console.log('  ✅ 溢出 P0：不进 Block A，但仍从 Block B 进来 —— 文案与行为一致');
 });
+
+// ──────────────────── 缺陷 40 / 41（2026-11-24）────────────────────
+//
+// 用户反馈两件事：
+//   ① 「切换对话，频繁出现提炼技能的卡片」
+//   ② 「点提炼后，并没有办法查看具体的技能内容是什么」
+//
+// ① 的根因是卡片**队列式**地消费"没看过的组"：切到任何一个老会话，它的最后一回合
+//    重新挂载就领走下一组 —— 90 多组够格记忆被一组组弹完，而用户并没有产生新记忆。
+//    修法：只有「上次确认之后确实出现新内容」的组才算新（`freshSuggestions`）。
+// ② 的根因是提炼走的那条模型调用**写死了抽取用的系统提示词**，模型收到
+//    "你是记忆抽取器"却在看一份技能簇 → 回一段人话 → 解析失败 → 永远没有草稿。
+//    修法：`makeModelCaller` 支持 `opts.system`，提炼传 `DISTILL_SYSTEM`；
+//    并且模型真没按格式返回时，用它的原文兜底成草稿（标记 salvaged，界面写明）。
+
+test('缺陷 41：切会话不再把没看过的建议一组组弹完 —— 只有上次确认之后的新内容才算新', async () => {
+  const { analyzeSkillSuggestions } = await import('../lib/suggestion-status.js');
+  const mkRec = (id, tag, updated) => ({
+    id, title: `记忆 ${id}`, kind: 'experience', priority: 'P1', confidence: 1, lifecycle: 'active',
+    tags: [tag], body: '第一步检查；第二步执行；第三步验证。', summary: '步骤摘要', anchor: '需要时',
+    created: updated, updated, sessionCount: 1,
+    stats: { recalled: 0, injected: 0, positive: 0, negative: 0 },
+  });
+  const cfg = { skill: { enabled: true, suggest: true, minScore: 4, minSessions: 3 } };
+  const base = [
+    mkRec('m1', 'alpha', '2026-01-01T00:00:00Z'),
+    mkRec('m2', 'alpha', '2026-01-02T00:00:00Z'),
+    mkRec('m3', 'beta', '2026-01-03T00:00:00Z'),
+    mkRec('m4', 'beta', '2026-01-04T00:00:00Z'),
+  ];
+
+  const r1 = analyzeSkillSuggestions(base, {}, cfg);
+  assert.ok(r1.fresh.length >= 2, `从没看过时，够格的组都算新（实际 ${r1.fresh.length}）`);
+  assert.equal(r1.diagnostics.freshGroups, r1.fresh.length, '诊断与卡片必须用同一份口径');
+
+  // 看过第一组（水位 = 现在）→ 剩下那些**老组**不该继续一组组弹
+  const seenKey = r1.fresh[0].key;
+  const r2 = analyzeSkillSuggestions(base, { skillSeen: { [seenKey]: new Date().toISOString() } }, cfg);
+  assert.equal(r2.fresh.length, 0, '上次确认之后没有新内容 → 一张卡都不该弹');
+  assert.equal(r2.diagnostics.status, 'no_fresh');
+  assert.equal(r2.diagnostics.eligibleGroups, r1.diagnostics.eligibleGroups, '够格的组还在（只是不再主动弹）');
+
+  // 新记忆进来 → 组员变化 / 时间变新 → 重新算新
+  const later = new Date(Date.now() + 5000).toISOString();
+  const grown = [...base, mkRec('m5', 'alpha', later)];
+  const r3 = analyzeSkillSuggestions(grown, { skillSeen: { [seenKey]: new Date().toISOString() } }, cfg);
+  assert.ok(r3.fresh.length >= 1, '新记忆加入后要能重新弹');
+  console.log('  ✅ 卡片跟着新记忆走：看过之后老组不再弹，新记忆进来才重新提');
+});
+
+test('缺陷 40：技能提炼必须用**提炼**的系统提示词（别拿抽取那份硬套）', async (t) => {
+  const root = path.join(os.tmpdir(), `memfuse-distill-prompt-${Date.now()}`);
+  t.after(() => fsp.rm(root, { recursive: true, force: true }));
+  const llm = fakeLlm(JSON.stringify({ name: 'repo-onboarding', description: '接手陌生仓库时用', body: '## 步骤\n1. 先读 README' }));
+  const h = fakeCtx({ llm });
+  const api = mod.apply(h.ctx, {
+    root, git: false, verbose: false,
+    dshHome: path.join(root, 'dsh-home'),
+    extract: { enabled: true, followConversation: false, provider: 'p', model: 'm', autoRunOnStart: false },
+    skill: { dir: path.join(root, 'skills-lib'), minScore: 3, minSessions: 2 },
+  });
+  await api.ready;
+  const write = h.tools.find((d) => d.name === 'memfuse_write');
+  await write.execute({
+    mode: 'add', kind: 'experience', priority: 'P1',
+    title: '接手陌生仓库的摸底流程', summary: '先读 README 再跑测试。',
+    body: '第一步先读 README；第二步跑测试；第三步看 CI。', anchor: '接手新仓库时', tags: ['onboarding'],
+  });
+  const skill = h.tools.find((d) => d.name === 'memfuse_skill');
+  const dis = JSON.parse(await skill.execute({ action: 'distill', match: '接手陌生仓库的摸底流程' }));
+  assert.equal(dis.ok, true, JSON.stringify(dis));
+  const call = llm.calls.at(-1);
+  assert.ok(call, '必须真的调过模型');
+  assert.match(String(call.system ?? ''), /技能提炼器/, '系统提示词必须是 DISTILL_SYSTEM');
+  assert.ok(!/记忆抽取器/.test(String(call.system ?? '')), '不许再用抽取用的系统提示词');
+  console.log('  ✅ 提炼用的是提炼提示词（DISTILL_SYSTEM），不再是抽取那份');
+});
+
+test('缺陷 40：模型没按 JSON 返回时，用它的原文兜底成草稿（至少让用户看得到内容）', async () => {
+  const d = await import('../lib/distill.js');
+  const cluster = [{
+    id: 'm_demo', title: '部署前检查', kind: 'experience', priority: 'P1', confidence: 1,
+    tags: ['deploy'], anchor: '发布前', summary: '发布前检查清单',
+    body: '第一步检查分支；第二步跑测试；第三步发布。',
+  }];
+  const prose = '已读入这 6 条记忆，未见具体任务指令。先按主题归档：\n1. 部署前检查分支\n2. 发布后验证回滚';
+  const r = await d.distillSkill({ cluster, callModel: async () => prose });
+  assert.equal(r.ok, true, '兜底也必须出草稿 —— 不能只回一句"解析失败"');
+  assert.equal(r.salvaged, true, '必须标记 salvaged，界面要写清"这是模型原文"');
+  assert.match(r.content, /^---/, '兜底草稿也要是合法 SKILL.md');
+  assert.match(r.content, /部署前检查分支/, '原文内容必须在');
+  console.log('  ✅ 模型不按格式返回时：原文兜底成草稿 + 标记 salvaged');
+});

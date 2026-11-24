@@ -383,6 +383,10 @@ async function loadClientHalf({
   };
   const require = (name) => {
     if (name === 'react/jsx-runtime') return { jsx, jsxs };
+    // 2026-11-24：设置页分栏用 `React.useState` 记住当前 tab。
+    // 离线测试没有 React 运行时 —— 桩只保留初始值；要验"切到设置栏"就用
+    // `MemfuseConfigCardView` 的 `initialTab: 'settings'` 测试接缝。
+    if (name === 'react') return { useState: (initial) => [initial, () => {}] };
     if (name === '@deepseek-ai/dsh-client-ui-primitives') return primitives;
     if (name === '@deepseek-ai/dsh-client-store') return { createSnapshotStore: makeStore };
     throw new Error(`unexpected require("${name}")`);
@@ -520,9 +524,24 @@ function findBanner(node) {
   return null;
 }
 
+/**
+ * 收集假树里所有 `className` 含 `cls` 的元素（递归，函数组件会被展开）。
+ *
+ * 为什么按 className 找而不是按 tag：tab 条 / 分栏都是普通 `div`，
+ * 真正区分它们的是类名与 `role`；按 tag 找会把整页的 div 全捞出来。
+ */
+function findAllByClass(node, cls, out = []) {
+  const current = renderNode(node);
+  if (current === null || typeof current !== 'object') return out;
+  const className = current.props?.className;
+  if (typeof className === 'string' && className.split(/\s+/).includes(cls)) out.push(current);
+  const kids = current.props?.children;
+  for (const kid of Array.isArray(kids) ? kids : kids === undefined ? [] : [kids]) findAllByClass(kid, cls, out);
+  return out;
+}
+
 /** 把假树里的文本拼起来（断言"文案里说了什么"用）。`props.label` 也算 —— 勾选框的标签
- *  是作为 prop 传给 `Checkbox` 的，不在 children 里。 */
-function textOfTree(node) {
+ *  是作为 prop 传给 `Checkbox` 的，不在 children 里。 */function textOfTree(node) {
   if (node === null || node === undefined) return '';
   if (typeof node === 'string') return node;
   if (typeof node !== 'object') return '';
@@ -2223,4 +2242,84 @@ test('记忆面板：设置页真的渲染出记忆列表，并把溢出/休眠�
   assert.ok(h.remoteCalls.some((c) => c[0] === 'revive'), '点「唤醒」必须打到宿主的 revive 端点');
 
   console.log('  ✅ 面板渲染：三条记忆都列出、序号是注入顺序、溢出与休眠各有原因、三个按钮都打到宿主');
+});
+// ──────────────────── 设置页分栏（2026-11-24）────────────────────
+//
+// 用户原话：「我的记忆和原有的设置，应该作为不同的 tab 可以进行切换，现在全部在
+// 一个页面中，要一直下拉才能找到记忆设置相关配置」。
+// 这一条钉住三件事：① 真的有两个 tab（role/aria 正确、文案对）；② 默认停在
+// 「我的记忆」；③ 另一栏是 **hidden**，不是"排在下面继续铺" —— 否则等于没分开。
+
+test('设置页分两栏：我的记忆 / 设置各是一个 tab，默认记忆栏，另一栏 hidden', async () => {
+  const h = await loadClientHalf({ value: {}, suggestions: EMPTY_FEED });
+  h.exports.apply(h.ctx);
+  await settle();
+  const { reg } = sectionProps(h);
+  const face = reg.options.inject();
+
+  const PANEL = {
+    stats: { total: 1, active: 1, dormant: 0, byPriority: { P0: 1 }, byScope: { workspace: 1 }, byKind: { fact: 1 }, residentCap: 8, residentCount: 1, residentOverflow: 0 },
+    resident: ['m1'], overflow: [],
+    rows: [{
+      id: 'm1', title: '要我每轮都记得的那条', summary: '常驻摘要', priority: 'P0', lifecycle: 'active',
+      scope: 'workspace', kind: 'fact', updated: '2026-11-01T00:00:00Z', dormant: false,
+      resident: true, overflow: false, reason: null, stats: { recalled: 0 },
+    }],
+    page: 1, pageSize: 50, pageCount: 1, totalMatches: 1,
+    filters: { query: '', priority: '', lifecycle: '', scope: '' },
+    residentMaxEntries: 8, residentMaxChars: 1200, readError: null,
+  };
+
+  const propsOf = (extra = {}) => ({
+    t: h.t,
+    view: 'page',
+    ...face,
+    ...extra,
+    useMemfuseConfig: (selector) =>
+      selector({
+        ...face.hooks.memfuseConfig.getSnapshot(),
+        panel: { status: 'ready', view: PANEL, busy: null, error: null, actionError: null, note: null },
+      }),
+  });
+
+  // ① 默认：tab 条 + 两个 tab，选中「我的记忆」
+  const tree = reg.Component(propsOf());
+  const tabBars = findAllByClass(tree, 'dsh-memfuse-tabs');
+  assert.equal(tabBars.length, 1, '设置页必须有一条 tab 栏');
+  assert.equal(tabBars[0].props.role, 'tablist', 'tab 栏要有 role=tablist（键盘/读屏要靠它）');
+
+  const tabButtons = findAllByClass(tree, 'dsh-memfuse-tab');
+  assert.equal(tabButtons.length, 2, '必须正好两个 tab：我的记忆 / 设置');
+  assert.deepEqual(
+    tabButtons.map((b) => textOfTree(b)),
+    ['我的记忆', '设置'],
+    'tab 文案就是用户说的那两栏',
+  );
+  assert.equal(tabButtons[0].props['aria-selected'], true, '默认停在「我的记忆」');
+  assert.equal(tabButtons[1].props['aria-selected'], false);
+  assert.equal(tabButtons[0].props['aria-controls'], 'dsh-memfuse-panel-memory', 'aria-controls 要指向分栏容器');
+
+  // ② 两栏都在树里，但只有当前那栏可见 —— 「hidden」才是"分开"，不是继续往下铺
+  const panels = findAllByClass(tree, 'dsh-memfuse-tab-panel');
+  assert.equal(panels.length, 2, '两栏都要渲染（切换不丢筛选词）');
+  assert.equal(panels[0].props.hidden, false, '默认这一栏可见');
+  assert.equal(panels[1].props.hidden, true, '设置栏默认必须 hidden —— 否则用户还是要一路下拉');
+  assert.match(textOfTree(panels[0]), /要我每轮都记得的那条/, '记忆栏要有真的记忆列表');
+
+  // ③ 切到设置栏：原来那些开关/页脚都在，记忆列表不再占位
+  const settingsTree = reg.Component(propsOf({ initialTab: 'settings' }));
+  const panels2 = findAllByClass(settingsTree, 'dsh-memfuse-tab-panel');
+  assert.equal(panels2[0].props.hidden, true, '切过去之后记忆栏收起');
+  assert.equal(panels2[1].props.hidden, false, '设置栏展开');
+  const settingsText = textOfTree(panels2[1]);
+  assert.match(settingsText, /开启记忆学习|跟随对话模型/, '设置栏必须保留原来的抽取开关');
+  assert.match(settingsText, /检查更新/, '版本页脚跟着设置栏');
+  assert.ok(!/要我每轮都记得的那条/.test(settingsText), '设置栏里不该再出现记忆列表（那是另一栏的事）');
+
+  // ④ 切 tab 是真的换状态：点第二个 tab 会调到 setTab（桩 setter 不重渲染，只验能点）
+  assert.equal(typeof tabButtons[1].props.onClick, 'function', 'tab 必须可点');
+  tabButtons[1].props.onClick();
+  assert.ok(true);
+
+  console.log('  ✅ 设置页分栏：两个 tab、默认记忆栏、另一栏 hidden、切换后各归各位');
 });
