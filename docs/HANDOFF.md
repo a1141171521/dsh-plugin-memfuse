@@ -112,16 +112,20 @@ npm test          # 应该看到 77 + 29 + 5 + 23 = 134 项全绿（全部零 LL
 
 ```
 lib/
-├── index.js    182KB 4010 行  宿主半边入口：6 个工具 + 注入接线 + 宿主探测 + 捕获 + 维护 + status.md（**待拆，见下**）
-├── client.js   131KB 2596 行  浏览器半边：设置页表单 + 回合尾候选卡片（**不拆文件，见下**）
+├── index.js    188KB 4123 行  宿主半边入口：6 个工具 + 注入接线 + 宿主探测 + 捕获 + 维护 + status.md（**待拆，见下**）
+├── client.js   179KB 3470 行  浏览器半边：设置页表单 + 记忆面板 + 回合尾候选卡片（**不拆文件，见下**）
 ├── store.js      23KB  593 行  存储层：frontmatter 往返 + 原子写 + drift guard + 锁 + 三级作用域路由
 ├── policy.js     14KB  357 行  策略层（纯函数）：打分 / 准入 / 生命周期 / 反馈 / 升级
 ├── distill.js    13KB  335 行  技能提炼：候选打分 + 标签聚类 + 提炼提示词
-├── remote.js     15KB  327 行  界面数据通道：手写 Typert 贡献，9 个端点
+├── remote.js     18KB  401 行  界面数据通道：手写 Typert 贡献，12 个端点
 ├── config.js     11KB  178 行  宿主半边 Config schema（设置页的字段定义）
 ├── update.js     11KB  301 行  版本：checkUpdate（git fetch/rev-list，只读）+ applyUpdate（git pull --ff-only）
 ├── skill.js       9KB  242 行  SKILL.md 格式 I/O + 四个静默坑的对策 + approve/reject
-├── recall.js      9KB  229 行  本地检索：CJK bigram + BM25 + excerpt
+├── recall.js     12KB  280 行  本地检索：CJK bigram + BM25 + excerpt + 常驻排序（pinnedAt 优先）
+├── memory-view.js 15KB 323 行  **记忆面板的纯函数层**（2026-11-23）：统计 / 常驻顺序 /
+│                              溢出计算 / 筛选 / 优先级变更规划（只算不写）/ 非正常态说明。
+│                              ⚠️ 面板的**展示顺序就是实际注入顺序** —— 所以 resident()
+│                              与 compareResident() 的排序口径必须一致（两边共用一个判据）
 ├── extract.js     9KB  216 行  记忆抽取：提示词 + 容错解析 + 准入 + 偏好加成
 ├── inject.js      8KB  175 行  注入装配：Block A/B/C/D/E + 信任边界 + 预算
 ├── antiseptic.js  5KB  121 行  反腐烂：重复检测 + stale 计划（标记，不删除）

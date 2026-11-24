@@ -275,6 +275,7 @@ test('status 工具返回 JSON 且 schema 与实际返回值一致', async (t) =
 
 const policy = await import('../lib/policy.js');
 const storeMod = await import('../lib/store.js');
+const { recall } = await import('../lib/recall.js');
 
 test('生命周期：被召回过的 dormant 不再被物理删除（原判据会误删）', () => {
   const old = new Date(Date.now() - 40 * 86400000).toISOString();
@@ -295,6 +296,72 @@ test('生命周期：被召回过的 dormant 不再被物理删除（原判据�
     [], '有反馈的 → 不能删',
   );
   console.log('  ✅ purge 判据：只有「从未被召回 + 零反馈」才删');
+});
+
+test('缺陷 39：休眠不是死亡 —— 高相关提问仍能召回休眠记忆', () => {
+  const mk = (id, title, body, lifecycle = 'dormant') => ({
+    id, title, body, lifecycle, kind: 'fact', priority: 'P2', confidence: 0.5,
+    tags: [], stats: {}, updated: new Date().toISOString(),
+  });
+  const all = [
+    mk('live', '不相干的活跃记忆', '完全无关的内容', 'active'),
+    mk('sleep-web', '微信小程序 openid 家庭', 'openid 在小程序里用于识别家庭成员'),
+    mk('sleep-other', '云函数运行时超时', '云开发云函数超时只有 3 秒'),
+  ];
+
+  // ① 相关提问：休眠条目必须能被召回来（老实现只查 active，永远返回空）
+  const hits = recall(all, '微信小程序 openid 家庭', { minScore: 0.18, maxEntries: 4 });
+  assert.ok(
+    hits.some((h) => h.rec.id === 'sleep-web'),
+    `高相关提问必须能召回休眠记忆，实际只需 ${JSON.stringify(hits.map((h) => h.rec.id))}`,
+  );
+
+  // ② 不相关提问：休眠条目不能靠底分混进来（必须真有词法证据）
+  const noise = recall(all, '今天天气怎么样', { minScore: 0.18, maxEntries: 4 });
+  assert.equal(
+    noise.filter((h) => h.rec.lifecycle === 'dormant').length,
+    0,
+    '不相关提问不该召回休眠记忆 —— 那等于什么都招魂',
+  );
+
+  // ③ 常驻块（无 query）仍然只看 active：休眠不该自己变成常驻
+  const residentHits = recall(all, '', { maxEntries: 4 });
+  assert.deepEqual(residentHits.map((h) => h.rec.id), ['live'], '无查询时不该拉休眠条目');
+  console.log('  ✅ 休眠可被高相关召回 / 不相关不招魂 / 常驻仍只认 active');
+});
+
+test('缺陷 39：休眠记忆被真正召回事后自动唤醒，不再无限期走向物理删除', async (t) => {
+  const root = path.join(os.tmpdir(), `memfuse-39-revive-${Date.now()}`);
+  t.after(() => fsp.rm(root, { recursive: true, force: true }));
+  const h = fakeCtx();
+  const api = mod.apply(h.ctx, { root, git: false, verbose: false, extract: { autoRunOnStart: false }, lifecycle: { autoRunOnStart: false } });
+  await api.ready;
+
+  const write = h.tools.find((d) => d.name === 'memfuse_write');
+  const added = JSON.parse(await write.execute({
+    mode: 'add', kind: 'fact', priority: 'P2',
+    title: '云函数运行时超时仅 3 秒',
+    summary: '云开发云函数硬超时 3 秒。',
+    body: '云开发云函数运行时超时仅 3 秒，长任务要拆。',
+    anchor: '写云函数时',
+  }));
+  assert.equal(added.ok, true, JSON.stringify(added));
+
+  // 手动把它打成 dormant（模拟过期维护之后的状态）
+  const rec0 = await api.store.read(added.id, 'fact', 'workspace');
+  await api.store.write({ ...rec0, lifecycle: 'dormant', dormantAt: new Date().toISOString() });
+
+  const recall = h.tools.find((d) => d.name === 'memfuse_recall');
+  const res = JSON.parse(await recall.execute({ query: '云函数运行时超时', limit: 5 }));
+  assert.ok(res.results.some((r) => r.id === added.id), `休眠记忆必须能被召回，实际 ${JSON.stringify(res.results.map((r) => r.id))}`);
+
+  // 关键：召回之后它必须回到 active（否则下一轮又要靠巧合，且 30 天后被删）
+  const after = await api.store.read(added.id, 'fact', 'workspace');
+  assert.equal(after.lifecycle, 'active', '被真实召回过的休眠记忆必须自动唤醒');
+  assert.ok(after.dormantAt === null || after.dormantAt === undefined, 'dormantAt 要清掉');
+  assert.ok(Date.parse(after.expires) > Date.now(), 'expires 必须重算到未来');
+  assert.ok((after.stats.recalled || 0) >= 1, '召回计数照常累加');
+  console.log('  ✅ 休眠 → 被召回 → 自动唤醒（不再单向走向删除）');
 });
 
 test('生命周期：revive 把 dormant 拉回 active 并重算 expires', () => {
@@ -1195,6 +1262,18 @@ test('H1 候选识别：零 LLM 打分 + 按共享标签聚类', () => {
   console.log(`  ✅ 候选打分 ${s1.score} vs ${s2.score}；聚类按共享标签（不引入新相似度机制）`);
 });
 
+test('缺陷 38：前五个种子被忽略或归为同簇时，仍扫描后面的新建议', () => {
+  const memories = Array.from({ length: 7 }, (_, i) => ({
+    id: `seed-${i}`, title: `经验${i}`, kind: 'experience', priority: i < 5 ? 'P0' : 'P1',
+    lifecycle: 'active', body: '第一步检查配置，再验证结果。', tags: [], updated: `2026-11-${21 - i}`,
+  }));
+  const dismissed = Object.fromEntries(memories.slice(0, 5).map((r) => [r.id, true]));
+  assert.deepEqual(distillMod.buildSuggestions(memories, { limit: 5 }, dismissed).map((s) => s.key), ['seed-5', 'seed-6']);
+  const sameCluster = memories.map((r, i) => ({ ...r, tags: i < 5 ? ['same-topic'] : [] }));
+  assert.equal(distillMod.buildSuggestions(sameCluster, { limit: 3 }).length, 3,
+    '输出限制应用于最终建议，不能应用于去重前的种子');
+});
+
 test('H2 提炼容错：模型说 skip / 输出不是 JSON', async () => {
   const d = distillMod;
   const cluster = [{ id: 'x', title: 't', body: 'b', tags: [] }];
@@ -1879,7 +1958,7 @@ test('Remote 通道：手写描述符合法 + 服务绑定正确 + 七个方法�
   //    这里把规则**照抄**成断言；换宿主版本时要回去重读那些函数，别让测试变成自证。
   const wireName = /^[A-Za-z0-9_$.-]+$/;
   const descriptors = remoteMod.remoteDescriptors();
-  assert.equal(descriptors.length, 9);
+  assert.equal(descriptors.length, 12);
   // 端点清单（探针与 status.md 都读它）必须与描述符**一一对应** —— 少一个就是
   // "界面按钮打到不存在的端点上"，而那种失败只表现为"点了没反应"。
   assert.deepEqual(
@@ -1903,8 +1982,13 @@ test('Remote 通道：手写描述符合法 + 服务绑定正确 + 七个方法�
     for (const p of d.parameters) {
       assert.match(p.name, wireName);
       assert.match(p.wire, wireName);
-      // 参数 codec 要真的校验（否则类型错误会被留到下游）
-      assert.throws(() => p.codec.create().parse(123), '非法参数必须被拒');
+      // 参数 codec 要真的校验（否则类型错误会被留到下游）。
+      //
+      // ⚠️ 非法样本要**按参数类型挑**：`123` 对字符串参数该被拒，但 `page`
+      // 是数字参数，`123` 是合法值 —— 拿它去断言"必须抛"只会把测试逼成假的。
+      // 所以数字参数的非法样本单独给（`-1` / 非有限数都该拒）。
+      const sample = p.wire === 'page' ? -1 : 123;
+      assert.throws(() => p.codec.create().parse(sample), `非法参数必须被拒（${p.wire} ← ${sample}）`);
     }
     // codec：宿主只要求 mode/typeSymbol/create，运行时只调 create().parse()
     for (const codec of [d.result, ...d.parameters.map((p) => p.codec)]) {
@@ -1946,6 +2030,19 @@ test('Remote 通道：手写描述符合法 + 服务绑定正确 + 七个方法�
       calls.push(['reject', name]);
       return { ok: true };
     },
+    // 记忆面板三个（2026-11-23）
+    memories: (...args) => {
+      calls.push(['memories', args.length]);
+      return { ok: true, rows: [] };
+    },
+    setPriority: (id, priority) => {
+      calls.push(['setPriority', id, priority]);
+      return { ok: true };
+    },
+    revive: (id) => {
+      calls.push(['revive', id]);
+      return { ok: true };
+    },
   });
   const binding = service.typertRemote;
   assert.ok(binding, '没有 typertRemote 绑定 → 网关会报 gateway/binding-invalid');
@@ -1963,6 +2060,9 @@ test('Remote 通道：手写描述符合法 + 服务绑定正确 + 七个方法�
   await service.distill('k1');
   await service.approve('n1');
   await service.reject('n1');
+  await service.memories('q', '', '', '', 2);
+  await service.setPriority('m1', 'P0');
+  await service.revive('m2');
   assert.deepEqual(calls, [
     'list',
     ['dismiss', 'k1'],
@@ -1971,6 +2071,9 @@ test('Remote 通道：手写描述符合法 + 服务绑定正确 + 七个方法�
     ['distill', 'k1'],
     ['approve', 'n1'],
     ['reject', 'n1'],
+    ['memories', 5],
+    ['setPriority', 'm1', 'P0'],
+    ['revive', 'm2'],
   ]);
 
   // ③ 两份贡献只在 face 上不同（宿主定义实现、客户端定义可调用方法）
@@ -3392,4 +3495,454 @@ test('U7 安装更新：不是 git 检出 → supported:false，给重装建议�
   assert.match(r.error, /dsh plugin add/, '要给一条能走通的路，不能只说"不行"');
   assert.ok(!fake.calls.some((c) => c.key.startsWith('pull ')));
   console.log('  ✅ 非 git 检出：不支持 + 给出重装建议，绝不执行 pull');
+});
+
+
+test('缺陷 38：技能诊断只计当前候选，区分忽略、已提醒、待提炼与待采纳', async () => {
+  const { analyzeSkillSuggestions } = await import('../lib/suggestion-status.js');
+  const records=Array.from({length:5},(_,i)=>({id:'diag-'+i,title:'经验'+i,kind:'experience',priority:'P1',body:'第一步检查配置。',lifecycle:i===4?'dormant':'active',tags:[]}));
+  const state={skillDismissed:{'diag-0':true,obsolete:true},skillSeen:{'diag-1':true,obsolete:true},distillRequests:['diag-2']};
+  const before=JSON.stringify(state);
+  const cfg={skill:{},extract:{mode:'suggest'}};
+  const { diagnostics:d }=analyzeSkillSuggestions(records,state,cfg,101);
+  assert.deepEqual([d.eligibleGroups,d.dismissedGroups,d.seenGroups,d.pendingGroups,d.freshGroups],[4,1,1,1,1]);
+  assert.equal(d.pendingMemories,101);assert.equal(d.activeMemories,4);assert.equal(d.dormantMemories,1);
+  assert.equal(d.status,'ready');assert.equal(JSON.stringify(state),before,'诊断不改变忽略或展示记录');
+  assert.equal(analyzeSkillSuggestions(records.slice(0,1),state,cfg).diagnostics.status,'all_dismissed');
+  assert.equal(analyzeSkillSuggestions([],state,cfg,101).diagnostics.status,'no_candidates');
+  assert.equal(analyzeSkillSuggestions(records,state,{skill:{suggest:false}}).diagnostics.status,'suggest_off');
+  assert.equal(analyzeSkillSuggestions(records,state,{skill:{enabled:false}}).diagnostics.status,'disabled');
+});
+
+test('缺陷 38：前五组已提醒或待提炼时，后面的新组仍进入界面', async () => {
+  const { analyzeSkillSuggestions }=await import('../lib/suggestion-status.js');
+  const records=Array.from({length:7},(_,i)=>({id:'ui-new-'+i,title:'流程'+i,kind:'experience',priority:i<5?'P0':'P1',body:'第一步检查。',lifecycle:'active',tags:[]}));
+  const state={skillSeen:Object.fromEntries(records.slice(0,4).map(r=>[r.id,true])),distillRequests:['ui-new-4']};
+  const {suggestions,diagnostics}=analyzeSkillSuggestions(records,state,{skill:{}});
+  const selected=mod.selectUiSuggestions(suggestions,state.skillSeen,state.distillRequests,1);
+  assert.equal(diagnostics.freshGroups,2);
+  assert.equal(selected.shown[0].key,'ui-new-5');assert.deepEqual(selected.restKeys,['ui-new-6']);
+  const initial=mod.selectUiSuggestions(suggestions,{},[],1);
+  assert.equal(initial.shown.length+initial.restKeys.length,5,'保留每批最多五组，避免批量记账溢出');
+});
+
+test('缺陷 38：待确认→采纳→技能建议→忽略的完整通道与状态工具一致', async (t) => {
+  const root=await fsp.mkdtemp(path.join(os.tmpdir(),'memfuse-skill-flow-'));
+  t.after(()=>fsp.rm(root,{recursive:true,force:true}));
+  const h=fakeCtx();let remote;
+  const inject=h.ctx.inject;
+  h.ctx.inject=(names,cb)=>{
+    if(names.includes('typert')) {
+      cb({provide:(_key,value)=>{remote=value;},effect:h.ctx.effect,typert:{register:()=>()=>{},local:{get:()=>({})}}});
+      return ()=>{};
+    }
+    return inject(names,cb);
+  };
+  const api=mod.apply(h.ctx,{root,git:false,verbose:false,extract:{enabled:false,autoRunOnStart:false},lifecycle:{autoRunOnStart:false},skill:{dir:path.join(root,'installed-skills')}});
+  await api.ready;assert.ok(remote,'真实 apply 安装 Remote 实现');
+  const {putPending}=await import('../lib/queue.js');
+  const candidate={id:'queue-flow',kind:'experience',priority:'P1',title:'部署前按流程检查',body:'第一步检查分支，再检查构建结果。',summary:'部署检查流程',anchor:'部署时',tags:['deploy'],createdAt:'2026-11-21T00:00:00Z'};
+  await putPending(api.store.root,candidate);
+  const before=await remote.list();
+  assert.equal(before.groups.length,0);assert.equal(before.diagnostics.pendingMemories,1);assert.equal(before.diagnostics.status,'no_candidates');
+  const status=h.tools.find(t=>t.name==='memfuse_status');
+  const skill=h.tools.find(t=>t.name==='memfuse_skill');
+  assert.deepEqual(JSON.parse(await status.execute()).skillSuggestions,before.diagnostics);
+  assert.deepEqual(JSON.parse(await skill.execute({action:'list'})).diagnostics,before.diagnostics);
+  assert.equal((await api.store.list()).length,0,'只读诊断不会擅自采纳');
+  const write=h.tools.find(t=>t.name==='memfuse_write');
+  assert.equal(JSON.parse(await write.execute({mode:'approve',match:candidate.title})).ok,true);
+  const ready=await remote.list();
+  assert.equal(ready.diagnostics.pendingMemories,0);assert.equal(ready.diagnostics.freshGroups,1);assert.equal(ready.groups.length,1);
+  assert.equal(ready.groups[0].seedTitle,candidate.title);
+  await remote.dismiss(ready.groups[0].key);
+  const dismissed=await remote.list();
+  assert.equal(dismissed.groups.length,0);assert.equal(dismissed.diagnostics.status,'all_dismissed');
+  assert.deepEqual(JSON.parse(await status.execute()).skillSuggestions,dismissed.diagnostics);
+});
+
+
+test('缺陷 38：排在五组已提醒之后的新卡片可以直接提炼', async (t) => {
+  const root=await fsp.mkdtemp(path.join(os.tmpdir(),'memfuse-late-distill-'));
+  t.after(()=>fsp.rm(root,{recursive:true,force:true}));
+  const llm=fakeLlm(JSON.stringify({name:'new-flow',description:'检查部署流程时用',body:'## 步骤\n1. 先检查配置\n2. 验证结果'}));
+  const h=fakeCtx({llm});let remote;
+  const inject=h.ctx.inject;
+  h.ctx.inject=(names,cb)=>{
+    if(names.includes('typert')) {
+      cb({provide:(_key,value)=>{remote=value;},effect:h.ctx.effect,typert:{register:()=>()=>{},local:{get:()=>({})}}});
+      return ()=>{};
+    }
+    return inject(names,cb);
+  };
+  const api=mod.apply(h.ctx,{root,git:false,verbose:false,extract:{enabled:true,followConversation:false,provider:'p',model:'m',autoRunOnStart:false},lifecycle:{autoRunOnStart:false},skill:{dir:path.join(root,'installed-skills')}});
+  const {state}=await api.ready;
+  for(let i=0;i<7;i++) {
+    const rec={id:'flow-'+i,title:'检查流程'+i,kind:'experience',priority:i<5?'P0':'P1',body:'第一步检查配置，再验证结果。',lifecycle:'active',tags:[],created:'2026-11-21T00:00:00Z',updated:'2026-11-21T00:00:00Z'};
+    await api.store.write(rec);
+  }
+  state.skillSeen=Object.fromEntries(Array.from({length:5},(_,i)=>['flow-'+i,true]));
+  const card=await remote.list();
+  assert.equal(card.groups.length,1);assert.equal(card.diagnostics.freshGroups,2);
+  const key=card.groups[0].key;assert.ok(['flow-5','flow-6'].includes(key));
+  await remote.markSeen([key,...card.restKeys]);
+  const result=await remote.distill(key);
+  assert.equal(result.ok,true,JSON.stringify(result));
+  assert.equal(result.name,'new-flow');assert.match(result.content,/步骤/);
+  assert.equal((await remote.list()).pendingSkills.length,1);
+});
+
+// ─────────────────────────── 记忆面板（2026-11-23）───────────────────────────
+//
+// 用户原话：「能否做出来面板，让我查看我已经有的记忆，然后我可以主动调整记忆，
+// 由我判定哪些记忆更常用」。下面这些用例锁的就是这句话能不能成立：
+//   ① 面板必须能看到**全部**记忆（含休眠），并且知道哪几条真在常驻；
+//   ② "用户置顶"必须真的改注入内容（不是只写个标记）；
+//   ③ 置顶超上限时**必须说出来**，不能静默丢弃；
+//   ④ 降级要把 P0 的永不过期一起撤销（否则"降级"之后它还是永不消失）；
+//   ⑤ 休眠条目改优先级**不会**自动生效，界面必须能告诉用户（我们断言 plan 里的标记）。
+
+test('记忆面板：能列出全部记忆、常驻顺序、以及挤不进常驻块的溢出条目', async (t) => {
+  const root = await fsp.mkdtemp(path.join(os.tmpdir(), 'memfuse-panel-'));
+  t.after(() => fsp.rm(root, { recursive: true, force: true }));
+  const h = fakeCtx();
+  const api = mod.apply(h.ctx, {
+    root, git: false, verbose: false,
+    extract: { enabled: false, autoRunOnStart: false },
+    lifecycle: { autoRunOnStart: false },
+    // 上限压到 2 条，才能在用例里造出溢出（默认 8 条要写 9 条记录，没必要）
+    inject: { residentMaxEntries: 2, residentMaxChars: 1200 },
+  });
+  await api.ready;
+
+  // 三条 P0 + 一条 P1 + 一条休眠：溢出 1 条，休眠 1 条
+  const write = (id, priority, extra = {}) =>
+    api.store.write({
+      id, title: `记忆 ${id}`, kind: 'fact', priority,
+      summary: `摘要 ${id}`, body: '正文内容', lifecycle: 'active',
+      tags: ['t'], created: '2026-01-01T00:00:00Z', updated: '2026-01-01T00:00:00Z',
+      stats: { recalled: 0, injected: 0, positive: 0, negative: 0 },
+      ...extra,
+    });
+  await write('r1', 'P0');
+  await write('r2', 'P0');
+  await write('r3', 'P0');
+  await write('p1', 'P1');
+  await write('d1', 'P2', { lifecycle: 'dormant', dormantAt: '2026-01-02T00:00:00Z' });
+
+  const { buildView, annotateRows } = await import('../lib/memory-view.js');
+  const all = await api.store.list();
+  const view = buildView(all, { residentMaxEntries: 2 });
+
+  assert.equal(view.stats.total, 5, '面板必须能看到全部 5 条');
+  assert.equal(view.stats.byPriority.P0, 3);
+  assert.equal(view.stats.dormant, 1, '休眠条目也要出现在列表里（否则用户找不到要唤醒的东西）');
+  assert.equal(view.resident.length, 2, '常驻块只装上限那么多条');
+  assert.equal(view.overflow.length, 1, '超出上限的那条必须被单独列出来，不能静默消失');
+  assert.equal(
+    view.stats.residentOverflow, 1,
+    '统计里也要有这个数 —— 用户看顶部就知道"我置顶了几条、几条真生效"',
+  );
+
+  // 「为什么这条没生效」必须算出来（溢出 / 休眠两种）
+  const why = annotateRows(view);
+  const reasons = Object.fromEntries(why.map((r) => [r.id, r.reason?.code ?? null]));
+  assert.equal(reasons[view.overflow[0]], 'overflow', '溢出条目要说清"超出常驻上限"');
+  assert.equal(reasons.d1, 'dormant', '休眠条目要说清"不参与注入"');
+  assert.equal(reasons.p1, null, '正常条目不该挂一条原因说明');
+
+  console.log('  ✅ 面板：全量可见 / 常驻顺序 / 溢出与休眠各自有原因说明');
+});
+
+test('记忆面板：置顶真的改注入内容，降级会撤销 P0 的永不过期', async (t) => {
+  const root = await fsp.mkdtemp(path.join(os.tmpdir(), 'memfuse-pin-'));
+  t.after(() => fsp.rm(root, { recursive: true, force: true }));
+  const h = fakeCtx();
+  let remote = null;
+  const inject = h.ctx.inject;
+  h.ctx.inject = (names, cb) => {
+    if (names.includes('typert')) {
+      cb({
+        provide: (_key, value) => { remote = value; },
+        effect: h.ctx.effect,
+        typert: { register: () => () => {}, local: { get: () => ({}) } },
+      });
+      return () => {};
+    }
+    return inject(names, cb);
+  };
+  const api = mod.apply(h.ctx, {
+    root, git: false, verbose: false,
+    extract: { enabled: false, autoRunOnStart: false },
+    lifecycle: { autoRunOnStart: false },
+    inject: { residentMaxEntries: 8 },
+  });
+  await api.ready;
+  assert.ok(remote, '真实 apply 必须装好 Remote');
+  await api.store.write({
+    id: 'pick-me', title: '这条由用户置顶', kind: 'fact', priority: 'P1',
+    summary: '我要它每轮都在', body: '正文', lifecycle: 'active',
+    created: '2026-01-01T00:00:00Z', updated: '2026-01-01T00:00:00Z',
+    expires: '2026-02-01T00:00:00Z',
+    stats: { recalled: 0, injected: 0, positive: 0, negative: 0 },
+  });
+
+  // ① 置顶
+  const pinned = await remote.setPriority('pick-me', 'P0');
+  assert.equal(pinned.ok, true, JSON.stringify(pinned));
+  assert.equal(pinned.changed, true);
+  assert.equal(pinned.from, 'P1');
+  assert.ok(pinned.residentAfter.includes('pick-me'), '置顶之后它必须进入常驻集合');
+
+  const after = await api.store.read('pick-me');
+  assert.equal(after.priority, 'P0', '必须真的写进磁盘');
+  assert.equal(after.expires, null, 'P0 永不过期 —— 降级时要有对称处理，置顶时先清掉');
+  assert.ok(after.pinnedAt, '置顶要写 pinnedAt：这是排序依据（否则召回续期会把它挤走）');
+
+  // ② 它必须真的出现在**注入**里（不是只改了个字段）
+  const { buildInjection } = await import('../lib/inject.js');
+  const inj = buildInjection(await api.store.list(), '完全无关的问题', { ok: true });
+  assert.ok(inj.text.includes('这条由用户置顶'), '置顶的记忆必须出现在注入文本里');
+
+  // ③ 降级：P0 → P1，并且 expires 要重新算（从"永不过期"回到"30 天"）
+  const unpinned = await remote.setPriority('pick-me', 'P1');
+  assert.equal(unpinned.ok, true);
+  assert.equal(unpinned.changed, true);
+  const back = await api.store.read('pick-me');
+  assert.equal(back.priority, 'P1');
+  assert.equal(back.pinnedAt, null, '降级要清掉 pinnedAt（否则以后再升 P0 会带着旧时刻）');
+  assert.ok(back.expires, '降级必须重算过期时间 —— 否则"降了级"的记忆永远不过期，等于没降');
+  assert.ok(Date.parse(back.expires) > Date.now(), 'P1 的过期时间应该在将来');
+
+  const inj2 = buildInjection(await api.store.list(), '完全无关的问题', { ok: true });
+  assert.ok(!inj2.text.includes('这条由用户置顶'), '降级之后它不该再出现在每轮注入里');
+
+  console.log('  ✅ 置顶/降级：写盘 + 注入内容 + 过期语义三者一致');
+});
+
+test('记忆面板：置顶超上限会挤掉最旧那条，并且把后果如实带回界面', async (t) => {
+  const root = await fsp.mkdtemp(path.join(os.tmpdir(), 'memfuse-overflow-'));
+  t.after(() => fsp.rm(root, { recursive: true, force: true }));
+  const h = fakeCtx();
+  let remote = null;
+  const inject = h.ctx.inject;
+  h.ctx.inject = (names, cb) => {
+    if (names.includes('typert')) {
+      cb({
+        provide: (_key, value) => { remote = value; },
+        effect: h.ctx.effect,
+        typert: { register: () => () => {}, local: { get: () => ({}) } },
+      });
+      return () => {};
+    }
+    return inject(names, cb);
+  };
+  const api = mod.apply(h.ctx, {
+    root, git: false, verbose: false,
+    extract: { enabled: false, autoRunOnStart: false },
+    lifecycle: { autoRunOnStart: false },
+    inject: { residentMaxEntries: 2 },
+  });
+  await api.ready;
+
+  const rec = (id, pinnedAt) => ({
+    id, title: id, kind: 'fact', priority: 'P0',
+    body: '正文', lifecycle: 'active',
+    created: '2026-01-01T00:00:00Z', updated: '2026-01-01T00:00:00Z',
+    ...(pinnedAt ? { pinnedAt } : {}),
+    stats: { recalled: 0, injected: 0, positive: 0, negative: 0 },
+  });
+  // 两条已经在常驻块里（旧的 pinnedAt 先写），第三条是 P1
+  await api.store.write(rec('old1', '2026-01-01T00:00:00Z'));
+  await api.store.write(rec('old2', '2026-01-02T00:00:00Z'));
+  await api.store.write({
+    ...rec('newest'), priority: 'P1', pinnedAt: null,
+    expires: '2026-02-01T00:00:00Z',
+  });
+
+  const res = await remote.setPriority('newest', 'P0');
+  assert.equal(res.ok, true);
+  assert.equal(res.cap, 2);
+  assert.ok(res.targetVisible, '新置顶的那条必须进常驻块（它是最新的）');
+  assert.deepEqual(
+    res.pushedOut, ['old1'],
+    `必须点名被挤出去的那条（实际 ${JSON.stringify(res.pushedOut)}）—— ` +
+      '静默挤掉一条 P0 等于悄悄改了每轮注入的内容',
+  );
+  assert.equal(res.stillOverflow, 1, '溢出区仍有 1 条（old1），界面要提示"还有 N 条 P0 看不见"');
+
+  // 挤出去的那条**仍然带 P0 标记**（实现如此）—— 所以界面必须解释它为什么不生效
+  const view = await remote.memories('', '', '', '', 1);
+  assert.equal(view.resident.length, 2);
+  assert.equal(view.overflow.length, 1);
+  assert.equal(view.overflow[0], 'old1');
+  const row = view.rows.find((r) => r.id === 'old1');
+  assert.equal(row.reason.code, 'overflow', '溢出条目必须自带"超出上限"的说明');
+  assert.match(row.reason.reason, /常驻|上限/);
+
+  console.log('  ✅ 置顶超上限：挤出谁被点名，溢出条目自带原因说明');
+});
+
+test('记忆面板：唤醒休眠记忆（唯一能把条目救回来的动作）', async (t) => {
+  const root = await fsp.mkdtemp(path.join(os.tmpdir(), 'memfuse-revive-'));
+  t.after(() => fsp.rm(root, { recursive: true, force: true }));
+  const h = fakeCtx();
+  let remote = null;
+  const inject = h.ctx.inject;
+  h.ctx.inject = (names, cb) => {
+    if (names.includes('typert')) {
+      cb({
+        provide: (_key, value) => { remote = value; },
+        effect: h.ctx.effect,
+        typert: { register: () => () => {}, local: { get: () => ({}) } },
+      });
+      return () => {};
+    }
+    return inject(names, cb);
+  };
+  const api = mod.apply(h.ctx, {
+    root, git: false, verbose: false,
+    extract: { enabled: false, autoRunOnStart: false },
+    lifecycle: { autoRunOnStart: false },
+  });
+  await api.ready;
+  await api.store.write({
+    id: 'sleepy', title: '休眠的那条', kind: 'fact', priority: 'P1',
+    body: '正文', lifecycle: 'dormant', dormantAt: '2025-01-01T00:00:00Z',
+    created: '2024-12-01T00:00:00Z', updated: '2025-01-01T00:00:00Z',
+    stats: { recalled: 0, injected: 0, positive: 0, negative: 0 },
+  });
+
+  const first = await remote.revive('sleepy');
+  assert.equal(first.ok, true);
+  assert.equal(first.changed, true);
+  const back = await api.store.read('sleepy');
+  assert.equal(back.lifecycle, 'active', '唤醒必须真的写回 active');
+  assert.ok(back.expires, '唤醒要重算过期时间（否则下一条维护又把它转回休眠）');
+
+  // 幂等：已经是 active 就不要报错，也不要伪造一次改动
+  const again = await remote.revive('sleepy');
+  assert.equal(again.ok, true);
+  assert.equal(again.changed, false, '本来就是 active 时不该声称"改过"');
+
+  // 不存在的 id：明确失败（不是静默成功）
+  const missing = await remote.revive('nope');
+  assert.equal(missing.ok, false);
+  assert.match(String(missing.error), /nope/);
+
+  console.log('  ✅ 唤醒：写回 active + 重算过期 + 幂等 + 不存在时明确失败');
+});
+
+test('记忆面板：改优先级只碰优先级，不动正文（面板不是编辑器）', async (t) => {
+  const root = await fsp.mkdtemp(path.join(os.tmpdir(), 'memfuse-noedit-'));
+  t.after(() => fsp.rm(root, { recursive: true, force: true }));
+  const h = fakeCtx();
+  let remote = null;
+  const inject = h.ctx.inject;
+  h.ctx.inject = (names, cb) => {
+    if (names.includes('typert')) {
+      cb({
+        provide: (_key, value) => { remote = value; },
+        effect: h.ctx.effect,
+        typert: { register: () => () => {}, local: { get: () => ({}) } },
+      });
+      return () => {};
+    }
+    return inject(names, cb);
+  };
+  const api = mod.apply(h.ctx, {
+    root, git: false, verbose: false,
+    extract: { enabled: false, autoRunOnStart: false },
+    lifecycle: { autoRunOnStart: false },
+  });
+  await api.ready;
+  const original = {
+    id: 'keep-body', title: '原标题', kind: 'decision', priority: 'P2',
+    summary: '原摘要', anchor: '部署时', body: '## 原正文\n不要改我。',
+    tags: ['a', 'b'], lifecycle: 'active',
+    created: '2026-01-01T00:00:00Z', updated: '2026-01-01T00:00:00Z',
+    stats: { recalled: 3, injected: 1, positive: 1, negative: 0 },
+  };
+  await api.store.write(original);
+
+  await remote.setPriority('keep-body', 'P0');
+  const after = await api.store.read('keep-body');
+  for (const key of ['title', 'body', 'summary', 'anchor', 'kind']) {
+    assert.equal(after[key], original[key], `${key} 不该被面板改动（面板只改优先级）`);
+  }
+  assert.deepEqual(after.tags, original.tags, 'tags 不该被动');
+  assert.deepEqual(after.stats, original.stats, 'stats 不该被清零（那是"召回历史"，面板无权改）');
+  assert.equal(after.created, original.created, 'created 不该被动');
+
+  // 非法优先级：拒绝，且**不写盘**
+  const bad = await remote.setPriority('keep-body', 'P9');
+  assert.equal(bad.ok, false);
+  assert.equal((await api.store.read('keep-body')).priority, 'P0', '非法输入不该改动磁盘');
+
+  console.log('  ✅ 面板只改优先级：正文/标签/统计/创建时间都不动，非法输入拒绝');
+});
+// ───────────── 溢出不是"消失"（2026-11-23 自查更正的一条事实）─────────────
+//
+// 第一版面板文案写的是"超出常驻上限 = 本轮的注入里看不到它"。
+// **那是假的**，端到端验证把它抓出来了：溢出条目确实进不了 Block A，
+// 但它照样出现在 Block B（相关召回）里，因为
+//   ① `recall.js:211` 明确给 P0 开了词法豁免：`l <= 0 && rec.priority !== 'P0'` 才跳过；
+//   ② P0 的零词法底分 = 0.18×1.0 + 0.12×confidence + 0.07×freshness ≈ 0.34 > 阈值 0.18。
+//
+// 这条回归把真实行为钉住：**溢出 P0 仍会被召回**。
+// 别把它"修"成"溢出就彻底不注入" —— 那是改设计，不是改文案；
+// 若真要改，得先想清"用户置顶了 12 条、只生效 8 条"到底应该怎么表现。
+
+test('记忆面板：溢出常驻块的 P0 仍会从相关召回进来（所以文案不能说"看不到"）', async (t) => {
+  const root = await fsp.mkdtemp(path.join(os.tmpdir(), 'memfuse-overflow-recall-'));
+  t.after(() => fsp.rm(root, { recursive: true, force: true }));
+  const h = fakeCtx();
+  const api = mod.apply(h.ctx, {
+    root, git: false, verbose: false,
+    extract: { enabled: false, autoRunOnStart: false },
+    lifecycle: { autoRunOnStart: false },
+    inject: { residentMaxEntries: 2 },
+  });
+  await api.ready;
+
+  const rec = (id, pinnedAt) => ({
+    id, title: `标题 ${id}`, kind: 'fact', priority: 'P0',
+    summary: `摘要 ${id}`, body: '正文', lifecycle: 'active',
+    created: '2026-01-01T00:00:00Z', updated: '2026-01-01T00:00:00Z',
+    pinnedAt,
+    stats: { recalled: 0, injected: 0, positive: 0, negative: 0 },
+  });
+  // 三条 P0，上限 2 → old1 排最后（最旧的 pinnedAt）会被挤出常驻块
+  await api.store.write(rec('new1', '2026-03-01T00:00:00Z'));
+  await api.store.write(rec('new2', '2026-02-01T00:00:00Z'));
+  await api.store.write(rec('old1', '2026-01-01T00:00:00Z'));
+
+  const { buildView } = await import('../lib/memory-view.js');
+  const view = buildView(await api.store.list(), { residentMaxEntries: 2 });
+  assert.equal(view.resident.length, 2);
+  assert.deepEqual(view.overflow, ['old1'], 'old1 应该被挤出常驻块');
+
+  // 关键断言：它**仍然**会出现在注入里 —— 走的是 Block B，不是 Block A。
+  const { buildInjection } = await import('../lib/inject.js');
+  const inj = buildInjection(await api.store.list(), '完全无关的提问', { ok: true }, { residentMaxEntries: 2 });
+  const blockA = inj.text.split('### 相关召回')[0];
+  const blockB = inj.text.includes('### 相关召回') ? inj.text.split('### 相关召回')[1] : '';
+  assert.ok(!blockA.includes('标题 old1'), 'old1 不该在常驻块（Block A）里 —— 它被挤出去了');
+  assert.ok(
+    blockB.includes('标题 old1'),
+    `溢出 P0 仍必须能从相关召回（Block B）进来（实际 Block B：${JSON.stringify(blockB.slice(0, 200))}）。` +
+      '如果这条红了，说明召回对 P0 的豁免被改了 —— 那面板文案也要跟着改，别留着两句互相矛盾的话',
+  );
+
+  // 溢出条目在面板上的说明**不许**写"看到不了"
+  const { annotateRows } = await import('../lib/memory-view.js');
+  const row = annotateRows(view).find((r) => r.id === 'old1');
+  assert.equal(row.reason.code, 'overflow');
+  assert.ok(
+    !/注入里看不到|每一轮都不会被注入/.test(row.reason.reason),
+    `溢出说明不许写"看不到"（它刚刚被 Block B 注入了）：${row.reason.reason}`,
+  );
+  assert.match(row.reason.reason, /开头|相关召回/, '要说清是"不固定排在开头 / 靠相关召回"');
+
+  console.log('  ✅ 溢出 P0：不进 Block A，但仍从 Block B 进来 —— 文案与行为一致');
 });

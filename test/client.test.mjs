@@ -133,6 +133,12 @@ async function loadClientHalf({
   updateImpl = null,
   /** 覆盖 `applyUpdate` 的实现（安装更新那条路）。 */
   installImpl = null,
+  /** 覆盖 `memories` 的实现（记忆面板读取）。 */
+  panelImpl = null,
+  /** 覆盖 `setPriority` 的实现（面板置顶 / 降级）。 */
+  setPriorityImpl = null,
+  /** 覆盖 `revive` 的实现（面板唤醒）。 */
+  reviveImpl = null,
   /** 宿主是否接受写入（false = 模拟"非 volatile 字段被拒"）。 */
   mutateOk = true,
 } = {}) {
@@ -288,6 +294,33 @@ async function loadClientHalf({
           updatedAt: '2026-10-18T00:00:00.000Z',
         },
       };
+    },
+    // ── 2026-11-23：记忆面板三个端点 ──
+    // 形状与宿主 `lib/memory-view.js` 的 buildView + annotateRows 一致；
+    // 用例可以用 `panelImpl` 覆盖它（测失败/溢出等分支）。
+    memories: async (...args) => {
+      remoteCalls.push(['memories', ...args]);
+      if (panelImpl !== null) return panelImpl(...args);
+      return {
+        ok: true,
+        value: {
+          stats: { total: 0, active: 0, dormant: 0, byPriority: { P0: 0, P1: 0, P2: 0 }, residentCap: 8, residentCount: 0, residentOverflow: 0 },
+          resident: [], overflow: [], rows: [],
+          page: 1, pageSize: 50, pageCount: 1, totalMatches: 0,
+          filters: { query: '', priority: '', lifecycle: '', scope: '' },
+          residentMaxEntries: 8, residentMaxChars: 1200, readError: null,
+        },
+      };
+    },
+    setPriority: async (id, priority) => {
+      remoteCalls.push(['setPriority', id, priority]);
+      if (setPriorityImpl !== null) return setPriorityImpl(id, priority);
+      return { ok: true, value: { ok: true, changed: true, id, to: priority, targetVisible: true, pushedOut: [] } };
+    },
+    revive: async (id) => {
+      remoteCalls.push(['revive', id]);
+      if (reviveImpl !== null) return reviveImpl(id);
+      return { ok: true, value: { ok: true, changed: true, revived: id } };
     },
   };
 
@@ -448,9 +481,12 @@ const settle = async (turns = 5) => {
 
 /** 在 jsx 假树里找一个按钮（按文案认，递归）。 */
 function findButton(node, label) {
-  if (node === null || typeof node !== 'object') return null;
-  if (node.type === 'button' && node.props?.children === label) return node;
-  const kids = node.props?.children;
+  // ⚠️ 先展开函数组件（React 会做，假树不会）。`textOfTree` 早就这么做了，
+  // 这里以前没有 —— 于是"嵌在子组件里的按钮"永远找不到，看起来像功能没做。
+  const current = renderNode(node);
+  if (current === null || typeof current !== 'object') return null;
+  if (current.type === 'button' && current.props?.children === label) return current;
+  const kids = current.props?.children;
   for (const kid of Array.isArray(kids) ? kids : kids === undefined ? [] : [kids]) {
     const hit = findButton(kid, label);
     if (hit !== null) return hit;
@@ -491,6 +527,7 @@ function textOfTree(node) {
   if (typeof node === 'string') return node;
   if (typeof node !== 'object') return '';
   const current = renderNode(node);
+  if (current === null || current === undefined) return '';
   if (typeof current === 'string') return current;
   const label = typeof current.props?.label === 'string' ? current.props.label : '';
   const kids = current.props?.children;
@@ -654,8 +691,9 @@ test('client half：卡片数据源必须走**注入过 remote.memfuse 的子 ct
   assert.equal(h.mounted.length, 1, '必须把自己那份贡献挂到 Remote 上（否则 remote.memfuse 不存在）');
   assert.equal(h.mounted[0].package, 'dsh-memfuse');
   assert.equal(h.mounted[0].face, 'client');
-  // 九个端点：读候选 / 表态 四个 + 缺陷 25 的 distill·approve·reject 三个 + 检查更新一个 + 安装更新一个
-  assert.equal(h.mounted[0].descriptors.length, 9);
+  // 十二个端点：读候选 / 表态 四个 + 缺陷 25 的 distill·approve·reject 三个 +
+  // 检查更新一个 + 安装更新一个 + 记忆面板三个（memories·setPriority·revive）
+  assert.equal(h.mounted[0].descriptors.length, 12);
   assert.ok(
     h.remoteCalls.some((call) => call[0] === 'list'),
     '挂上之后要真的拉一次候选 —— 不拉的话卡片永远是空的',
@@ -1726,7 +1764,7 @@ test('client half：配置页要显示候选卡片的连通状态（卡片不出
   const good = await mount({ value: {} });
   await settle();
   const page = good.Component(good.props);
-  assert.match(JSON.stringify(page), /已连上（1 组候选待你决定）/, '连上要说出来');
+  assert.match(JSON.stringify(page), /候选通道：已连接/, '连上要说出来');
 
   // ② 数据源报错：把原始消息显示出来
   const bad = await mount({
@@ -1883,3 +1921,306 @@ test('缺陷 27：切回窗口（wake）要立刻再试，不等退避', async (
   console.log('  ✅ 切回窗口立刻重试，成功即收掉错误');
 });
 
+
+
+test('缺陷 38：设置页解释无卡片原因与待确认记忆，读取和渲染均不改用户数据', async () => {
+  const diagnostic={status:'all_dismissed',totalMemories:119,activeMemories:26,dormantMemories:93,eligibleGroups:2,dismissedGroups:2,seenGroups:0,pendingGroups:0,freshGroups:0,pendingMemories:101,extractMode:'suggest'};
+  const h=await mount({value:{},suggestions:{groups:[],restKeys:[],pendingDistill:[],pendingSkills:[],diagnostics:diagnostic}});
+  await settle();
+  const text=textOfTree(h.Component(h.props));
+  assert.match(text,/候选通道：已连接/);
+  assert.match(text,/当前 2 组建议已被忽略/);
+  assert.ok(text.includes('活跃 26 / 休眠 93'));
+  assert.match(text,/101 条新记忆待你确认/);
+  assert.match(text,/采纳前不会参与技能判定/);
+  assert.equal(h.writes.length,0);
+  assert.ok(!h.remoteCalls.some(c=>['markSeen','dismiss','approve','distill'].includes(c[0])));
+  await h.dispose();
+  for(const [status,expected] of [['no_candidates',/暂无达到条件/],['no_fresh',/已提醒或正在提炼/],['ready',/3 组新建议/],['suggest_off',/主动提示已关闭/]]) {
+    const another=await mount({suggestions:{groups:[],restKeys:[],diagnostics:{...diagnostic,status,freshGroups:3,pendingMemories:0}}});
+    await settle();
+    assert.match(textOfTree(another.Component(another.props)),expected);
+    await another.dispose();
+  }
+});
+// ─────────────────────────── 记忆面板（2026-11-23）───────────────────────────
+//
+// 面板的数据源有三件事**只能靠行为断言**（渲染路径测不到）：
+//   ① 参数必须是**位置参数**（宿主网关按 descriptor.parameters 顺序逐个解析）；
+//   ② 首次加载必须**幂等**（渲染期调用，React 会重复渲染）；
+//   ③ 改完优先级必须把"挤掉了谁 / 到底生效没有"写进提示（否则用户以为白点了）。
+
+/** 从 loaded bundle 里取出面板数据源类（只给测试的导出，见 client.js 的注释）。 */
+async function panelKit() {
+  const { exports } = await loadClientHalf();
+  assert.equal(typeof exports.MemoryPanelFeed, 'function', '必须导出记忆面板数据源（供测试用）');
+  return exports;
+}
+
+test('记忆面板：memories 端点走**位置参数**，参数顺序与宿主描述符一致', async () => {
+  const exports = await panelKit();
+  const calls = [];
+  const ctx = {
+    remote: {
+      memfuse: {
+        memories: async (...args) => {
+          calls.push(args);
+          return { ok: true, value: { page: 1, rows: [], resident: [], overflow: [], stats: {}, filters: {} } };
+        },
+      },
+    },
+  };
+  const feed = new exports.MemoryPanelFeed(ctx);
+  await feed.load();
+  assert.equal(calls.length, 1);
+  assert.deepEqual(
+    calls[0],
+    ['', '', '', '', 1],
+    '必须按 (query, priority, lifecycle, scope, page) 传位置参数，实际 ' + JSON.stringify(calls[0]) +
+      '。传成一个对象会让宿主把第一个字符串之外的条件全丢掉，而且不报错',
+  );
+
+  // 改筛选 → 参数跟着变，且**翻页回第 1 页**（换条件还停在旧页码没有意义）
+  feed.setPage(3);
+  await feed.load();
+  assert.equal(calls.at(-1)[4], 3, '翻页要真的把页码传下去');
+  await feed.setFilter('priority', 'P0');
+  const last = calls.at(-1);
+  assert.equal(last[1], 'P0', '筛选值要落在**第 2 个**位置参数上（priority）');
+  assert.equal(last[4], 1, '改筛选必须重置回第 1 页');
+
+  // 页码非法时不该发请求
+  const before = calls.length;
+  await feed.setPage(0);
+  assert.equal(calls.length, before, '非法页码（0）不该发请求');
+  feed.dispose();
+  console.log('  ✅ 面板参数：位置参数顺序正确、筛选重置页码、非法页码不发请求');
+});
+
+test('记忆面板：ensureLoaded 幂等（渲染期调用也不会每帧打一次请求）', async () => {
+  const exports = await panelKit();
+  let resolveFirst = null;
+  let count = 0;
+  const ctx = {
+    remote: {
+      memfuse: {
+        memories: async () => {
+          count += 1;
+          // 第一次挂住，用来验"飞行中不重复发"
+          if (count === 1) await new Promise((resolve) => { resolveFirst = resolve; });
+          return { ok: true, value: { page: 1, rows: [], resident: [], overflow: [], stats: {}, filters: {} } };
+        },
+      },
+    },
+  };
+  const feed = new exports.MemoryPanelFeed(ctx);
+  // 首屏连敲三次（模拟 StrictMode 双渲染 + 父组件更新）
+  const a = feed.ensureLoaded();
+  const b = feed.ensureLoaded();
+  const c = feed.ensureLoaded();
+  await settle();
+  assert.equal(count, 1, '飞行中必须只发一次请求，实际发了 ' + count + ' 次');
+  resolveFirst();
+  await Promise.all([a, b, c]);
+  assert.equal(feed.store.getSnapshot().status, 'ready');
+
+  // 已经是 ready：再敲也不发
+  await feed.ensureLoaded();
+  assert.equal(count, 1, '数据已经在了就不该再拉（否则每帧一次请求）');
+
+  // 出错之后 ensureLoaded **不许**自己重试（那是 scheduleRetry 的事，它带退避）
+  const broken = new exports.MemoryPanelFeed({
+    remote: { memfuse: { memories: async () => { throw new Error('HTTP 404'); } } },
+  });
+  await broken.load();
+  assert.equal(broken.store.getSnapshot().status, 'error');
+  const before = broken.retryCount;
+  await broken.ensureLoaded();
+  assert.equal(broken.retryCount, before, '出错后 ensureLoaded 不该绕过退避自己再试');
+  broken.dispose();
+  feed.dispose();
+  console.log('  ✅ 幂等加载：飞行中只一次、ready 后不再拉、出错交给退避');
+});
+
+test('记忆面板：改优先级的提示必须说出后果（挤出谁 / 到底生效没有）', async () => {
+  const exports = await panelKit();
+  let response = null;
+  const ctx = {
+    remote: {
+      memfuse: {
+        memories: async () => ({ ok: true, value: { page: 1, rows: [], resident: [], overflow: [], stats: {}, filters: {} } }),
+        setPriority: async () => response,
+      },
+    },
+  };
+  const feed = new exports.MemoryPanelFeed(ctx);
+
+  // ① 正常置顶：说"已置顶"
+  response = { ok: true, value: { ok: true, changed: true, from: 'P1', to: 'P0', targetVisible: true, pushedOut: [] } };
+  await feed.setPriority('m1', 'P0', '某条记忆');
+  assert.match(feed.store.getSnapshot().note ?? '', /已置顶/);
+
+  // ② 挤掉了别人：**必须点名**（静默挤掉一条等于悄悄改了每轮注入）
+  response = {
+    ok: true,
+    value: { ok: true, changed: true, from: 'P1', to: 'P0', targetVisible: true, pushedOut: ['old1', 'old2'] },
+  };
+  await feed.setPriority('m2', 'P0', '新那条');
+  assert.match(
+    feed.store.getSnapshot().note ?? '',
+    /挤出/,
+    '把别人挤出常驻块时必须写出来（否则用户不知道自己的置顶把谁顶掉了）',
+  );
+
+  // ③ 目标自己挤不进去：也要说清。
+  // ⚠️ 措辞必须是"不再固定排在开头"，**不是**"本轮看不到" —— P0 有词法豁免
+  // （recall.js:211），零匹配底分 ≈0.34 > 阈值 0.18，所以溢出条目照样能从相关召回进来。
+  response = { ok: true, value: { ok: true, changed: true, from: 'P1', to: 'P0', targetVisible: false, pushedOut: [] } };
+  await feed.setPriority('m3', 'P0', '倒霉那条');
+  const notVisibleNote = feed.store.getSnapshot().note ?? '';
+  assert.match(notVisibleNote, /上限/, '目标没进常驻块时必须说清原因');
+  assert.match(notVisibleNote, /开头|相关召回/, '要写清"不固定排在开头、只能靠相关召回"');
+  assert.ok(!/本轮注入里看不到/.test(notVisibleNote), '不能写成"本轮看不到" —— 溢出条目仍可能被召回');
+
+  // ④ 休眠条目改优先级不会生效：必须提示"再点唤醒"
+  response = { ok: true, value: { ok: true, changed: true, from: 'P2', to: 'P0', dormant: true, pushedOut: [] } };
+  await feed.setPriority('m4', 'P0', '睡着那条');
+  assert.match(feed.store.getSnapshot().note ?? '', /唤醒/, '休眠条目改优先级不会让它生效，必须提示去唤醒');
+
+  // ⑤ 幂等（本来就这个优先级）：不能假装改过
+  response = { ok: true, value: { ok: true, changed: false } };
+  await feed.setPriority('m5', 'P1', '本来就这样');
+  assert.match(feed.store.getSnapshot().note ?? '', /没有改动|本来就是/, '没改动时不该声称改过');
+
+  // ⑥ 失败：原始报错原样上屏（硬规则 4）。
+  // ⚠️ 落在 `actionError` 而**不是** `error`：动作之后还会重拉一次列表，
+  // 那次刷新是**成功的** —— 混用一个字段的话报错会被它清掉（第一版就是这样）。
+  ctx.remote.memfuse.setPriority = async () => ({ ok: false, error: { message: '磁盘满了' } });
+  await feed.setPriority('m6', 'P0', '失败的');
+  assert.match(feed.store.getSnapshot().actionError ?? '', /磁盘满了/, '原始报错必须原样显示，不许吞');
+  assert.equal(feed.store.getSnapshot().status, 'ready', '动作失败不该把列表整体标成"读不到"');
+
+  feed.dispose();
+  console.log('  ✅ 后果如实上报：置顶 / 挤掉谁 / 没进常驻 / 还在休眠 / 没改动 / 失败原文');
+});
+
+test('记忆面板：通道没挂上时动作给出明确失败，而不是静默什么都不做', async () => {
+  const exports = await panelKit();
+  // 数据源拿不到 remote.memfuse（模拟贡献没挂上）
+  const feed = new exports.MemoryPanelFeed({ remote: {} });
+  await feed.load();
+  const snapshot = feed.store.getSnapshot();
+  assert.equal(snapshot.status, 'error');
+  assert.match(String(snapshot.error), /不在|挂上/, '必须说明"端点不在"，实际：' + snapshot.error);
+  feed.dispose();
+  console.log('  ✅ 通道缺失：明确报"端点不在"，不静默');
+});// ──────────────────── 记忆面板：渲染（设置页整条路径）────────────────────
+//
+// 前面的用例测的是**数据源**（参数、幂等、后果上报）；这一条测的是**渲染**：
+// 面板真的出现在设置页上、真的把记忆列出来、真的能点。
+// 为什么必须单独测：面板是唯一一张"用户会盯着看几百条数据"的界面，
+// 它一旦渲染崩了（某个字段 null、某个 map 漏 key），整个设置页会白屏 ——
+// 而那种失败在数据源测试里完全看不见。
+
+test('记忆面板：设置页真的渲染出记忆列表，并把溢出/休眠的原因说出来', async () => {
+  // 面板数据源要真的挂上：先走一遍 apply()，再把它拿到的那份 card 交给设置页。
+  const h = await loadClientHalf({ value: {}, suggestions: EMPTY_FEED });
+  // ⚠️ 必须先 apply()：注册面（settings.section 等）是 apply 里挂的。
+  h.exports.apply(h.ctx);
+  await settle();
+  // 宿主侧的面板响应（形状与 lib/memory-view.js 的 buildView + annotateRows 一致）
+  const PANEL = {
+    stats: {
+      total: 3, active: 2, dormant: 1, stale: 0,
+      byPriority: { P0: 2, P1: 0, P2: 1 }, byScope: { workspace: 3, user: 0, global: 0 },
+      byKind: { fact: 3 }, residentCap: 1, residentCount: 1, residentOverflow: 1,
+    },
+    resident: ['m1'],
+    overflow: ['m2'],
+    rows: [
+      {
+        id: 'm1', title: '要我每轮都记得的那条', summary: '常驻摘要', priority: 'P0', lifecycle: 'active',
+        scope: 'workspace', kind: 'fact', updated: '2026-11-01T00:00:00Z', dormant: false,
+        resident: true, overflow: false, reason: null, stats: { recalled: 5 },
+      },
+      {
+        id: 'm2', title: '被挤出常驻块的那条', summary: '溢出摘要', priority: 'P0', lifecycle: 'active',
+        scope: 'workspace', kind: 'fact', updated: '2026-11-02T00:00:00Z', dormant: false,
+        resident: true, overflow: true,
+        reason: {
+          code: 'overflow',
+          reason: '已置顶，但超出常驻条数上限 —— 不再固定出现在每轮开头，只能靠在相关召回里被选中',
+        },
+        stats: { recalled: 0 },
+      },
+      {
+        id: 'm3', title: '休眠着的那条', summary: '休眠摘要', priority: 'P2', lifecycle: 'dormant',
+        scope: 'workspace', kind: 'fact', updated: '2026-11-03T00:00:00Z', dormant: true,
+        resident: false, overflow: false,
+        reason: { code: 'dormant', reason: '休眠中，不参与注入；被高相关提问命中时会自动唤醒' },
+        stats: { recalled: 1 },
+      },
+    ],
+    page: 1, pageSize: 50, pageCount: 1, totalMatches: 3,
+    filters: { query: '', priority: '', lifecycle: '', scope: '' },
+    residentMaxEntries: 1, residentMaxChars: 1200, readError: null,
+  };
+  // 让替身 `memories` 端点返回这份数据
+  h.ctx.remote.allowed?.add('remote.memfuse');
+
+  const { reg } = sectionProps(h);
+  const face = reg.options.inject();
+  // 直接把面板数据源换成一个"已经有数据"的替身（避免依赖真实装配时序）
+  const panelSnap = { status: 'ready', view: PANEL, busy: null, error: null, actionError: null, note: null };
+  const props = {
+    t: h.t,
+    view: 'page',
+    ...face,
+    useMemfuseConfig: (selector) =>
+      selector({ ...face.hooks.memfuseConfig.getSnapshot(), panel: panelSnap }),
+  };
+
+  const tree = reg.Component(props);
+  const text = textOfTree(tree);
+
+  // ① 三条记忆都列出来了（含休眠那条 —— 用户要能看见它才谈得上唤醒）
+  assert.match(text, /要我每轮都记得的那条/, '常驻记忆必须出现在列表里');
+  assert.match(text, /被挤出常驻块的那条/, '溢出记忆也要列出来（它仍在库中）');
+  assert.match(text, /休眠着的那条/, '休眠记忆也要列出来，否则用户没法唤醒它');
+
+  // ② 常驻顺序给了序号（那就是实际注入顺序）
+  assert.match(text, /1\..*要我每轮都记得的那条/s, '常驻区要按注入顺序带序号');
+
+  // ③ 溢出必须显形 —— 这是本次改动最要紧的一条：当前实现会**静默丢掉**它们。
+  //    措辞必须准：不是"本轮看不到"（P0 有词法豁免 recall.js:211，零匹配底分 ≈0.34
+  //    > 阈值 0.18，所以它照样能从相关召回进来），而是"不固定排在开头、只能靠相关召回"。
+  assert.match(text, /超出常驻|上限/, '溢出条目必须说清"超出上限"');
+  assert.ok(
+    !/每一轮都不会被注入|本轮的注入里看不到/.test(text),
+    '不许写成"永远看不到" —— 溢出 P0 仍可能被相关召回，那是假消息',
+  );
+
+  // ④ 休眠原因也要说清（不参与注入）
+  assert.match(text, /休眠/, '休眠条目要有原因说明');
+
+  // ⑤ 三个动作按钮都在：置顶 / 降为 P1 / 唤醒
+  assert.ok(findButton(tree, '置顶（每轮生效）') || findButton(tree, '已置顶'), '要有置顶按钮');
+  assert.ok(findButton(tree, '降为 P1'), '要有降级按钮');
+  assert.ok(findButton(tree, '唤醒'), '休眠条目要有唤醒按钮');
+
+  // ⑥ 点「置顶」必须真的打到宿主（否则界面上点了什么都不发生 —— 缺陷 25 那类）
+  const pin = findButton(tree, '置顶（每轮生效）');
+  pin.props.onClick();
+  await settle();
+  assert.ok(
+    h.remoteCalls.some((c) => c[0] === 'setPriority'),
+    '点「置顶」必须打到宿主的 setPriority 端点',
+  );
+  // ⑦ 点「唤醒」也一样
+  const wake = findButton(reg.Component(props), '唤醒');
+  wake.props.onClick();
+  await settle();
+  assert.ok(h.remoteCalls.some((c) => c[0] === 'revive'), '点「唤醒」必须打到宿主的 revive 端点');
+
+  console.log('  ✅ 面板渲染：三条记忆都列出、序号是注入顺序、溢出与休眠各有原因、三个按钮都打到宿主');
+});
