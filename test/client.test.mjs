@@ -127,6 +127,10 @@ async function loadClientHalf({
   /** 覆盖 `list` 的实现（用来模拟宿主报错）。 */
   listImpl = null,
   markSeenImpl = null,
+  /** 覆盖 `dismiss`（F-CL-01：动作失败不能在下次 list 刷新时被抹掉）。 */
+  dismissImpl = null,
+  /** 覆盖 `requestDistill`。 */
+  requestDistillImpl = null,
   /** 覆盖 `distill` 的实现（缺陷 25：提炼成技能那条路）。 */
   distillImpl = null,
   /** 覆盖 `checkUpdate` 的实现（检查更新那条路）。 */
@@ -226,10 +230,12 @@ async function loadClientHalf({
     },
     dismiss: async (key) => {
       remoteCalls.push(['dismiss', key]);
+      if (dismissImpl !== null) return dismissImpl(key);
       return { ok: true, value: { ok: true } };
     },
     requestDistill: async (key) => {
       remoteCalls.push(['requestDistill', key]);
+      if (requestDistillImpl !== null) return requestDistillImpl(key);
       return { ok: true, value: { ok: true } };
     },
     // ── 缺陷 25：界面上真的把技能提炼出来 + 装 / 丢 ──
@@ -461,6 +467,7 @@ async function loadClientHalf({
     scope,
     mounted,
     remoteCalls,
+    dicts,
     dispose: async () => { for (const off of disposers.reverse()) await off(); },
     /** 真字典 + 真插值（不是 `t:key` 那种占位，见 makeTranslator 的注释）。 */
     t: (key, params) => translate('settings.memfuse', key, params),
@@ -496,6 +503,18 @@ function findButton(node, label) {
     if (hit !== null) return hit;
   }
   return null;
+}
+
+/**
+ * 在假树里找出**所有**同文案按钮（F-CL-07：两行候选时按钮数要能数）。
+ */
+function findButtons(node, label, out = []) {
+  const current = renderNode(node);
+  if (current === null || typeof current !== 'object') return out;
+  if (current.type === 'button' && current.props?.children === label) out.push(current);
+  const kids = current.props?.children;
+  for (const kid of Array.isArray(kids) ? kids : kids === undefined ? [] : [kids]) findButtons(kid, label, out);
+  return out;
 }
 
 /**
@@ -1231,7 +1250,9 @@ test('缺陷 25：提炼失败（没开抽取 / 没模型）要如实说出来�
 
   const snapshot = face.hooks.memfuseSuggestions.getSnapshot();
   assert.equal(snapshot.drafts.length, 0, '失败了就不该有草稿');
-  assert.match(String(snapshot.error), /自动抽取没开启/, '宿主给的原始原因要留在快照里（不许静默）');
+  // F-CL-01：动作失败落在 actionError（通道错误 error 是另一回事，列表刷新不许抹掉它）
+  assert.match(String(snapshot.actionError), /自动抽取没开启/, '宿主给的原始原因要留在快照里（不许静默）');
+  assert.equal(snapshot.error, null, '动作失败不该冒充"通道坏了"');
   // 兜底：宿主这侧没模型时，仍然把这一组记成待办 —— 下一轮 Block E 会催模型去提炼
   assert.deepEqual(
     h.remoteCalls.filter((c) => c[0] === 'requestDistill').map((c) => c[1]),
@@ -2322,4 +2343,475 @@ test('设置页分两栏：我的记忆 / 设置各是一个 tab，默认记忆�
   assert.ok(true);
 
   console.log('  ✅ 设置页分栏：两个 tab、默认记忆栏、另一栏 hidden、切换后各归各位');
+});
+
+// ═══════════════ 2026-11-24 客户端审计（docs/audit/2026-11-24/client.md）回归 ═══════════════
+//
+// 每条 finding 一条用例，全部断言**用户可见的行为**（不是实现细节）：
+// 失败前这些用例确实会红（见交付说明里的逐条对照），修好之后才是绿的。
+// 报告口径：F-CL-01..13；F-CL-01/02 是 high，其余 medium/low。
+
+/** 卡片 props（补上真宿主一定会给的会话 / 回合 / useChat）。 */
+function cardPropsFor(handle, { sessionId = 's1', turn = 1, turnOrder = [turn] } = {}) {
+  const base = cardProps(handle);
+  return {
+    ...base,
+    props: {
+      ...base.props,
+      sessionId,
+      turn,
+      useChat: (selector) => selector({ timeline: { turnOrder } }),
+    },
+  };
+}
+
+test('F-CL-01（high）：动作失败留在 actionError，成功的 list 刷新不许抹掉；行也不许提前摘', async () => {
+  let failDismiss = true;
+  const h = await loadClientHalf({
+    value: {},
+    dismissImpl: async () =>
+      failDismiss
+        ? { ok: false, error: { message: 'dismiss 失败：磁盘只读' } }
+        : { ok: true, value: { ok: true } },
+    suggestions: {
+      groups: [
+        { key: 'k1', seedTitle: '部署要走 scripts/deploy.sh', members: 1, memberTitles: ['部署入口'], score: 7, seen: false, useWhen: '部署时' },
+      ],
+      restCount: 0, restKeys: [], seen: 0, dismissed: 0, pendingDistill: [], pendingSkills: [],
+    },
+  });
+  h.exports.apply(h.ctx);
+  await settle();
+  const { reg, face, props } = cardProps(h);
+
+  const first = reg.Component(props);
+  const button = findButton(first, props.t('suggestDismiss'));
+  assert.ok(button, '卡片上要有「不用」按钮');
+  await button.props.onClick();
+  await settle();
+
+  let snap = face.hooks.memfuseSuggestions.getSnapshot();
+  assert.match(String(snap.actionError), /磁盘只读/, '动作失败的原因必须留下');
+  assert.equal(snap.error, null, '动作失败不该冒充"通道坏了"');
+  assert.match(textOfTree(reg.Component(props)), /部署要走 scripts\/deploy\.sh/, '失败时那一行必须还在（否则看起来像成功了）');
+
+  // 渲染路径上的 touch() 发起一次**成功的** list —— 这正是原来把报错抹掉的那一步
+  await refreshFeed(face);
+  snap = face.hooks.memfuseSuggestions.getSnapshot();
+  assert.equal(snap.status, 'ready', '刷新本身是成功的');
+  assert.match(String(snap.actionError), /磁盘只读/, '成功的 list 刷新不许抹掉动作错误');
+  const refreshedText = textOfTree(reg.Component(props));
+  assert.match(refreshedText, /磁盘只读/, '刷新后卡片上仍然要看得见原始原因');
+
+  // 下一次动作成功 → 才清掉 actionError，并且行才被摘掉
+  failDismiss = false;
+  const button2 = findButton(reg.Component(props), props.t('suggestDismiss'));
+  await button2.props.onClick();
+  await settle();
+  snap = face.hooks.memfuseSuggestions.getSnapshot();
+  assert.equal(snap.actionError, null, '下一次动作开始/成功后动作错误才清');
+  assert.ok(!/部署要走 scripts\/deploy\.sh/.test(textOfTree(reg.Component(props))), '成功后才允许摘行');
+  await h.dispose();
+  console.log('  ✅ F-CL-01：动作错误独立存活；失败不摘行；成功才清');
+});
+
+test('F-CL-02（high）：记忆面板重试烧完后有「重新加载」按钮，不是死路', async () => {
+  const h = await loadClientHalf({ value: {} });
+  h.exports.apply(h.ctx);
+  await settle();
+  const { MemoryPanelFeed, MemoryPanel } = h.exports;
+
+  let calls = 0;
+  const feed = new MemoryPanelFeed({
+    remote: { memfuse: { memories: async () => { calls += 1; throw new Error('client api: memfuse/memories failed: HTTP 500'); } } },
+  });
+  await feed.load();
+  assert.equal(feed.store.getSnapshot().status, 'error');
+  feed.retryCount = 3; // 3 次预算已经烧完（原来这里就是永久死路）
+
+  const snap = feed.store.getSnapshot();
+  const tree = MemoryPanel({
+    t: h.t,
+    useMemfuseMemoryPanel: (selector) => selector(snap),
+    setFilter: () => {}, setPage: () => {}, setPriority: () => {}, revive: () => {},
+    refresh: () => feed.reload(),
+  });
+  const retry = findButton(tree, h.t('panelRetry'));
+  assert.ok(retry, '失败态必须有「重新加载」按钮（否则只能 F5 整个页面）');
+  assert.match(textOfTree(tree), /HTTP 500/, '原始报错要摆出来');
+
+  await retry.props.onClick();
+  await settle();
+  assert.equal(calls, 2, '点「重新加载」必须真的再发一次 memories');
+  assert.equal(feed.store.getSnapshot().status, 'error', '仍失败就仍显示错误（不假装成功）');
+  feed.dispose();
+  await h.dispose();
+  console.log('  ✅ F-CL-02：失败态可手动重新加载');
+});
+
+test('F-CL-03：筛选到 0 条说「没有匹配」，只有库真为空才说「记忆库里还没有内容」', async () => {
+  const h = await loadClientHalf({ value: {} });
+  h.exports.apply(h.ctx);
+  await settle();
+  const { MemoryPanel } = h.exports;
+  const render = (view) =>
+    MemoryPanel({
+      t: h.t,
+      useMemfuseMemoryPanel: (selector) => selector({ status: 'ready', view, busy: null, error: null, actionError: null, note: null }),
+      setFilter: () => {}, setPage: () => {}, setPriority: () => {}, revive: () => {},
+    });
+  const base = {
+    stats: { total: 10, active: 10, dormant: 0, residentCap: 8, residentCount: 0, residentOverflow: 0 },
+    resident: [], overflow: [], rows: [], page: 1, pageSize: 50, pageCount: 1,
+    residentMaxEntries: 8, residentMaxChars: 1200, readError: null,
+  };
+  for (const [name, filters] of [
+    ['lifecycle', { query: '', priority: '', lifecycle: 'dormant', scope: '' }],
+    ['priority', { query: '', priority: 'P2', lifecycle: '', scope: '' }],
+    ['scope', { query: '', priority: '', lifecycle: '', scope: 'user' }],
+  ]) {
+    const text = textOfTree(render({ ...base, totalMatches: 0, filters }));
+    assert.match(text, /没有匹配的记忆/, `${name} 筛到 0 条时必须说「没有匹配」`);
+    assert.ok(!/记忆库里还没有内容/.test(text), `${name}：库里有 10 条，不许说库是空的`);
+  }
+  const emptyText = textOfTree(render({ ...base, stats: { ...base.stats, total: 0 }, totalMatches: 0, filters: { query: '', priority: '', lifecycle: '', scope: '' } }));
+  assert.match(emptyText, /记忆库里还没有内容/, '库真的为空时才说「还没有内容」');
+  await h.dispose();
+  console.log('  ✅ F-CL-03：空态与「筛选无匹配」分开');
+});
+
+test('F-CL-04：常驻顺序不许显示裸 m_* 内部 id（翻页/搜索后也一样）', async () => {
+  const h = await loadClientHalf({ value: {} });
+  h.exports.apply(h.ctx);
+  await settle();
+  const { MemoryPanel } = h.exports;
+  const view = {
+    stats: { total: 12, active: 12, dormant: 0, residentCap: 8, residentCount: 3, residentOverflow: 0 },
+    resident: ['m_aaa', 'm_bbb', 'm_ccc'],
+    overflow: [],
+    rows: [{ id: 'm_aaa', title: '甲：搜索命中的那条', summary: '', priority: 'P0', lifecycle: 'active', scope: 'workspace', kind: 'fact', updated: '2026-11-01T00:00:00Z', dormant: false, resident: true, overflow: false, reason: null, stats: { recalled: 0 } }],
+    // 宿主将来若带 residentTitles 就用它（老宿主没有）
+    residentTitles: { m_bbb: '乙：不在本页但有标题' },
+    page: 1, pageSize: 50, pageCount: 2, totalMatches: 1,
+    filters: { query: '部署', priority: '', lifecycle: '', scope: '' },
+    residentMaxEntries: 8, residentMaxChars: 1200, readError: null,
+  };
+  const tree = MemoryPanel({
+    t: h.t,
+    useMemfuseMemoryPanel: (selector) => selector({ status: 'ready', view, busy: null, error: null, actionError: null, note: null }),
+    setFilter: () => {}, setPage: () => {}, setPriority: () => {}, revive: () => {},
+  });
+  const text = textOfTree(tree);
+  assert.match(text, /甲：搜索命中的那条/, '当前页内的常驻标题照常显示');
+  assert.match(text, /乙：不在本页但有标题/, '宿主给了 residentTitles 就用它');
+  assert.ok(!/m_aaa|m_bbb|m_ccc/.test(text), '常驻区绝不能出现裸 m_* id，实际：' + text);
+  assert.match(text, /不在当前页/, '查不到标题时也要写人话，而不是内部 id');
+  await h.dispose();
+  console.log('  ✅ F-CL-04：常驻标题不回落裸 id');
+});
+
+test('F-CL-05：安装更新进行中「检查更新」禁用，且守卫挡住并发的 git fetch', async () => {
+  let releaseInstall = null;
+  const h = await loadClientHalf({
+    value: {},
+    updateImpl: async () => ({ ok: true, value: NEWER }),
+    installImpl: () => new Promise((resolve) => { releaseInstall = resolve; }),
+  });
+  h.exports.apply(h.ctx);
+  await settle();
+  const { reg, face, props } = sectionProps(h);
+  await face.checkUpdate();
+  await settle();
+
+  let tree = reg.Component(props);
+  const install = findButton(tree, '安装更新');
+  assert.ok(install, '查到新版本后要出现「安装更新」');
+  install.props.onClick();
+  await settle();
+
+  tree = reg.Component(props);
+  const check = findButton(tree, '检查更新');
+  assert.ok(check, '「检查更新」按钮还在');
+  assert.equal(check.props.disabled, true, '安装进行中「检查更新」必须禁用（git fetch 会抢 .git）');
+  const before = h.remoteCalls.filter((c) => c[0] === 'checkUpdate').length;
+  await face.checkUpdate();
+  await settle();
+  assert.equal(h.remoteCalls.filter((c) => c[0] === 'checkUpdate').length, before, '安装中 checkUpdate() 守卫必须直接返回');
+  releaseInstall?.({ ok: true, value: { ok: true, changed: true, from: '0.1.0', to: '0.2.0' } });
+  await settle();
+  await h.dispose();
+  console.log('  ✅ F-CL-05：安装/检查互斥（按钮 + 动作守卫）');
+});
+
+test('F-CL-06：设置页 tab 键盘可达（方向键/Home/End 切换并移动焦点）', async () => {
+  const h = await loadClientHalf({ value: {}, suggestions: EMPTY_FEED });
+  h.exports.apply(h.ctx);
+  await settle();
+  const { reg, face, props } = sectionProps(h);
+  const tree = reg.Component(props);
+  const bar = findAllByClass(tree, 'dsh-memfuse-tabs')[0];
+  assert.equal(typeof bar.props.onKeyDown, 'function', 'tablist 必须有 keydown 处理器（WAI-ARIA tabs 模式）');
+
+  const tabs = findAllByClass(tree, 'dsh-memfuse-tab');
+  assert.equal(tabs[0].props.tabIndex, 0, '选中项 tabIndex=0');
+  assert.equal(tabs[1].props.tabIndex, -1, '非选中项 tabIndex=-1（靠方向键进入）');
+
+  const nextTabId = h.exports.__nextTabId;
+  assert.equal(typeof nextTabId, 'function', '必须导出方向键映射（测试接缝）');
+  assert.equal(nextTabId('memory', 'ArrowRight'), 'settings', 'ArrowRight 从「我的记忆」到「设置」');
+  assert.equal(nextTabId('settings', 'ArrowLeft'), 'memory', 'ArrowLeft 从「设置」回「我的记忆」');
+  assert.equal(nextTabId('memory', 'End'), 'settings');
+  assert.equal(nextTabId('settings', 'Home'), 'memory');
+  assert.equal(nextTabId('memory', 'Escape'), null, '别的键不归 tab 管');
+
+  let focused = null;
+  let prevented = false;
+  bar.props.onKeyDown({
+    key: 'ArrowRight',
+    preventDefault() { prevented = true; },
+    currentTarget: { ownerDocument: { getElementById: (id) => ({ focus() { focused = id; } }) } },
+  });
+  assert.equal(prevented, true, '方向键要 preventDefault（否则页面会滚动）');
+  assert.equal(focused, 'dsh-memfuse-tab-settings', '切换后焦点要跟到新 tab');
+  await h.dispose();
+  console.log('  ✅ F-CL-06：tab 键盘可达');
+});
+
+test('F-CL-07：提炼进行中再点另一行 —— 不发 distill、第二行也不许被摘掉', async () => {
+  let release = null;
+  const h = await loadClientHalf({
+    value: {},
+    distillImpl: () => new Promise((resolve) => { release = resolve; }),
+    suggestions: {
+      groups: [
+        { key: 'k1', seedTitle: '第一组：部署流程', members: 1, memberTitles: ['甲'], score: 7, seen: false, useWhen: '部署时' },
+        { key: 'k2', seedTitle: '第二组：回滚流程', members: 1, memberTitles: ['乙'], score: 6, seen: false, useWhen: '回滚时' },
+      ],
+      restCount: 0, restKeys: [], seen: 0, dismissed: 0, pendingDistill: [], pendingSkills: [],
+    },
+  });
+  h.exports.apply(h.ctx);
+  await settle();
+  const { reg, face, props } = cardProps(h);
+
+  const tree = reg.Component(props);
+  const buttons = findButtons(tree, props.t('suggestDistill'));
+  assert.equal(buttons.length, 2, '两行候选就有两个「提炼成技能」按钮');
+  buttons[0].props.onClick();
+  await settle();
+  assert.ok(face.hooks.memfuseSuggestions.getSnapshot().draftBusy, '第一行应进入提炼中');
+
+  const second = findButtons(reg.Component(props), props.t('suggestDistill'));
+  assert.equal(second.length, 2, '提炼中第二行必须还在（不许提前摘）');
+  assert.equal(second[1].props.disabled, true, '提炼中第二行的按钮必须禁用');
+  await second[1].props.onClick();
+  await settle();
+  assert.deepEqual(
+    h.remoteCalls.filter((c) => c[0] === 'distill').map((c) => c[1]),
+    ['k1'],
+    '第二行不许静默发 distill，也不许被 busy 守卫拒绝后消失',
+  );
+  assert.match(textOfTree(reg.Component(props)), /第二组：回滚流程/, '第二行必须仍然可见（才能等会儿再点）');
+
+  release?.({ ok: true, value: { ok: true, name: 's1', description: '', content: '', installPath: null } });
+  await settle();
+  assert.match(textOfTree(reg.Component(props)), /第二组：回滚流程/, '第一组完成后第二组还可以点');
+  await h.dispose();
+  console.log('  ✅ F-CL-07：busy 期间第二行不丢');
+});
+
+test('F-CL-08：提炼永不返回时超时清闩锁；也能「取消等待」恢复', async () => {
+  const h = await loadClientHalf({
+    value: {},
+    distillImpl: () => new Promise(() => {}), // 宿主/网关永远不 settle
+    suggestions: {
+      groups: [{ key: 'k1', seedTitle: '部署要走 scripts/deploy.sh', members: 1, memberTitles: ['甲'], score: 7, seen: false, useWhen: '部署时' }],
+      restCount: 0, restKeys: [], seen: 0, dismissed: 0, pendingDistill: [], pendingSkills: [],
+    },
+  });
+  h.exports.apply(h.ctx);
+  await settle();
+  const { reg, face, props } = cardProps(h);
+  h.exports.__actionBudget.ms = 40;
+
+  const first = findButton(reg.Component(props), props.t('suggestDistill'));
+  first.props.onClick();
+  await settle();
+  assert.ok(face.hooks.memfuseSuggestions.getSnapshot().draftBusy, '点击后应显示进行中');
+  await new Promise((resolve) => setTimeout(resolve, 90));
+  await settle();
+  let snap = face.hooks.memfuseSuggestions.getSnapshot();
+  assert.equal(snap.draftBusy, null, '超时后 draftBusy 必须被清掉（不能永久卡住）');
+  assert.match(String(snap.actionError), /超时/, '超时要如实说（含原始原因）');
+
+  // 手动取消：宿主不返回时用户不必干等 90 秒
+  h.exports.__actionBudget.ms = 5000;
+  const again = findButton(reg.Component(props), props.t('suggestDistill'));
+  again.props.onClick();
+  await settle();
+  const cancel = findButton(reg.Component(props), props.t('draftCancelWait'));
+  assert.ok(cancel, '进行中必须给「取消等待」按钮');
+  cancel.props.onClick();
+  await settle();
+  snap = face.hooks.memfuseSuggestions.getSnapshot();
+  assert.equal(snap.draftBusy, null, '取消后闩锁要清掉');
+  assert.match(String(snap.actionError), /取消/, '取消要留一句说明（宿主可能还在跑）');
+  // 装/丢不再被同一把闩锁挡住
+  const rej = await face.rejectDraft('whatever');
+  assert.equal(rej.ok, true, '取消之后装/丢必须能继续用');
+  h.exports.__actionBudget.ms = 90_000;
+  await h.dispose();
+  console.log('  ✅ F-CL-08：超时 + 取消等待都可恢复');
+});
+
+test('F-CL-09：一个模型都没有时横幅必须 partial，不许写「记忆学习已开启」', async () => {
+  const h = await loadClientHalf({
+    value: { extract: { enabled: true, followConversation: true } },
+    catalog: { ok: true, value: { default: null, routableProviders: [], groups: [], failures: [] } },
+    suggestions: EMPTY_FEED,
+  });
+  h.exports.apply(h.ctx);
+  await settle();
+  const { reg, face, props } = sectionProps(h);
+  const tree = reg.Component(props);
+  const banner = findBanner(tree);
+  assert.ok(banner, '设置页必须有学习横幅');
+  assert.equal(banner.props['data-tone'], 'partial', '没有模型时必须是 partial（不是绿色 ready）');
+  assert.match(textOfTree(banner), /没有可用的模型/, '要说清"没有模型、学不了"');
+  assert.match(textOfTree(banner), /设置 → 模型/, '要告诉用户去哪儿配模型');
+  assert.ok(!/记忆学习已开启/.test(textOfTree(tree)), '不许再写「记忆学习已开启」');
+  assert.equal(findButton(banner, '跟随对话模型'), null, '跟随已经开着时不该再摆一个点了也没用的按钮');
+  await h.dispose();
+  console.log('  ✅ F-CL-09：无模型 → partial');
+});
+
+test('F-CL-10：中英文 panelHint 对「溢出 P0 仍可能被召回」必须一致（英文不许写 not injected）', async () => {
+  const h = await loadClientHalf({ value: {}, suggestions: EMPTY_FEED });
+  h.exports.apply(h.ctx);
+  await settle();
+  const dicts = h.dicts.get('settings.memfuse');
+  assert.ok(dicts?.zh?.panelHint && dicts?.en?.panelHint, '两份字典都要有 panelHint');
+  assert.ok(!/not injected/i.test(dicts.en.panelHint), '英文不许再写 "not injected"（与中文/spec 相反）');
+  assert.match(dicts.en.panelHint, /relevant recall|recall can still pick/i, '英文要说明仍可能被相关召回');
+  assert.match(dicts.zh.panelHint, /还能从相关召回|仍可能/, '中文保持"仍可能被召回"');
+  assert.ok(!dicts.zh.panelHint.includes('**') && !dicts.en.panelHint.includes('**'), '纯文本里不许出现 Markdown 星号');
+  assert.ok(!dicts.zh.panelOverflow.includes('**') && !dicts.en.panelOverflow.includes('**'), '溢出提示同样不许出现 **');
+  await h.dispose();
+  console.log('  ✅ F-CL-10：中英文口径一致');
+});
+
+test('F-CL-11：面板行元信息用本地化标签，纯文本里不出现 **', async () => {
+  const h = await loadClientHalf({ value: {} });
+  h.exports.apply(h.ctx);
+  await settle();
+  const { MemoryPanel } = h.exports;
+  const view = {
+    stats: { total: 1, active: 1, dormant: 0, residentCap: 8, residentCount: 0, residentOverflow: 0 },
+    resident: [], overflow: [],
+    rows: [{ id: 'm1', title: '一条记忆', summary: '', priority: 'P1', lifecycle: 'active', scope: 'workspace', kind: 'fact', updated: '2026-11-01T00:00:00Z', dormant: false, resident: false, overflow: false, reason: null, stats: { recalled: 2 } }],
+    page: 1, pageSize: 50, pageCount: 1, totalMatches: 1,
+    filters: { query: '', priority: '', lifecycle: '', scope: '' },
+    residentMaxEntries: 8, residentMaxChars: 1200, readError: null,
+  };
+  const tree = MemoryPanel({
+    t: h.t,
+    useMemfuseMemoryPanel: (selector) => selector({ status: 'ready', view, busy: null, error: null, actionError: null, note: null }),
+    setFilter: () => {}, setPage: () => {}, setPriority: () => {}, revive: () => {},
+  });
+  const text = textOfTree(tree);
+  const json = JSON.stringify(tree);
+  assert.match(text, /本工作区/, 'scope 要本地化（与筛选下拉一致）');
+  assert.match(text, /事实/, 'kind 要本地化');
+  assert.ok(!/\bworkspace\b/.test(text), '中文界面不许出现裸 workspace');
+  assert.ok(!/\bfact\b/.test(text), '中文界面不许出现裸 fact');
+  assert.ok(!json.includes('**'), '纯文本文案里不许出现 Markdown 星号（会原样显示）');
+  await h.dispose();
+  console.log('  ✅ F-CL-11：元信息本地化、无 **');
+});
+
+test('F-CL-12：待确认草稿不串会话 —— A 提炼的草稿不出现在 B 的卡片上', async () => {
+  const h = await loadClientHalf({
+    value: {},
+    suggestions: {
+      groups: [{ key: 'k1', seedTitle: '部署要走 scripts/deploy.sh', members: 1, memberTitles: ['甲'], score: 7, seen: false, useWhen: '部署时' }],
+      restCount: 0, restKeys: [], seen: 0, dismissed: 0, pendingDistill: [], pendingSkills: [],
+    },
+  });
+  h.exports.apply(h.ctx);
+  await settle();
+  const { reg, face } = cardProps(h);
+  const a = cardPropsFor(h, { sessionId: 'session-A', turn: 1 });
+  const distill = findButton(reg.Component(a.props), a.props.t('suggestDistill'));
+  await distill.props.onClick();
+  await settle();
+  assert.equal(face.hooks.memfuseSuggestions.getSnapshot().drafts.length, 1);
+  assert.match(textOfTree(reg.Component(a.props)), /ui-skill/, 'A 的卡片要看到自己的草稿');
+  assert.equal(face.draftsFor('session-A').length, 1);
+  assert.equal(face.draftsFor('session-B').length, 0, 'B 不许拿到 A 的草稿');
+
+  const b = cardPropsFor(h, { sessionId: 'session-B', turn: 2, turnOrder: [1, 2] });
+  const treeB = reg.Component(b.props);
+  assert.ok(treeB === null || !/ui-skill/.test(textOfTree(treeB)), 'B 的卡片不许出现 A 的草稿正文');
+
+  // 刷新页面后来源未知（磁盘真源）：显示，但必须明确标注「全局待确认」
+  const h2 = await loadClientHalf({
+    value: {},
+    suggestions: {
+      groups: [], restCount: 0, restKeys: [], seen: 0, dismissed: 0, pendingDistill: [],
+      pendingSkills: [{ name: 'draft-global', description: '上次留下的', content: '---\nname: draft-global\n---\n', installPath: null }],
+    },
+  });
+  h2.exports.apply(h2.ctx);
+  await settle();
+  const c = cardPropsFor(h2, { sessionId: 'session-C', turn: 1 });
+  const treeC = reg.Component(c.props);
+  assert.ok(treeC, '来源未知的草稿仍然要能看到（否则刷新后就永远装不了）');
+  assert.match(textOfTree(treeC), /draft-global/);
+  assert.match(textOfTree(treeC), /全局待确认/, '来源未知时必须标注它是全局的，不能假装属于本对话');
+  await h.dispose();
+  await h2.dispose();
+  console.log('  ✅ F-CL-12：草稿按来源会话隔离 + 全局草稿明确标注');
+});
+
+test('F-CL-13：跟随+fallback 时策略排在降级模型之前，标签不再说「上面那个模型」', async () => {
+  const h = await loadClientHalf({
+    value: { extract: { enabled: true, followConversation: true, onUnavailable: 'fallback' } },
+    suggestions: EMPTY_FEED,
+  });
+  h.exports.apply(h.ctx);
+  await settle();
+  const { reg, face, props } = sectionProps(h);
+  const tree = reg.Component(props);
+  const fields = findAllByClass(tree, 'dsh-memfuse-field');
+  const labels = fields.map((field) => {
+    const label = findAllByClass(field, 'dsh-memfuse-field-label')[0];
+    return label ? textOfTree(label) : '';
+  });
+  const strategy = labels.findIndex((label) => label.includes('对话模型不可用时'));
+  const fallback = labels.findIndex((label) => label.includes('降级模型（主模型不可用时）'));
+  assert.ok(strategy >= 0, '策略字段必须出现（实际标签：' + labels.join(' | ') + '）');
+  assert.ok(fallback >= 0, '降级模型字段必须出现');
+  assert.ok(strategy < fallback, '策略要排在降级模型之前（否则「上面那个」指的是降级模型本身）');
+  assert.ok(!labels.some((label) => label.includes('上面那个模型')), '不许再用依赖视觉位置的「上面那个模型」');
+  await h.dispose();
+  console.log('  ✅ F-CL-13：策略 → 降级模型，标签自洽');
+});
+
+test('渲染边界：summary 与 page 走同一套 hooks（防止 summary→page 切换报 hooks 数量变化）', async () => {
+  const h = await loadClientHalf({ value: {}, suggestions: EMPTY_FEED });
+  h.exports.apply(h.ctx);
+  await settle();
+  const { reg, face } = sectionProps(h);
+  let calls = 0;
+  const props = {
+    t: h.t,
+    view: 'summary',
+    ...face,
+    useMemfuseConfig: (selector) => { calls += 1; return selector(face.hooks.memfuseConfig.getSnapshot()); },
+  };
+  const text = reg.Component(props);
+  assert.equal(typeof text, 'string', 'summary 仍然只返回一行说明');
+  assert.equal(calls, 1, 'summary 也必须先走 hook —— 否则同一实例切到 page 时 hooks 数量会变，React 直接崩');
+  await h.dispose();
+  console.log('  ✅ 渲染边界：summary 也走 hooks');
 });

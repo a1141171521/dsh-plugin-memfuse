@@ -10,3 +10,6 @@ node_modules/
 .DS_Store
 Thumbs.db
 desktop.ini
+
+# 本地审计的临时脚本与夹具（报告在 docs/audit/，会提交）
+.audit/

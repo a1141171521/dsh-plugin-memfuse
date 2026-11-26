@@ -288,7 +288,7 @@ test('status 工具返回 JSON 且 schema 与实际返回值一致', async (t) =
 
 const policy = await import('../lib/policy.js');
 const storeMod = await import('../lib/store.js');
-const { recall } = await import('../lib/recall.js');
+const { recall, tokenize } = await import('../lib/recall.js');
 
 test('生命周期：被召回过的 dormant 不再被物理删除（原判据会误删）', () => {
   const old = new Date(Date.now() - 40 * 86400000).toISOString();
@@ -1268,13 +1268,66 @@ test('H1 候选识别：零 LLM 打分 + 按共享标签聚类', () => {
   assert.ok(s1.reasons.some((r) => r.includes('步骤')), s1.reasons.join('、'));
   assert.ok(s2.score < 4, `弱候选不该够格，实际 ${s2.score}`);
 
-  const all = [strong, weak, mem({ id: 'c', tags: ['x'], body: 'x' })];
+  const all = [strong, weak, mem({ id: 'c', tags: ['x'], body: '第一步先看 README，再运行测试。' })];
   const cluster = d.clusterAround(strong, all, 6);
   assert.equal(cluster[0].id, 'a');
-  assert.ok(cluster.some((r) => r.id === 'c'), '共享标签的应被聚进来');
+  assert.ok(cluster.some((r) => r.id === 'c'), '共享标签的**方法类**记忆应被聚进来');
   assert.ok(!cluster.some((r) => r.id === 'b'), '无共享标签的不该进簇');
   assert.equal(d.findCandidates(all, { minScore: 4, minSessions: 3 }).length, 1);
   console.log(`  ✅ 候选打分 ${s1.score} vs ${s2.score}；聚类按共享标签（不引入新相似度机制）`);
+});
+
+test('技能方向（2026-11-24）：只提炼可复用方法，文档修订记录不进候选', async () => {
+  const d = distillMod;
+  const mem = (o) => ({
+    id: 'x', title: 't', summary: '', body: '', kind: 'decision', priority: 'P1',
+    lifecycle: 'active', tags: ['概要设计'], stats: {}, ...o,
+  });
+
+  // 真机里最典型的两条"修订记录"：改章节、改提示语
+  const churn = [
+    mem({ id: 'c1', kind: 'experience', sessionCount: 3, title: '6.6 改为状态通知：不发站内消息、不存消息表（2026-11-04 评审）', body: '6.6 由消息通知模块改成状态通知模块；删除消息表；新增状态字段。' }),
+    mem({ id: 'c2', sessionCount: 3, title: '标记完成提示语按原型原文对齐（2026-11-14 评审）', body: '把勾多条提示语改为「请选择一条数据进行操作」；新增并发提示语。' }),
+  ];
+  for (const r of churn) {
+    assert.equal(d.isMethodMemory(r), false, `修订记录不能算方法：${r.title}`);
+  }
+
+  // 审查要点是方法（这正是用户想要的"下次审概要设计时查什么"）
+  const method = mem({
+    id: 'm1', kind: 'experience', sessionCount: 3,
+    title: '概要设计审查：一码两义 / 重复规则 / 字段过期是高频缺陷',
+    body: '审查时逐项检查：编号是否一码两义、规则是否重复、字段是否过期。',
+    anchor: '审查概要设计时',
+  });
+  assert.equal(d.isMethodMemory(method), true);
+
+  // 只有修订记录 → 一组建议都不该出
+  assert.equal(
+    d.buildSuggestions(churn, { minScore: 4, minSessions: 3 }).length,
+    0,
+    '文档修订记录不该成为技能候选',
+  );
+  // 方法 + 修订记录同标签 → 簇里只带方法，不带修订记录
+  const groups = d.buildSuggestions([method, ...churn], { minScore: 4, minSessions: 3 });
+  assert.equal(groups.length, 1);
+  assert.deepEqual(groups[0].members.map((x) => x.id), ['m1'], '修订记录不能混进提炼簇');
+
+  // 提示词与兜底校验都指向同一个方向
+  assert.match(d.DISTILL_SYSTEM, /修订记录/, '提示词必须说明"不要修订记录"');
+  assert.match(d.DISTILL_SYSTEM, /skip/, '凑不出方法时要允许 skip');
+  const drafted = await d.distillSkill({
+    cluster: [{ id: 'x', title: 't', body: 'b' }],
+    callModel: async () => JSON.stringify({
+      name: 'design-edit',
+      description: '改概要设计时',
+      body: '## 步骤\n1. 将 6.6 改为状态通知。\n2. 删除消息表。\n3. 新增状态字段。\n4. 把提示语改为原型原文。',
+    }),
+  });
+  assert.equal(drafted.ok, false, '把修订流水账写成步骤时必须拒绝');
+  assert.equal(drafted.skipped, true);
+  assert.match(drafted.error, /修订记录/);
+  console.log('  ✅ 技能方向：修订记录不进候选、不混簇，模型硬写成步骤也会被拒');
 });
 
 test('缺陷 38：前五个种子被忽略或归为同簇时，仍扫描后面的新建议', () => {
@@ -1282,8 +1335,8 @@ test('缺陷 38：前五个种子被忽略或归为同簇时，仍扫描后面�
     id: `seed-${i}`, title: `经验${i}`, kind: 'experience', priority: i < 5 ? 'P0' : 'P1',
     lifecycle: 'active', body: '第一步检查配置，再验证结果。', tags: [], updated: `2026-11-${21 - i}`,
   }));
-  const dismissed = Object.fromEntries(memories.slice(0, 5).map((r) => [r.id, true]));
-  assert.deepEqual(distillMod.buildSuggestions(memories, { limit: 5 }, dismissed).map((s) => s.key), ['seed-5', 'seed-6']);
+  const dismissed = Object.fromEntries(memories.slice(0, 5).map((r) => [`seed:${r.id}`, true]));
+  assert.deepEqual(distillMod.buildSuggestions(memories, { limit: 5 }, dismissed).map((s) => s.key), ['seed:seed-5', 'seed:seed-6']);
   const sameCluster = memories.map((r, i) => ({ ...r, tags: i < 5 ? ['same-topic'] : [] }));
   assert.equal(distillMod.buildSuggestions(sameCluster, { limit: 3 }).length, 3,
     '输出限制应用于最终建议，不能应用于去重前的种子');
@@ -1564,9 +1617,18 @@ test('G1/G4 维护：完全重复自动标 stale，同标题不同正文只报�
   await api.ready;
   const write = h.tools.find((d) => d.name === 'memfuse_write');
 
-  await write.execute({ mode: 'add', kind: 'fact', priority: 'P2', title: '完全重复的条目', summary: '同一个摘要内容在这里', body: '完全一样的正文' });
-  await new Promise((r) => setTimeout(r, 15));
-  await write.execute({ mode: 'add', kind: 'fact', priority: 'P2', title: '完全重复的条目', summary: '同一个摘要内容在这里', body: '完全一样的正文' });
+  // ⚠️ 2026-11-24（F-ST-09）：`memfuse_write` 写的一律是 source:user / managedBy:user，
+  // 属于**受保护记录**，planStale 不再自动标它们（AGENTS.md 硬规则 5）。
+  // 所以"完全重复"这一组用**自动抽取产物**（source:auto）来构造 —— 那才是反腐烂
+  // 真正该动的对象。同标题不同正文那组仍走工具写入，用于断言"只报告不动手"。
+  const auto = (id, updated) =>
+    api.store.write({
+      id, kind: 'fact', priority: 'P2', source: 'auto',
+      title: '完全重复的条目', summary: '同一个摘要内容在这里', body: '完全一样的正文',
+      lifecycle: 'active', created: updated, updated, stats: { recalled: 0, injected: 0, positive: 0, negative: 0 },
+    });
+  await auto('auto-dup-old', '2026-01-01T00:00:00.000Z');
+  await auto('auto-dup-new', '2026-01-02T00:00:00.000Z');
   await write.execute({ mode: 'add', kind: 'fact', priority: 'P2', title: '同标题不同正文', summary: '摘要甲在这里够长了', body: '甲' });
   await write.execute({ mode: 'add', kind: 'fact', priority: 'P2', title: '同标题不同正文', summary: '摘要乙在这里够长了', body: '乙' });
 
@@ -2430,24 +2492,41 @@ test('H7 dismiss：忽略后不再提示，簇长大时重新提一次', async (
   const inj = await api.buildInjection('部署');
   assert.equal(inj.blocks.find((b) => b.key === 'E'), undefined, '忽略后 Block E 应消失');
 
-  // 簇长大 → key 变 → 重新提示
+  // 缺陷 42：簇长大（新增邻居）不再产生新 key —— 同一个种子身份不变，「不用」必须继续生效
   const skillMod2 = await import('../lib/distill.js');
-  const grown = [...before[0].members.map((m) => ({ id: m.id, tags: ['deploy'] })), { id: 'new-member', tags: ['deploy'] }];
-  assert.notEqual(skillMod2.clusterKey(grown), keyBefore, '成员变化必须产生新 key（否则会被旧的忽略永久压住）');
+  const seedId = before[0].seedId;
+  const grown = [
+    { id: seedId, tags: ['deploy'] },
+    { id: 'new-member', tags: ['deploy'] },
+    { id: 'another-member', tags: ['deploy'] },
+  ];
+  assert.equal(
+    skillMod2.clusterKey(grown),
+    keyBefore,
+    '同一颗种子 + 新邻居必须还是同一个 key（否则「不用」会被簇长大冲掉）',
+  );
+  // 换一颗种子才是新话题：新候选仍然应该有机会提示
+  assert.notEqual(
+    skillMod2.clusterKey([{ id: 'other-seed', tags: ['deploy'] }]),
+    keyBefore,
+    '换种子必须得到新 key',
+  );
 
   // dismiss 无建议时要明确报错，而不是静默成功
   const again = JSON.parse(await skill.execute({ action: 'dismiss' }));
   assert.equal(again.ok, false, '没有建议可忽略时必须报错');
-  console.log(`  ✅ dismiss：${membersBefore} 条那组被忽略且不再提示；成员变化会重新提一次`);
+  console.log(`  ✅ dismiss：${membersBefore} 条那组被忽略且不再提示；簇长大不再换 key（缺陷 42）`);
 });
 
 test('H7 clusterKey / renderSuggestions 的纯函数行为', async (t) => {
   const d = await import('../lib/distill.js');
 
-  // key 稳定：成员顺序不影响
+  // key 稳定：同一颗种子（cluster[0]）→ 同一 key，与邻居多少/顺序无关（缺陷 42）
   const a = [{ id: 'x' }, { id: 'y' }];
-  const b = [{ id: 'y' }, { id: 'x' }];
-  assert.equal(d.clusterKey(a), d.clusterKey(b), 'key 必须与成员顺序无关');
+  const b = [{ id: 'x' }, { id: 'z' }, { id: 'w' }];
+  assert.equal(d.clusterKey(a), d.clusterKey(b), '同一颗种子 + 不同邻居必须同 key');
+  assert.notEqual(d.clusterKey([{ id: 'y' }]), d.clusterKey(a), '换种子必须换 key');
+  assert.equal(d.clusterKey([]), '', '空簇给空 key，不抛');
 
   // sharedTags：至少一半成员带它才算
   const cluster = [
@@ -2478,7 +2557,48 @@ test('H7 clusterKey / renderSuggestions 的纯函数行为', async (t) => {
     assert.ok(text.includes(need), `渲染结果缺少「${need}」：\n${text}`);
   }
   assert.ok(!/undefined|null/.test(text), `渲染结果不该出现 undefined/null：\n${text}`);
-  console.log('  ✅ clusterKey 顺序无关 / sharedTags 过半判定 / 渲染要素齐全');
+  console.log('  ✅ clusterKey 种子身份 / sharedTags 过半判定 / 渲染要素齐全');
+});
+
+// 缺陷 42（2026-11-24，用户："我点了好几次不用了 还给我弹"）：
+// 现场 state.json 里同一个话题一天内被「不用」15 次，key 每次只差 1–2 个成员 ——
+// `clusterAround` 只取共享标签最多的前 5 个邻居，新记忆一进来就把末尾邻居挤掉，
+// 于是 key 变了、旧的忽略记录对不上。key 现在只认种子。
+test('缺陷 42：簇长大不换 key，「不用」不会被新邻居冲掉', async () => {
+  const d = await import('../lib/distill.js');
+  const mk = (id, extra = {}) => ({
+    id,
+    title: `记忆 ${id}`,
+    summary: '',
+    body: '按以下流程处理',
+    kind: 'skill',
+    priority: 'P1',
+    lifecycle: 'active',
+    tags: ['deploy'],
+    sessionCount: 3,
+    updated: `2026-01-0${String(id).slice(-1) || '1'}T00:00:00.000Z`,
+    ...extra,
+  });
+  const seed = mk('s1');
+  const plain = (id) => mk(id, { kind: 'fact', sessionCount: 0, body: '普通说明' });
+  const opts = { minScore: 4, minSessions: 3, limit: 5 };
+
+  const first = d.buildSuggestions([seed, plain('m1')], opts, {});
+  assert.equal(first.length, 1, '先要有一组建议');
+  const key = first[0].key;
+
+  const grown = d.buildSuggestions([seed, plain('m1'), plain('m2')], opts, {});
+  assert.equal(grown[0].key, key, '簇里多了邻居，key 不能变（否则「不用」被冲掉）');
+
+  const afterDismiss = d.buildSuggestions([seed, plain('m1'), plain('m2')], opts, { [key]: true });
+  assert.equal(afterDismiss.length, 0, '点过「不用」之后，簇再长也不能弹');
+
+  // 换了话题（新种子）仍然要能提示 —— 忽略只针对这一个话题
+  const other = mk('s9', { tags: ['release'] });
+  const refreshed = d.buildSuggestions([seed, plain('m1'), plain('m2'), other], opts, { [key]: true });
+  assert.equal(refreshed.length, 1, '新话题仍然要能提出来');
+  assert.notEqual(refreshed[0].key, key, '新话题必须是新 key');
+  console.log('  ✅ 缺陷 42：同一话题只认种子；簇长大不再重弹，新话题照常提示');
 });
 
 // ── 缺陷 28（2026-10-17，DSH 0.2.1-rc.1 兼容性事故）──────────────────────────
@@ -2948,7 +3068,7 @@ test('缺陷 35：maxInputChars 调大必须真生效（extract.js 不许再偷�
 test('缺陷 35：第二段失败 → 水位线停在第一段末尾，下次只重抽失败的那段', async (t) => {
   const text = 'S1_MARK' + 'a'.repeat(9993) + 'S2_MARK' + 'b'.repeat(9993);
   const llm = recordingLlm([segCandidate('第一段条目'), { fail: '429 Too Many Requests' }, segCandidate('第二段条目')]);
-  const { api, readWm } = await segFixture(t, 'fail', text, { maxInputChars: 10000 }, llm);
+  const { api, readWm } = await segFixture(t, 'fail', text, { maxInputChars: 10000, maxRetries: 0 }, llm);
 
   const first = await api.runExtraction({});
   assert.equal(first.ok, false, '第二段失败必须报出来');
@@ -2967,6 +3087,18 @@ test('缺陷 35：第二段失败 → 水位线停在第一段末尾，下次只
   const second2 = pending.find((p) => p.title === '第二段条目');
   assert.deepEqual(second2.sourceRange, { start: 10000, end: 20000 }, '候选要带出处（文件里的字符范围）');
   console.log('  ✅ 中途失败：停在成功处、只重抽失败段、候选带 sourceRange');
+});
+
+test('缺陷 42b：extract.maxRetries 真的会重试瞬态错误（配置不再无效）', async (t) => {
+  const text = 'RETRY_MARK ' + 'r'.repeat(400);
+  const llm = recordingLlm([{ fail: 'ETIMEDOUT 连接超时' }, segCandidate('重试成功条目')]);
+  const { api } = await segFixture(t, 'retry', text, { maxInputChars: 10000, maxRetries: 1 }, llm);
+
+  const res = await api.runExtraction({});
+  assert.equal(res.ok, true, `重试后应当成功：${JSON.stringify(res)}`);
+  assert.equal(llm.inputs.length, 2, '第一次瞬态失败后必须重试一次（maxRetries=1）');
+  assert.ok(res.queued >= 1, '重试成功的候选要入队');
+  console.log('  ✅ maxRetries=1：瞬态失败重试一次后成功，候选照常入队');
 });
 
 test('缺陷 35：单轮段数有上限，剩下的下次接着抽；追加的新内容不丢', async (t) => {
@@ -3516,7 +3648,7 @@ test('U7 安装更新：不是 git 检出 → supported:false，给重装建议�
 test('缺陷 38：技能诊断只计当前候选，区分忽略、已提醒、待提炼与待采纳', async () => {
   const { analyzeSkillSuggestions } = await import('../lib/suggestion-status.js');
   const records=Array.from({length:5},(_,i)=>({id:'diag-'+i,title:'经验'+i,kind:'experience',priority:'P1',body:'第一步检查配置。',lifecycle:i===4?'dormant':'active',tags:[]}));
-  const state={skillDismissed:{'diag-0':true,obsolete:true},skillSeen:{'diag-1':true,obsolete:true},distillRequests:['diag-2']};
+  const state={skillDismissed:{'seed:diag-0':true,obsolete:true},skillSeen:{'seed:diag-1':true,obsolete:true},distillRequests:['seed:diag-2']};
   const before=JSON.stringify(state);
   const cfg={skill:{},extract:{mode:'suggest'}};
   const { diagnostics:d }=analyzeSkillSuggestions(records,state,cfg,101);
@@ -3532,11 +3664,11 @@ test('缺陷 38：技能诊断只计当前候选，区分忽略、已提醒、�
 test('缺陷 38：前五组已提醒或待提炼时，后面的新组仍进入界面', async () => {
   const { analyzeSkillSuggestions }=await import('../lib/suggestion-status.js');
   const records=Array.from({length:7},(_,i)=>({id:'ui-new-'+i,title:'流程'+i,kind:'experience',priority:i<5?'P0':'P1',body:'第一步检查。',lifecycle:'active',tags:[]}));
-  const state={skillSeen:Object.fromEntries(records.slice(0,4).map(r=>[r.id,true])),distillRequests:['ui-new-4']};
+  const state={skillSeen:Object.fromEntries(records.slice(0,4).map(r=>['seed:'+r.id,true])),distillRequests:['seed:ui-new-4']};
   const {suggestions,diagnostics}=analyzeSkillSuggestions(records,state,{skill:{}});
   const selected=mod.selectUiSuggestions(suggestions,state.skillSeen,state.distillRequests,1);
   assert.equal(diagnostics.freshGroups,2);
-  assert.equal(selected.shown[0].key,'ui-new-5');assert.deepEqual(selected.restKeys,['ui-new-6']);
+  assert.equal(selected.shown[0].key,'seed:ui-new-5');assert.deepEqual(selected.restKeys,['seed:ui-new-6']);
   const initial=mod.selectUiSuggestions(suggestions,{},[],1);
   assert.equal(initial.shown.length+initial.restKeys.length,5,'保留每批最多五组，避免批量记账溢出');
 });
@@ -3596,10 +3728,10 @@ test('缺陷 38：排在五组已提醒之后的新卡片可以直接提炼', as
     const rec={id:'flow-'+i,title:'检查流程'+i,kind:'experience',priority:i<5?'P0':'P1',body:'第一步检查配置，再验证结果。',lifecycle:'active',tags:[],created:'2026-11-21T00:00:00Z',updated:'2026-11-21T00:00:00Z'};
     await api.store.write(rec);
   }
-  state.skillSeen=Object.fromEntries(Array.from({length:5},(_,i)=>['flow-'+i,true]));
+  state.skillSeen=Object.fromEntries(Array.from({length:5},(_,i)=>['seed:flow-'+i,true]));
   const card=await remote.list();
   assert.equal(card.groups.length,1);assert.equal(card.diagnostics.freshGroups,2);
-  const key=card.groups[0].key;assert.ok(['flow-5','flow-6'].includes(key));
+  const key=card.groups[0].key;assert.ok(['seed:flow-5','seed:flow-6'].includes(key));
   await remote.markSeen([key,...card.restKeys]);
   const result=await remote.distill(key);
   assert.equal(result.ok,true,JSON.stringify(result));
@@ -3665,7 +3797,7 @@ test('记忆面板：能列出全部记忆、常驻顺序、以及挤不进常�
   const why = annotateRows(view);
   const reasons = Object.fromEntries(why.map((r) => [r.id, r.reason?.code ?? null]));
   assert.equal(reasons[view.overflow[0]], 'overflow', '溢出条目要说清"超出常驻上限"');
-  assert.equal(reasons.d1, 'dormant', '休眠条目要说清"不参与注入"');
+  assert.equal(reasons.d1, 'dormant', '休眠条目要给出原因说明（文案必须与实际注入行为一致，见 F-RC-08 回归）');
   assert.equal(reasons.p1, null, '正常条目不该挂一条原因说明');
 
   console.log('  ✅ 面板：全量可见 / 常驻顺序 / 溢出与休眠各自有原因说明');
@@ -4036,7 +4168,7 @@ test('缺陷 40：技能提炼必须用**提炼**的系统提示词（别拿抽�
   assert.equal(dis.ok, true, JSON.stringify(dis));
   const call = llm.calls.at(-1);
   assert.ok(call, '必须真的调过模型');
-  assert.match(String(call.system ?? ''), /技能提炼器/, '系统提示词必须是 DISTILL_SYSTEM');
+  assert.match(String(call.system ?? ''), /提炼器/, '系统提示词必须是 DISTILL_SYSTEM');
   assert.ok(!/记忆抽取器/.test(String(call.system ?? '')), '不许再用抽取用的系统提示词');
   console.log('  ✅ 提炼用的是提炼提示词（DISTILL_SYSTEM），不再是抽取那份');
 });
@@ -4055,4 +4187,424 @@ test('缺陷 40：模型没按 JSON 返回时，用它的原文兜底成草稿�
   assert.match(r.content, /^---/, '兜底草稿也要是合法 SKILL.md');
   assert.match(r.content, /部署前检查分支/, '原文内容必须在');
   console.log('  ✅ 模型不按格式返回时：原文兜底成草稿 + 标记 salvaged');
+});
+
+// ═══════════════════════════════════════════════════════════════════
+// 2026-11-24 隐藏缺陷审计修复（t6：store.md + recall.md 第一批）
+// 每条 finding 一个回归；注释里写明「修复前会怎么失败」。
+// ═══════════════════════════════════════════════════════════════════
+
+test('审计 F-ST-05：id 不许当路径片段 —— read/remove/write 都拒绝穿越，list 退回文件名', async (t) => {
+  const root = await fsp.mkdtemp(path.join(os.tmpdir(), 'memfuse-safeid-'));
+  t.after(() => fsp.rm(root, { recursive: true, force: true }));
+  const store = new storeMod.MemoryStore({ root, git: false }, { log() {}, warn() {} });
+  await store.init();
+
+  // 记忆根之外的受害文件
+  const outside = path.join(root, '..', `victim-${Date.now()}.md`);
+  await fsp.writeFile(outside, '---\nid: victim\n---\n根外文件\n', 'utf8');
+  t.after(() => fsp.rm(outside, { force: true }));
+
+  for (const bad of ['../victim', '..\\victim', 'a/b', 'C:\\Windows\\x', '', '.', '..']) {
+    // 修复前：read/remove 会拼出根外路径并真的读到/删掉；现在必须拒绝
+    await assert.rejects(() => store.read(bad), /非法记忆 id/, `read(${JSON.stringify(bad)}) 必须拒绝`);
+    await assert.rejects(() => store.remove(bad), /非法记忆 id/, `remove(${JSON.stringify(bad)}) 必须拒绝`);
+    await assert.rejects(
+      () => store.write({ id: bad, kind: 'fact', title: 'x', body: 'y' }),
+      /非法记忆 id/,
+      `write(${JSON.stringify(bad)}) 必须拒绝`,
+    );
+  }
+  assert.match(await fsp.readFile(outside, 'utf8'), /根外文件/, '根外文件不许被动过');
+
+  // 记忆文件里写穿越 id：list() 必须退回文件名，删除只动根内那份
+  const inside = path.join(root, 'memories', 'inside.md');
+  await fsp.writeFile(inside, '---\nid: ../../victim\ntitle: 指向根外\nkind: fact\npriority: P1\n---\n正文\n', 'utf8');
+  const all = await store.list();
+  const rec = all.find((r) => r.title === '指向根外');
+  assert.ok(rec, '这条记忆仍要看得见（不能静默消失）');
+  assert.equal(rec.id, 'inside', '非法 id 必须退回文件名');
+  assert.ok(rec._issues?.includes('id'), '必须标记它有问题（不许静默）');
+  assert.equal(await store.remove(rec), true, '删除的是根内那份');
+  assert.ok(!fs.existsSync(inside));
+  assert.match(await fsp.readFile(outside, 'utf8'), /根外文件/, '根外文件仍然不许被动');
+  console.log('  ✅ 穿越 id：read/remove/write 全拒绝；list 退回文件名；根外文件安然无恙');
+});
+
+test('审计 F-ST-05：memfuse_feedback 的 id 穿越必须如实报错，不许读到根外文件', async (t) => {
+  const root = await fsp.mkdtemp(path.join(os.tmpdir(), 'memfuse-fb-traversal-'));
+  t.after(() => fsp.rm(root, { recursive: true, force: true }));
+  const h = fakeCtx();
+  const api = mod.apply(h.ctx, {
+    root, git: false, verbose: false,
+    extract: { enabled: false, autoRunOnStart: false }, lifecycle: { autoRunOnStart: false },
+  });
+  await api.ready;
+
+  // 从 `<root>/memories` 往上两级放一个 .md —— 修复前 read() 会把它的标题读进工具结果
+  const outside = path.join(root, '..', `fb-victim-${Date.now()}.md`);
+  await fsp.writeFile(outside, '---\nid: fb-victim\ntitle: 根外机密\n---\n不该被读到\n', 'utf8');
+  t.after(() => fsp.rm(outside, { force: true }));
+
+  const feedback = h.tools.find((d) => d.name === 'memfuse_feedback');
+  const out = JSON.parse(await feedback.execute({ id: '../../fb-victim', sign: 'positive' }));
+  assert.equal(out.ok, false, '穿越 id 不许当正常记忆处理');
+  assert.match(String(out.error), /非法记忆 id|读取失败/, `必须说明是非法 id，实际：${JSON.stringify(out)}`);
+  assert.ok(!JSON.stringify(out).includes('根外机密'), '根外内容不许进工具结果');
+  console.log('  ✅ feedback：穿越 id → 明确报错，根外内容不入结果');
+});
+
+test('审计 F-ST-04：记忆文件改名后，list/read/write/remove 仍然操作同一份（不再写影子副本）', async (t) => {
+  const root = await fsp.mkdtemp(path.join(os.tmpdir(), 'memfuse-rename-'));
+  t.after(() => fsp.rm(root, { recursive: true, force: true }));
+  const store = new storeMod.MemoryStore({ root, git: false }, { log() {}, warn() {} });
+  await store.init();
+  const id = 'm_abc123_def456';
+  await store.write({
+    id, kind: 'fact', priority: 'P1', title: 'pnpm 约定', summary: '安装依赖用 pnpm。',
+    body: '原始正文', tags: [], source: 'auto', lifecycle: 'active',
+    created: '2026-01-01T00:00:00.000Z', updated: '2026-01-01T00:00:00.000Z',
+    stats: { recalled: 0, injected: 0, positive: 0, negative: 0 },
+  });
+  const dir = path.join(root, 'memories');
+  const renamed = path.join(dir, '0-pnpm-约定.md');
+  await fsp.rename(path.join(dir, `${id}.md`), renamed);
+
+  const listed = await store.list();
+  const rec = listed.find((r) => r.title === 'pnpm 约定');
+  assert.ok(rec, 'list() 必须看得见改过名的文件');
+  assert.equal(rec.id, id, 'id 仍以 frontmatter 为准');
+  assert.equal(path.basename(rec._path), '0-pnpm-约定.md', 'list() 必须带出真实路径');
+
+  // 修复前：write() 按 id 重建路径 → 写出第二份 m_abc…md；list() 仍读旧文件 → 永远不睡
+  await store.write({ ...rec, lifecycle: 'dormant', dormantAt: '2026-02-01T00:00:00.000Z' });
+  assert.ok(!fs.existsSync(path.join(dir, `${id}.md`)), '不许凭空写出第二份 m_abc….md');
+  const after = await store.read(id);
+  assert.equal(after.lifecycle, 'dormant', '维护写回必须落在改过名的那份文件上');
+  assert.equal(after._fileId, '0-pnpm-约定', 'read 按 frontmatter id 兜底');
+
+  assert.equal(await store.remove(rec), true, '删除要删读到的那份');
+  assert.ok(!fs.existsSync(renamed), '改过名的文件必须真的删掉');
+  console.log('  ✅ 改名后：list/read/write/remove 全部对齐同一份文件');
+});
+
+test('审计 F-ST-04：memfuse_write delete 在文件被改名后仍要删得掉（不许假成功）', async (t) => {
+  const root = await fsp.mkdtemp(path.join(os.tmpdir(), 'memfuse-delete-tool-'));
+  t.after(() => fsp.rm(root, { recursive: true, force: true }));
+  const h = fakeCtx();
+  const api = mod.apply(h.ctx, {
+    root, git: false, verbose: false,
+    extract: { enabled: false, autoRunOnStart: false }, lifecycle: { autoRunOnStart: false },
+  });
+  await api.ready;
+  const write = h.tools.find((d) => d.name === 'memfuse_write');
+  const added = JSON.parse(await write.execute({ mode: 'add', kind: 'fact', priority: 'P1', title: '会被改名的条目', summary: 's', body: 'b' }));
+  assert.equal(added.ok, true);
+
+  // 用户把它改成好读的文件名（这是插件的卖点，必须支持）
+  const dir = path.join(root, 'memories');
+  await fsp.rename(path.join(dir, `${added.id}.md`), path.join(dir, '好读的名字.md'));
+
+  const out = JSON.parse(await write.execute({ mode: 'delete', match: '会被改名的条目' }));
+  assert.equal(out.ok, true, `改名后仍要删得掉，实际：${JSON.stringify(out)}`);
+  assert.ok(!fs.existsSync(path.join(dir, '好读的名字.md')), '文件必须真的删掉');
+  console.log('  ✅ memfuse_write delete：改名后仍能删，且结果与磁盘一致');
+});
+
+test('审计 F-ST-02：手写的 tags 字符串不许让所有写路径报失败、更不许让维护崩掉', async (t) => {
+  const root = await fsp.mkdtemp(path.join(os.tmpdir(), 'memfuse-tags-'));
+  t.after(() => fsp.rm(root, { recursive: true, force: true }));
+  // 用户按 YAML 习惯手写：`tags: pnpm, tooling`（合法 YAML，但本项目解析成字符串）
+  await fsp.mkdir(path.join(root, 'memories'), { recursive: true });
+  await fsp.writeFile(
+    path.join(root, 'memories', 'm_handedit.md'),
+    '---\nid: m_handedit\nkind: fact\npriority: P1\ntitle: 手写的记忆\nsummary: 摘要\ntags: pnpm, tooling\n---\n正文\n',
+    'utf8',
+  );
+  const h = fakeCtx();
+  const api = mod.apply(h.ctx, {
+    root, git: false, verbose: false,
+    extract: { enabled: false, autoRunOnStart: false }, lifecycle: { autoRunOnStart: false },
+  });
+  await api.ready;
+  const write = h.tools.find((d) => d.name === 'memfuse_write');
+
+  // 修复前：write 返回 {"ok":false,"error":"(r.tags || []).map is not a function"}，但记忆已经落盘
+  const res = JSON.parse(await write.execute({ mode: 'add', kind: 'fact', priority: 'P2', title: '新写入的一条', summary: '摘要', body: '正文' }));
+  assert.equal(res.ok, true, `一个坏字段不许连坐所有写路径，实际：${JSON.stringify(res)}`);
+  const all = await api.store.list();
+  assert.equal(all.filter((r) => r.title === '新写入的一条').length, 1, '新记忆只能有一条');
+  const hand = all.find((r) => r.id === 'm_handedit');
+  assert.deepEqual(hand.tags, ['pnpm', 'tooling'], '手写的 tags 字符串要归一成数组（且不丢内容）');
+
+  // 修复前：runMaintenance 抛 TypeError，state.lastMaintenance 永远不更新
+  const m = await api.maintenance();
+  assert.ok(m && typeof m.total === 'number', '维护不许被一个坏字段打断');
+  const idx = await fsp.readFile(path.join(root, 'index.md'), 'utf8');
+  assert.ok(!idx.includes('undefined'), `index.md 不许出现 undefined：${idx.slice(0, 200)}`);
+  console.log('  ✅ tags 字符串：写路径成功、维护不崩、index 无 undefined');
+});
+
+test('审计 F-ST-09：维护不许把 P0 / source:user 标成 stale（硬规则 5）', async (t) => {
+  const root = await fsp.mkdtemp(path.join(os.tmpdir(), 'memfuse-protect-stale-'));
+  t.after(() => fsp.rm(root, { recursive: true, force: true }));
+  const store = new storeMod.MemoryStore({ root, git: false }, { log() {}, warn() {} });
+  await store.init();
+  const mk = (id, source, priority, updated) => ({
+    id, kind: 'fact', priority, source, lifecycle: 'active', confidence: 1,
+    title: '完全重复的条目', summary: '同一个摘要', body: '完全一样的正文',
+    tags: [], created: updated, updated, stats: { recalled: 0, injected: 0, positive: 0, negative: 0 },
+  });
+  // 用户的 P0 更旧、自动抽取产物更新 —— planStale 会选中旧的那条
+  await store.write(mk('user-p0-old', 'user', 'P0', '2026-01-01T00:00:00.000Z'));
+  await store.write(mk('auto-new', 'auto', 'P2', '2026-01-02T00:00:00.000Z'));
+
+  const clusters = antisepticMod.findDuplicateClusters(await store.list());
+  const plan = antisepticMod.planStale(clusters);
+  assert.deepEqual(plan, [], '受保护记录不许进 stale 计划（修复前会选中 user-p0-old）');
+
+  const h = fakeCtx();
+  const api = mod.apply(h.ctx, {
+    root, git: false, verbose: false,
+    extract: { enabled: false, autoRunOnStart: false }, lifecycle: { autoRunOnStart: false },
+  });
+  await api.ready;
+  const res = await api.maintenance();
+  assert.equal(res.staled, 0, `维护不许自动标用户资产，实际 staled=${res.staled}`);
+  const p0 = await api.store.read('user-p0-old');
+  assert.equal(p0.stale, undefined, 'P0 的 stale 必须仍是 undefined');
+  console.log('  ✅ planStale / runMaintenance 都跳过 isProtected（P0 / source:user）');
+});
+
+test('审计 F-RC-01：BM25 改成全库共享尺度 —— 单条休眠池里一个 bigram 不再等于满分', () => {
+  const NOW = Date.parse('2026-11-24T00:00:00Z');
+  const mk = (o) => ({
+    id: o.id, kind: 'fact', priority: o.priority, lifecycle: o.lifecycle || 'active',
+    title: o.title, summary: o.summary || '', body: o.body || '', anchor: o.anchor || '',
+    tags: [], confidence: 0.5, stats: {}, updated: '2026-11-24T00:00:00Z',
+  });
+  const lib = [
+    mk({ id: 'active-strong', priority: 'P1', title: '帮我写报告并做季度汇报', summary: '季度汇报模板', anchor: '写报告或季度汇报时' }),
+    // 休眠池里**只有这一条**时，旧实现会把它算成满分 1.000，于是 lexical >= 0.5 形同虚设
+    mk({ id: 'dormant-weak', priority: 'P2', lifecycle: 'dormant', title: '无关的旧记忆', body: '这里只提报告两个字' }),
+    mk({ id: 'dormant-strong', priority: 'P2', lifecycle: 'dormant', title: '季度汇报格式', summary: '报告与季度汇报的格式', anchor: '写季度汇报时' }),
+  ];
+  const hits = recall(lib, '帮我写报告 季度 汇报', { now: NOW, maxEntries: 6 });
+  const got = Object.fromEntries(hits.map((h) => [h.rec.id, h]));
+  assert.ok(!got['dormant-weak'], `只命中 1/6 个 token 的休眠条目不许进相关召回，实际：${JSON.stringify(Object.keys(got))}`);
+  assert.ok(got['dormant-strong'], '覆盖 3/6 的休眠条目仍要能被召回');
+  assert.ok(got['dormant-strong'].lexical < 0.99, `休眠条目必须用全库尺度（修复前恒为 1.0），实际 ${got['dormant-strong'].lexical}`);
+  assert.equal(got['dormant-strong'].coverage, 0.5, 'coverage 是绝对证据强度');
+  console.log(`  ✅ 全库尺度：weak 被剔除；strong lex=${got['dormant-strong'].lexical.toFixed(3)} cov=${got['dormant-strong'].coverage}`);
+});
+
+test('审计 F-RC-02：拉丁分词剥掉句末标点（memory. === memory）', () => {
+  assert.deepEqual(tokenize('This is memory.'), ['this', 'is', 'memory']);
+  assert.deepEqual(tokenize('use node.js. Then run it'), ['use', 'node.js', 'then', 'run', 'it']);
+  assert.deepEqual(tokenize('The config lives in state.json.'), ['the', 'config', 'lives', 'in', 'state.json']);
+  assert.ok(tokenize('node.js / state.json / e.g').includes('node.js'), '词内的点必须保留');
+
+  const en = {
+    id: 'en', kind: 'fact', priority: 'P1', lifecycle: 'active', confidence: 0.5, tags: [], stats: {},
+    updated: '2026-11-24T00:00:00Z', title: 'Memory',
+    summary: 'Store state.json next to the memory.', body: 'Memory is persisted in state.json.',
+    anchor: 'when asking about memory',
+  };
+  const hits = recall([en], 'memory');
+  assert.equal(hits.length, 1, `英文句末标点不该让记忆静默召回不到，实际 ${hits.length}`);
+  console.log('  ✅ 分词：memory. → memory；英文记忆能被 memory 命中');
+});
+
+test('审计 F-RC-03：摘录按实义词命中选行，不再被冠词带偏', async () => {
+  const { excerpt } = await import('../lib/recall.js');
+  const body = 'A quick note about releases.\nSecond line mentions nothing relevant.\nRun the build with pnpm.';
+  assert.equal(excerpt({ body }, 'what is a good build'), 'Run the build with pnpm.', '修复前会选中含单字母 a 的第一行');
+  assert.equal(excerpt({ body }, 'build'), 'Run the build with pnpm.');
+  assert.equal(excerpt({ body }, '完全无关的词'), '', '无命中行仍返回空串');
+  console.log('  ✅ 摘录：选中真正含 build 的那一行');
+});
+
+test('审计 F-RC-04：注入 query 按会话隔离，且只取真人输入（同轮第 2 步不消失）', async (t) => {
+  const root = await fsp.mkdtemp(path.join(os.tmpdir(), 'memfuse-query-session-'));
+  // pre-step 里的 flushInjected / refreshInjectionCache 是 fire-and-forget，收尾时可能还在写盘
+  t.after(async () => {
+    await new Promise((r) => setTimeout(r, 120));
+    await fsp.rm(root, { recursive: true, force: true }).catch(() => {});
+  });
+  const h = fakeCtx();
+  const api = mod.apply(h.ctx, {
+    root, git: false, verbose: false,
+    dshHome: path.join(root, 'dsh-home'),
+    extract: { enabled: false, autoRunOnStart: false }, lifecycle: { autoRunOnStart: false },
+    inject: { minScore: 0.18 },
+  });
+  await api.ready;
+  const write = h.tools.find((d) => d.name === 'memfuse_write');
+  await write.execute({ mode: 'add', kind: 'convention', priority: 'P1', title: '包管理器统一用 pnpm', summary: 'install 与 script 都用 pnpm。', anchor: '安装依赖或跑脚本时召回' });
+  await write.execute({ mode: 'add', kind: 'fact', priority: 'P1', title: '测试环境 nginx 端口 8080', summary: 'nginx 监听 8080。', anchor: '部署或排查端口时召回' });
+  await api.refreshInjectionCache();
+
+  const onEvent = h.handlers.get('session/event')?.[0];
+  assert.ok(onEvent, '必须注册 session/event（真人消息的最早时点）');
+  const userEvent = (text) => ({ type: 'user/message', seq: 1, data: { role: 'user', source: { kind: 'user' }, content: [{ type: 'text', text }] } });
+  onEvent({ id: 'sess-A', seq: 1 }, userEvent('我要装依赖，用 pnpm 还是 npm？'));
+  onEvent({ id: 'sess-B', seq: 1 }, userEvent('测试环境的 nginx 部署端口是多少？'));
+
+  const asA = h.contexts[0].text({ scope: { session: { id: 'sess-A' } } });
+  const asB = h.contexts[0].text({ scope: { session: { id: 'sess-B' } } });
+  assert.ok(asA.includes('pnpm') && !asA.includes('nginx'), `会话 A 必须只看到自己的提问，实际：${asA}`);
+  assert.ok(asB.includes('nginx') && !asB.includes('pnpm'), `会话 B 必须只看到自己的提问，实际：${asB}`);
+
+  // 同轮第 2 步：messages 末尾是助手自己的话 —— 修复前 latestQuery 被它覆盖，Block B 整块消失
+  const preStep = h.handlers.get('agent/pre-step')?.[0];
+  preStep(
+    {
+      turn: 'turn-1',
+      messages: [
+        { role: 'user', source: { kind: 'user' }, content: [{ type: 'text', text: '我要装依赖，用 pnpm 还是 npm？' }] },
+        { role: 'assistant', source: { kind: 'agent' }, content: [{ type: 'text', text: '好的，我先把目录结构列出来。' }] },
+      ],
+    },
+    () => Promise.resolve({ kind: 'enter', messages: [] }),
+  );
+  await api.refreshInjectionCache();
+  const second = h.contexts[0].text({});
+  assert.ok(second.includes('pnpm'), `同轮第 2 步仍要按本轮用户提问召回，实际：${second}`);
+  assert.equal(api.lastInjection().query, '我要装依赖，用 pnpm 还是 npm？', '归因 query 必须是用户那句话，不是助手的');
+  console.log('  ✅ 两会话互不串味；同轮第 2 步 Block B 仍在');
+});
+
+test('审计 F-RC-05：休眠条目被注入过就不许物理删除（injected > 0 视为用过）', () => {
+  const old = new Date(Date.now() - 40 * 86400000).toISOString();
+  const mk = (id, stats) => ({ id, kind: 'fact', priority: 'P2', lifecycle: 'dormant', dormantAt: old, updated: old, stats });
+  // 修复前：recalled===0 就删 —— 连续被注入 3 轮的条目照样 30 天后消失
+  assert.deepEqual(policy.planPurge([mk('used', { recalled: 0, injected: 3 })], {}, Date.now()), [], '注入过 = 用过，不许删');
+  assert.deepEqual(policy.planPurge([mk('never', { recalled: 0, injected: 0 })], {}, Date.now()), ['never'], '真没用过的照旧删');
+  console.log('  ✅ planPurge：injected>0 免死；零使用照旧清理');
+});
+
+test('审计 F-RC-06：inject.minScore 真的作用在词法上（调高会改变结果）', async () => {
+  const { buildInjection } = await import('../lib/inject.js');
+  const mk = (o) => ({
+    id: o.id, kind: 'fact', priority: o.priority, lifecycle: 'active', title: o.title,
+    summary: o.summary || '', body: '', anchor: o.anchor || '', tags: [], confidence: 0.5,
+    stats: {}, updated: '2026-11-24T00:00:00Z',
+  });
+  const lib = [
+    mk({ id: 'p1-strong', priority: 'P1', title: '包管理器统一用 pnpm', summary: '安装依赖一律用 pnpm。', anchor: '安装依赖、跑脚本时召回' }),
+    // 只在正文里出现一次「周报」（字段权重 0.5）→ 词法很弱，但 P1 的底分仍把总分抬到 0.5 上下。
+    // 修复前 minScore 作用在**总分**上，调到 0.5 都筛不掉它（0.18–0.5 全是死区）。
+    mk({ id: 'p1-weak', priority: 'P1', title: '周报模板', body: '正文里只提一次周报。' }),
+  ];
+  const low = buildInjection(lib, '安装依赖 周报', { ok: true }, { minScore: 0.18 });
+  const high = buildInjection(lib, '安装依赖 周报', { ok: true }, { minScore: 0.5 });
+  assert.ok(low.text.includes('周报模板'), '低阈值时弱命中也该进来');
+  assert.ok(high.text.includes('包管理器统一用 pnpm'), '强命中必须留下');
+  assert.ok(!high.text.includes('周报模板'), `minScore 调高必须真的筛掉弱命中（修复前 0.18 与 0.5 结果一样），实际：${high.text}`);
+  console.log('  ✅ minScore：0.18 两条 / 0.5 只剩强命中');
+});
+
+test('审计 F-RC-08：面板文案必须与休眠条目的真实注入行为一致', async () => {
+  const { explainRow } = await import('../lib/memory-view.js');
+  const { buildInjection } = await import('../lib/inject.js');
+  const row = { id: 'd1', dormant: true, lifecycle: 'dormant', priority: 'P1' };
+  const why = explainRow(row);
+  assert.equal(why.code, 'dormant');
+  assert.ok(!/不参与注入/.test(why.reason), `休眠条目实际会进相关召回，文案不许说「不参与注入」：${why.reason}`);
+  assert.match(why.reason, /相关召回/, `要说清它从哪进来：${why.reason}`);
+
+  // 行为侧：同一条休眠记忆真的会出现在注入块里
+  const dorm = {
+    id: 'd1', kind: 'fact', priority: 'P1', lifecycle: 'dormant', confidence: 0.5, tags: [], stats: {},
+    updated: '2026-11-24T00:00:00Z', title: '生产库连接串走只读账号',
+    summary: '报表任务必须用只读账号连接生产库。', anchor: '连生产库、做报表时', body: '不要用写账号。',
+  };
+  const inj = buildInjection([dorm], '生产库连接串 只读账号', { ok: true });
+  assert.ok(inj.text.includes('生产库连接串走只读账号'), '休眠条目被高相关提问命中时必须真的进注入');
+  console.log('  ✅ 休眠文案与行为一致：说「从相关召回进来」，实际也真的进来了');
+});
+
+test('审计 F-RC-09：没有输入时不许出现「相关召回（与当前输入相关）」', async () => {
+  const { buildInjection } = await import('../lib/inject.js');
+  const rec = {
+    id: 'p1', kind: 'fact', priority: 'P1', lifecycle: 'active', confidence: 0.5, tags: [], stats: {},
+    updated: '2026-11-24T00:00:00Z', title: '周报模板', summary: '关于周报模板的说明。', anchor: '写周报时', body: '周报正文。',
+  };
+  const inj = buildInjection([rec], '', { ok: true });
+  assert.ok(!inj.blocks.some((b) => b.key === 'B'), '修复前空 query 也会返回 active 列表并自称"与当前输入相关"');
+  assert.equal(inj.text, '', '没有 P0、没有 query 时整块都不该出现');
+  console.log('  ✅ 空 query：Block B 不出现');
+});
+
+test('审计 F-RC-10：stale 文案说「仍会注入但降权」，且行为真的如此（spec §G4）', async () => {
+  const { explainRow } = await import('../lib/memory-view.js');
+  const { buildInjection } = await import('../lib/inject.js');
+  const why = explainRow({ id: 's1', stale: true, priority: 'P1' });
+  assert.equal(why.code, 'stale');
+  assert.ok(!/不再注入/.test(why.reason), `spec §G4 是「−0.20 降权、仍注入」，文案不许说不再注入：${why.reason}`);
+  assert.match(why.reason, /仍会注入|降权/, why.reason);
+
+  const stale = {
+    id: 's1', kind: 'fact', priority: 'P1', lifecycle: 'active', stale: true, confidence: 0.5, tags: [], stats: {},
+    updated: '2026-11-24T00:00:00Z', title: '部署端口是 8080', summary: '生产端口 8080。', anchor: '部署时', body: '端口 8080。',
+  };
+  const inj = buildInjection([stale], '部署端口', { ok: true });
+  assert.ok(inj.text.includes('部署端口是 8080'), 'stale 条目仍会进注入（只是降权）—— 文案必须承认这一点');
+  console.log('  ✅ stale 文案与 spec §G4 对齐：仍会注入、只是降权');
+});
+
+test('审计 F-RC-11：预算按剩余条数平均分 —— 长标题时最后一条也要有摘要', async () => {
+  const { buildInjection } = await import('../lib/inject.js');
+  const title = '标'.repeat(80);
+  const summary = '摘'.repeat(200);
+  const rows = Array.from({ length: 8 }, (_, i) => ({
+    id: `p0-${i}`, kind: 'fact', priority: 'P0', lifecycle: 'active',
+    title, summary, body: '', anchor: '', tags: [], confidence: 1, stats: {},
+    updated: `2026-01-0${i + 1}T00:00:00Z`, pinnedAt: `2026-01-0${i + 1}T00:00:00Z`,
+  }));
+  const inj = buildInjection(rows, '随便', { ok: true }, { residentMaxChars: 1200, residentMaxEntries: 8 });
+  const body = inj.blocks.find((b) => b.key === 'A').body;
+  assert.equal(body.length, 8);
+  // 修复前：第 7、8 条只剩 「- [P0] 标题」（87 字，没有摘要）
+  for (const [i, line] of body.entries()) {
+    assert.ok(line.includes('—'), `第 ${i + 1} 条不该只剩标题：${line}`);
+    assert.ok(line.length >= 100, `第 ${i + 1} 条太短（摘要被吃掉了）：${line.length}`);
+  }
+  console.log('  ✅ 8 条长标题 P0：每条都保住了摘要');
+});
+
+test('审计 F-RC-12：computeStats 的常驻计数只算 active P0（与 buildView 同口径）', async () => {
+  const { computeStats, buildView } = await import('../lib/memory-view.js');
+  const all = [
+    { id: 'p0-active', priority: 'P0', lifecycle: 'active' },
+    { id: 'p0-dormant-1', priority: 'P0', lifecycle: 'dormant' },
+    { id: 'p0-dormant-2', priority: 'P0', lifecycle: 'dormant' },
+  ];
+  const stats = computeStats(all, 8);
+  assert.equal(stats.byPriority.P0, 3, 'byPriority 仍按优先级总数统计');
+  assert.equal(stats.residentCount, 1, '常驻数必须只算 active P0（修复前 = 3）');
+  assert.equal(stats.residentOverflow, 0, '休眠 P0 不算溢出');
+  assert.deepEqual(buildView(all, { residentMaxEntries: 8 }).resident, ['p0-active'], '与实际常驻列表同口径');
+  console.log('  ✅ residentCount = 1（active P0），不再把休眠 P0 算成常驻');
+});
+
+test('审计 F-ST-06：同一 id 的并发写不许互相踩 tmp（全部成功）', async (t) => {
+  const root = await fsp.mkdtemp(path.join(os.tmpdir(), 'memfuse-concurrent-'));
+  t.after(() => fsp.rm(root, { recursive: true, force: true }));
+  const store = new storeMod.MemoryStore({ root, git: false }, { log() {}, warn() {} });
+  await store.init();
+  const base = {
+    id: 'm_concurrent', kind: 'fact', priority: 'P2', title: '并发写', summary: 's',
+    tags: [], lifecycle: 'active', created: '2026-01-01T00:00:00.000Z', stats: {},
+  };
+  // 修复前：tmp 名只有 pid → 60 条并发里 56 条 rename ENOENT
+  const results = await Promise.allSettled(
+    Array.from({ length: 20 }, (_, i) => store.write({ ...base, updated: `2026-01-01T00:00:${String(i).padStart(2, '0')}.000Z`, body: `内容 ${i}` })),
+  );
+  const failed = results.filter((r) => r.status === 'rejected');
+  assert.equal(failed.length, 0, `并发写不许 ENOENT：${failed.map((f) => f.reason?.message).join(' / ')}`);
+  const back = await store.read('m_concurrent');
+  assert.match(back.body, /^内容 \d+$/, '最终内容必须是某一次的完整内容');
+  assert.deepEqual((await fsp.readdir(path.join(root, 'memories'))).filter((n) => n.includes('.tmp-')), [], '不许残留 tmp 文件');
+  console.log('  ✅ 20 条并发写全成功，无残留 tmp');
 });
